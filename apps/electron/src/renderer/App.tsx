@@ -459,7 +459,7 @@ export default function App() {
     // Handoff events signal end of streaming - need to sync back to React state
     // Also includes todo_state_changed so status updates immediately reflect in sidebar
     // async_operation included so shimmer effect on session titles updates in real-time
-    const handoffEventTypes = new Set(['complete', 'error', 'interrupted', 'typed_error', 'todo_state_changed', 'session_flagged', 'session_unflagged', 'name_changed', 'labels_changed', 'title_generated', 'async_operation'])
+    const handoffEventTypes = new Set(['complete', 'error', 'interrupted', 'typed_error', 'todo_state_changed', 'session_flagged', 'session_unflagged', 'name_changed', 'labels_changed', 'title_generated', 'async_operation', 'team_session_created'])
 
     // Helper to handle side effects (same logic for both paths)
     const handleEffects = (effects: Effect[], sessionId: string, eventType: string) => {
@@ -578,6 +578,20 @@ export default function App() {
           const newMetaMap = new Map(metaMap)
           newMetaMap.set(sessionId, extractSessionMeta(updatedSession))
           store.set(sessionMetaMapAtom, newMetaMap)
+
+          // Agent Teams: When a teammate session is created on the backend,
+          // load it into the renderer so it appears in All Chats sidebar
+          if (event.type === 'team_session_created' && 'teammateSessionId' in event) {
+            const teammateSessionId = (event as any).teammateSessionId as string
+            // Async load — don't block the event handler
+            window.electronAPI.getSessionMessages(teammateSessionId).then((teammateSession) => {
+              if (teammateSession) {
+                addSession(teammateSession)
+              }
+            }).catch((err) => {
+              console.error('[App] Failed to load teammate session:', err)
+            })
+          }
 
           // Show notification on complete (when window is not focused)
           // Skip hidden sessions (mini-agent sessions) - they shouldn't trigger notifications

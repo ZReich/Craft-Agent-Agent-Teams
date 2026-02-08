@@ -156,6 +156,16 @@ export interface SessionConfig {
   parentSessionId?: string;
   /** Explicit sibling order (lazy - only populated when user reorders). */
   siblingOrder?: number;
+  /** Team ID (if this session is part of an agent team) */
+  teamId?: string;
+  /** Whether this session is the team lead */
+  isTeamLead?: boolean;
+  /** Display name for teammate sessions */
+  teammateName?: string;
+  /** IDs of teammate sessions (lead tracks its children) */
+  teammateSessionIds?: string[];
+  /** Team accent color (hex) */
+  teamColor?: string;
 }
 
 /**
@@ -240,6 +250,16 @@ export interface SessionHeader {
   parentSessionId?: string;
   /** Explicit sibling order (lazy - only populated when user reorders). */
   siblingOrder?: number;
+  /** Team ID (if this session is part of an agent team) */
+  teamId?: string;
+  /** Whether this session is the team lead */
+  isTeamLead?: boolean;
+  /** Display name for teammate sessions */
+  teammateName?: string;
+  /** IDs of teammate sessions (lead tracks its children) */
+  teammateSessionIds?: string[];
+  /** Team accent color (hex) */
+  teamColor?: string;
   // Pre-computed fields for fast list loading
   /** Number of messages in session */
   messageCount: number;
@@ -319,4 +339,12 @@ export interface SessionMetadata {
   parentSessionId?: string;
   /** Explicit sibling order (lazy - only populated when user reorders). */
   siblingOrder?: number;
+  /** Team ID (if this session is part of an agent team) */
+  teamId?: string;
+  /** Whether this session is the team lead */
+  isTeamLead?: boolean;
+  /** Display name for teammate sessions */
+  teammateName?: string;
+  /** Team accent color (hex) */
+  teamColor?: string;
 }

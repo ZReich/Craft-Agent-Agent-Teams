@@ -1082,6 +1082,26 @@ function AppShellContent({
   // Theme toggle (CMD+SHIFT+A)
   useAction('app.toggleTheme', () => setMode(resolvedMode === 'dark' ? 'light' : 'dark'))
 
+  // Agent Teams: Toggle task list (CMD+T)
+  useAction('teams.toggleTasks', () => {
+    window.dispatchEvent(new CustomEvent('agent-teams:toggle-tasks'))
+  })
+
+  // Agent Teams: Toggle delegate mode (CMD+SHIFT+D)
+  useAction('teams.toggleDelegate', () => {
+    window.dispatchEvent(new CustomEvent('agent-teams:toggle-delegate'))
+  })
+
+  // Agent Teams: Next teammate (SHIFT+DOWN)
+  useAction('teams.nextTeammate', () => {
+    window.dispatchEvent(new CustomEvent('agent-teams:next-teammate'))
+  })
+
+  // Agent Teams: Previous teammate (SHIFT+UP)
+  useAction('teams.prevTeammate', () => {
+    window.dispatchEvent(new CustomEvent('agent-teams:prev-teammate'))
+  })
+
   // Global paste listener for file attachments
   // Fires when Cmd+V is pressed anywhere in the app (not just textarea)
   React.useEffect(() => {

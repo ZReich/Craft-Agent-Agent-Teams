@@ -73,6 +73,101 @@ export interface LlmConnectionSetup {
   models?: string[] | null  // Optional model list for compat providers
 }
 
+// Import usage types
+import type {
+  SessionUsage,
+  ProviderUsage,
+  TeamSessionUsage,
+  WeeklyUsageSummary,
+  DailyUsage,
+  SessionUsageRef,
+  UsageAlertThresholds,
+  UsageAlert,
+} from '@craft-agent/core';
+export type {
+  SessionUsage,
+  ProviderUsage,
+  TeamSessionUsage,
+  WeeklyUsageSummary,
+  DailyUsage,
+  SessionUsageRef,
+  UsageAlertThresholds,
+  UsageAlert,
+};
+
+// Import agent teams types from core (imported with `import type` for local use in ElectronAPI,
+// then re-exported so other packages can access them via this module)
+import type {
+  AgentTeam,
+  AgentTeamStatus,
+  AgentTeammate,
+  AgentTeammateStatus,
+  TeammateTokenUsage,
+  TeamTask,
+  TeamTaskStatus,
+  TeammateMessage,
+  TeammateMessageType,
+  ModelProvider,
+  AvailableModel,
+  ModelCapability,
+  TeamRole,
+  TeamModelConfig,
+  ModelAssignment,
+  ModelPresetId,
+  ModelPreset,
+  WorkerTask,
+  WorkerMessage,
+  ReviewPolicy,
+  ReviewResult,
+  TeamActivityEvent,
+  TeamActivityType,
+  TeamCostSummary,
+  QualityGateStageName,
+  QualityGateStageResult,
+  TestStageResult,
+  QualityGateResult,
+  QualityGateStageConfig,
+  QualityGateConfig,
+  TaskType,
+  TDDPhase,
+  TaskQualityReport,
+} from '@craft-agent/core/types';
+export type {
+  AgentTeam,
+  AgentTeamStatus,
+  AgentTeammate,
+  AgentTeammateStatus,
+  TeammateTokenUsage,
+  TeamTask,
+  TeamTaskStatus,
+  TeammateMessage,
+  TeammateMessageType,
+  ModelProvider,
+  AvailableModel,
+  ModelCapability,
+  TeamRole,
+  TeamModelConfig,
+  ModelAssignment,
+  ModelPresetId,
+  ModelPreset,
+  WorkerTask,
+  WorkerMessage,
+  ReviewPolicy,
+  ReviewResult,
+  QualityGateStageName,
+  QualityGateStageResult,
+  TestStageResult,
+  QualityGateResult,
+  QualityGateStageConfig,
+  QualityGateConfig,
+  TaskType,
+  TDDPhase,
+  TaskQualityReport,
+  TeamActivityEvent,
+  TeamActivityType,
+  TeamCostSummary,
+};
+
 
 /**
  * File/directory entry in a skill folder
@@ -390,10 +485,21 @@ export interface Session {
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number
   // Sub-session hierarchy (1 level max)
-  /** Parent session ID (if this is a sub-session). Null/undefined = root session. */
+  /** Parent session ID (if this is a sub-session or teammate). Null/undefined = root session. */
   parentSessionId?: string
   /** Explicit sibling order (lazy - only populated when user reorders). */
   siblingOrder?: number
+  // Agent team fields
+  /** Team ID (if this session is part of an agent team) */
+  teamId?: string
+  /** Whether this session is the team lead */
+  isTeamLead?: boolean
+  /** Display name for teammate sessions (e.g., "taco-researcher") */
+  teammateName?: string
+  /** IDs of teammate sessions (lead tracks its children) */
+  teammateSessionIds?: string[]
+  /** Team accent color (hex, e.g., "#7c3aed") */
+  teamColor?: string
 }
 
 /**
@@ -428,6 +534,17 @@ export interface CreateSessionOptions {
   isFlagged?: boolean
   /** Per-session source selection (source slugs) */
   enabledSourceSlugs?: string[]
+  // Agent team options
+  /** Team ID for team sessions */
+  teamId?: string
+  /** Whether this session is the team lead */
+  isTeamLead?: boolean
+  /** Parent session ID for teammate sessions */
+  parentSessionId?: string
+  /** Display name for teammate sessions */
+  teammateName?: string
+  /** Team accent color */
+  teamColor?: string
 }
 
 // Events sent from main to renderer
@@ -479,6 +596,8 @@ export type SessionEvent =
   | { type: 'sessions_reordered' }
   | { type: 'session_archived_cascade'; sessionId: string; count: number }
   | { type: 'session_deleted_cascade'; sessionId: string; count: number }
+  // Agent team events
+  | { type: 'team_session_created'; sessionId: string; teammateSessionId: string; teammateName: string; teamId: string; teamColor?: string }
   | { type: 'session_shared'; sessionId: string; sharedUrl: string }
   | { type: 'session_unshared'; sessionId: string }
   // Auth request events (unified auth flow)
@@ -500,6 +619,8 @@ export type SessionEvent =
       turnId?: string
       explanation?: string | null
     }
+  // Agent teams events
+  | { type: 'team_initialized'; sessionId: string; teamId: string; teammateName?: string }
 
 // Options for sendMessage
 export interface SendMessageOptions {
@@ -835,6 +956,36 @@ export const IPC_CHANNELS = {
   // Git operations
   GET_GIT_BRANCH: 'git:getBranch',
 
+  // Agent Teams
+  AGENT_TEAMS_GET_ENABLED: 'agentTeams:getEnabled',
+  AGENT_TEAMS_SET_ENABLED: 'agentTeams:setEnabled',
+  AGENT_TEAMS_CREATE: 'agentTeams:create',
+  AGENT_TEAMS_CLEANUP: 'agentTeams:cleanup',
+  AGENT_TEAMS_GET_STATUS: 'agentTeams:getStatus',
+  AGENT_TEAMS_SPAWN_TEAMMATE: 'agentTeams:spawnTeammate',
+  AGENT_TEAMS_SHUTDOWN_TEAMMATE: 'agentTeams:shutdownTeammate',
+  AGENT_TEAMS_SEND_MESSAGE: 'agentTeams:sendMessage',
+  AGENT_TEAMS_BROADCAST: 'agentTeams:broadcast',
+  AGENT_TEAMS_GET_TASKS: 'agentTeams:getTasks',
+  AGENT_TEAMS_UPDATE_TASK: 'agentTeams:updateTask',
+  AGENT_TEAMS_TEAMMATE_STREAM: 'agentTeams:teammateStream',
+  AGENT_TEAMS_SWAP_MODEL: 'agentTeams:swapModel',
+  AGENT_TEAMS_GET_COST: 'agentTeams:getCost',
+  AGENT_TEAMS_EVENT: 'agentTeams:event',  // main → renderer broadcast
+  AGENT_TEAMS_GET_PROVIDER_KEY: 'agentTeams:getProviderKey',
+  AGENT_TEAMS_SET_PROVIDER_KEY: 'agentTeams:setProviderKey',
+
+  // Usage tracking
+  USAGE_GET_SESSION: 'usage:getSession',
+  USAGE_GET_WEEKLY: 'usage:getWeekly',
+  USAGE_GET_RECENT_WEEKS: 'usage:getRecentWeeks',
+  USAGE_GET_THRESHOLDS: 'usage:getThresholds',
+  USAGE_SET_THRESHOLDS: 'usage:setThresholds',
+  USAGE_EXPORT_CSV: 'usage:exportCsv',
+  // Usage events (main → renderer)
+  USAGE_COST_UPDATE: 'usage:costUpdate',
+  USAGE_ALERT: 'usage:alert',
+
   // Git Bash (Windows)
   GITBASH_CHECK: 'gitbash:check',
   GITBASH_BROWSE: 'gitbash:browse',
@@ -1156,6 +1307,34 @@ export interface ElectronAPI {
   testLlmConnection(slug: string): Promise<{ success: boolean; error?: string }>
   setDefaultLlmConnection(slug: string): Promise<{ success: boolean; error?: string }>
   setWorkspaceDefaultLlmConnection(workspaceId: string, slug: string | null): Promise<{ success: boolean; error?: string }>
+
+  // Agent Teams
+  getAgentTeamsEnabled(workspaceId: string): Promise<boolean>
+  setAgentTeamsEnabled(workspaceId: string, enabled: boolean): Promise<void>
+  createAgentTeam(options: { name: string; leadSessionId: string; workspaceId: string; modelPreset?: string }): Promise<AgentTeam>
+  cleanupAgentTeam(teamId: string): Promise<void>
+  getAgentTeamStatus(teamId: string): Promise<AgentTeam | undefined>
+  spawnTeammate(options: { teamId: string; name: string; role: string; model: string; provider: string }): Promise<AgentTeammate>
+  shutdownTeammate(teamId: string, teammateId: string): Promise<void>
+  sendTeammateMessage(teamId: string, from: string, to: string, content: string): Promise<TeammateMessage>
+  broadcastTeamMessage(teamId: string, from: string, content: string): Promise<TeammateMessage>
+  getTeamTasks(teamId: string): Promise<TeamTask[]>
+  updateTeamTask(teamId: string, taskId: string, status: string, assignee?: string): Promise<void>
+  getTeamCost(teamId: string): Promise<TeamCostSummary>
+  swapTeammateModel(teamId: string, teammateId: string, newModel: string, newProvider: string): Promise<AgentTeammate>
+  onAgentTeamEvent(callback: (event: TeamActivityEvent) => void): () => void
+  getAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter'): Promise<{ hasKey: boolean; maskedKey?: string }>
+  setAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter', key: string): Promise<void>
+
+  // Usage tracking
+  getSessionUsage(sessionId: string): Promise<SessionUsage | null>
+  getWeeklyUsage(): Promise<WeeklyUsageSummary | null>
+  getRecentWeeksUsage(count?: number): Promise<WeeklyUsageSummary[]>
+  getUsageThresholds(): Promise<UsageAlertThresholds>
+  setUsageThresholds(thresholds: UsageAlertThresholds): Promise<{ success: boolean }>
+  exportUsageCSV(csvContent: string): Promise<{ success: boolean; filePath?: string; error?: string }>
+  onUsageCostUpdate(callback: (data: SessionUsage) => void): () => void
+  onUsageAlert(callback: (data: UsageAlert) => void): () => void
 }
 
 /**
@@ -1204,6 +1383,32 @@ export interface WorkspaceSettings {
   localMcpEnabled?: boolean
   /** Default LLM connection slug for new sessions in this workspace */
   defaultLlmConnection?: string
+  /** Whether Agent Teams feature is enabled for this workspace */
+  agentTeamsEnabled?: boolean
+  /** Model preset for agent teams (e.g., 'balanced', 'speed', 'quality') */
+  agentTeamsModelPreset?: string
+  /** Model ID for the team lead agent */
+  agentTeamsLeadModel?: string
+  /** Model ID for the team head agent */
+  agentTeamsHeadModel?: string
+  /** Model ID for worker agents */
+  agentTeamsWorkerModel?: string
+  /** Model ID for escalation handling */
+  agentTeamsEscalationModel?: string
+  /** Cost cap in USD for agent teams operations */
+  agentTeamsCostCapUsd?: number
+  // Quality gate settings (stored in agentTeams.qualityGates)
+  qualityGatesEnabled?: boolean
+  qualityGatesPassThreshold?: number
+  qualityGatesMaxCycles?: number
+  qualityGatesEnforceTDD?: boolean
+  qualityGatesReviewModel?: string
+  qualityGatesSyntaxEnabled?: boolean
+  qualityGatesTestsEnabled?: boolean
+  qualityGatesArchEnabled?: boolean
+  qualityGatesSimplicityEnabled?: boolean
+  qualityGatesErrorsEnabled?: boolean
+  qualityGatesCompletenessEnabled?: boolean
 }
 
 /**

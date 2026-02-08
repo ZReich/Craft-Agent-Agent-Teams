@@ -9,6 +9,7 @@ import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { AlertCircle, Globe, Copy, RefreshCw, Link2Off, Info } from 'lucide-react'
 import { ChatDisplay, type ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
+import { TeamStatusBar } from '@/components/teams/TeamStatusBar'
 import { PanelHeader } from '@/components/app-shell/PanelHeader'
 import { SessionMenu } from '@/components/app-shell/SessionMenu'
 import { RenameDialog } from '@/components/ui/rename-dialog'
@@ -559,10 +560,19 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     )
   }
 
+  // Agent teams: no longer need to extract teammate names from messages.
+  // TeamStatusBar now reads teammate data directly from sessionMetaMapAtom.
+
   return (
     <>
       <div className="h-full flex flex-col">
         <PanelHeader  title={displayTitle} titleMenu={titleMenu} actions={shareButton} rightSidebarButton={rightSidebarButton} isRegeneratingTitle={isAsyncOperationOngoing} />
+        {/* Agent Teams status bar */}
+        {session?.teamId && (
+          <TeamStatusBar
+            session={session}
+          />
+        )}
         <div className="flex-1 flex flex-col min-h-0">
           <ChatDisplay
             ref={chatDisplayRef}

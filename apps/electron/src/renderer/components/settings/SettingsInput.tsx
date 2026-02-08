@@ -38,6 +38,8 @@ export interface SettingsInputProps {
   inCard?: boolean
   /** onBlur handler */
   onBlur?: () => void
+  /** onFocus handler */
+  onFocus?: () => void
   /** onKeyDown handler */
   onKeyDown?: (e: React.KeyboardEvent) => void
 }
@@ -66,6 +68,7 @@ export function SettingsInput({
   className,
   inCard = false,
   onBlur,
+  onFocus,
   onKeyDown,
 }: SettingsInputProps) {
   const id = React.useId()
@@ -104,6 +107,7 @@ export function SettingsInput({
             placeholder={placeholder}
             disabled={disabled}
             onBlur={onBlur}
+            onFocus={onFocus}
             onKeyDown={onKeyDown}
             className={cn(
               'bg-muted/50 border-0 shadow-none focus-visible:ring-0 focus-visible:outline-none focus-visible:bg-transparent',

@@ -172,6 +172,12 @@ export async function createSession(
     todoState?: SessionConfig['todoState'];
     labels?: string[];
     isFlagged?: boolean;
+    // Agent team fields
+    teamId?: string;
+    isTeamLead?: boolean;
+    parentSessionId?: string;
+    teammateName?: string;
+    teamColor?: string;
   }
 ): Promise<SessionConfig> {
   ensureSessionsDir(workspaceRootPath);
@@ -202,6 +208,12 @@ export async function createSession(
     todoState: options?.todoState,
     labels: options?.labels,
     isFlagged: options?.isFlagged,
+    // Agent team fields
+    teamId: options?.teamId,
+    isTeamLead: options?.isTeamLead,
+    parentSessionId: options?.parentSessionId,
+    teammateName: options?.teammateName,
+    teamColor: options?.teamColor,
   };
 
   // Save empty session

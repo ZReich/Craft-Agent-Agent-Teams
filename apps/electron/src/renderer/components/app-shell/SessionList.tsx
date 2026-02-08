@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useAction, useActionLabel } from "@/actions"
 import { formatDistanceToNow, formatDistanceToNowStrict, isToday, isYesterday, format, startOfDay } from "date-fns"
 import type { Locale } from "date-fns"
-import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive } from "lucide-react"
+import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive, ChevronDown, ChevronRight, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
@@ -141,6 +141,83 @@ function hasUnreadMessages(session: SessionMeta): boolean {
  */
 function hasMessages(session: SessionMeta): boolean {
   return session.lastFinalMessageId !== undefined
+}
+
+/**
+ * TeamGroup — Collapsible container that wraps a team lead + its teammates.
+ * Open by default when any teammate is still processing, collapsible by the user.
+ */
+interface TeamGroupProps {
+  lead: SessionMeta
+  teammates: SessionMeta[]
+  /** Set of teamIds the user has manually collapsed */
+  collapsedTeams: Set<string>
+  onToggleCollapse: (teamId: string) => void
+  /** Render function that returns a <SessionItem> for a given SessionMeta */
+  renderSessionItem: (item: SessionMeta, isFirstInGroup: boolean) => React.ReactNode
+}
+
+function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSessionItem }: TeamGroupProps) {
+  const teamId = lead.teamId || lead.id
+  const teamColor = lead.teamColor || '#7c3aed'
+  const hasActiveWork = teammates.some(t => t.isProcessing)
+
+  // Expanded if: (a) not manually collapsed, OR (b) teammates are still working
+  const isManuallyCollapsed = collapsedTeams.has(teamId)
+  const isExpanded = hasActiveWork || !isManuallyCollapsed
+
+  const workingCount = teammates.filter(t => t.isProcessing).length
+  const doneCount = teammates.filter(t => !t.isProcessing).length
+
+  return (
+    <div className="team-group">
+      {/* Team lead row with collapse toggle */}
+      <div
+        style={{ borderLeft: `4px solid ${teamColor}`, backgroundColor: `${teamColor}08` }}
+      >
+        {/* Collapse toggle bar */}
+        <button
+          type="button"
+          onClick={() => onToggleCollapse(teamId)}
+          className="w-full flex items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+          style={{ color: teamColor }}
+        >
+          {isExpanded ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />}
+          <Users className="h-3 w-3 shrink-0" />
+          <span className="font-medium">Team</span>
+          <span className="text-muted-foreground mx-0.5">&middot;</span>
+          <span className="text-muted-foreground">{teammates.length} member{teammates.length !== 1 ? 's' : ''}</span>
+          {workingCount > 0 && (
+            <span className="ml-auto flex items-center gap-1 text-[10px]">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+              {workingCount} working
+            </span>
+          )}
+          {workingCount === 0 && doneCount > 0 && (
+            <span className="ml-auto flex items-center gap-1 text-[10px] text-green-600">
+              All done
+            </span>
+          )}
+        </button>
+        {/* Lead session item */}
+        {renderSessionItem(lead, true)}
+      </div>
+
+      {/* Teammate sessions — collapsible */}
+      {isExpanded && teammates.length > 0 && (
+        <div
+          className="ml-3"
+          style={{ borderLeft: `2px solid ${teamColor}30` }}
+        >
+          {teammates.map((teammate, idx) => (
+            <div key={teammate.id}>
+              {renderSessionItem(teammate, idx === 0)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 /** Options for sessionMatchesCurrentFilter including secondary filters */
@@ -531,7 +608,10 @@ function SessionItem({
                 "font-medium font-sans line-clamp-2 min-w-0 -mb-[2px]",
                 item.isAsyncOperationOngoing && "animate-shimmer-text"
               )}>
-                {searchQuery ? highlightMatch(getSessionTitle(item), searchQuery) : getSessionTitle(item)}
+                {item.teammateName
+                  ? (searchQuery ? highlightMatch(item.teammateName, searchQuery) : item.teammateName)
+                  : (searchQuery ? highlightMatch(getSessionTitle(item), searchQuery) : getSessionTitle(item))
+                }
               </div>
             </div>
             {/* Subtitle row — badges scroll horizontally when they overflow */}
@@ -560,6 +640,20 @@ function SessionItem({
                 {item.lastMessageRole === 'plan' && (
                   <span className="shrink-0 h-[18px] px-1.5 text-[10px] font-medium rounded bg-success/10 text-success flex items-center whitespace-nowrap">
                     Plan
+                  </span>
+                )}
+                {item.teamId && (
+                  <span
+                    className="shrink-0 h-[18px] px-1.5 text-[10px] font-medium rounded flex items-center whitespace-nowrap"
+                    style={item.teamColor ? {
+                      backgroundColor: `color-mix(in srgb, ${item.teamColor} 10%, transparent)`,
+                      color: item.teamColor,
+                    } : {
+                      backgroundColor: 'rgba(147, 51, 234, 0.1)',
+                      color: 'rgb(147, 51, 234)',
+                    }}
+                  >
+                    {item.isTeamLead ? 'Lead' : 'Team'}
                   </span>
                 )}
                 {permissionMode && (
@@ -927,6 +1021,20 @@ export function SessionList({
   const navState = useNavigationState()
   const { showEscapeOverlay } = useEscapeInterrupt()
 
+  // Agent Teams: Track which teams are manually collapsed by the user
+  const [collapsedTeams, setCollapsedTeams] = useState<Set<string>>(new Set())
+  const handleToggleCollapse = useCallback((teamId: string) => {
+    setCollapsedTeams(prev => {
+      const next = new Set(prev)
+      if (next.has(teamId)) {
+        next.delete(teamId)
+      } else {
+        next.add(teamId)
+      }
+      return next
+    })
+  }, [])
+
   // Pre-flatten label tree once for efficient ID lookups in each SessionItem
   const flatLabels = useMemo(() => flattenLabels(labels), [labels])
 
@@ -1027,10 +1135,38 @@ export function SessionList({
     }
   }, [searchActive])
 
-  // Sort by most recent activity first
-  const sortedItems = [...visibleItems].sort((a, b) =>
-    (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
-  )
+  // Sort by most recent activity first, then group team sessions together
+  // Team leads stay in their natural position; teammates are pulled out and
+  // placed directly after their lead so the team appears as a visual group.
+  const sortedItems = useMemo(() => {
+    const byTime = [...visibleItems].sort((a, b) =>
+      (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
+    )
+
+    // Group teammates right after their lead
+    const result: SessionMeta[] = []
+    const inserted = new Set<string>()
+
+    for (const item of byTime) {
+      if (inserted.has(item.id)) continue
+      inserted.add(item.id)
+      result.push(item)
+
+      // If this is a team lead, insert its teammates right after
+      if (item.isTeamLead && item.teammateSessionIds && item.teammateSessionIds.length > 0) {
+        for (const teammateId of item.teammateSessionIds) {
+          if (inserted.has(teammateId)) continue
+          const teammate = byTime.find(s => s.id === teammateId)
+          if (teammate) {
+            inserted.add(teammateId)
+            result.push(teammate)
+          }
+        }
+      }
+    }
+
+    return result
+  }, [visibleItems])
 
   // Filter items by search query — ripgrep content search only for consistent results
   // When not in search mode, apply current filter to maintain filtered view
@@ -1625,50 +1761,91 @@ export function SessionList({
               )}
             </>
           ) : (
-            /* Normal mode: show date-grouped sessions */
-            dateGroups.map((group) => (
-              <div key={group.date.toISOString()}>
-                <SessionListSectionHeader label={group.label} />
-                {group.sessions.map((item, indexInGroup) => {
-                  const flatIndex = sessionIndexMap.get(item.id) ?? 0
-                  const itemProps = getItemProps(item, flatIndex)
-                  return (
-                    <SessionItem
-                      key={item.id}
-                      item={item}
-                      index={flatIndex}
-                      itemProps={itemProps}
-                      isSelected={selectionState.selected === item.id}
-                      isLast={flatIndex === flatItems.length - 1}
-                      isFirstInGroup={indexInGroup === 0}
-                      onKeyDown={handleKeyDown}
-                      onRenameClick={handleRenameClick}
-                      onTodoStateChange={onTodoStateChange}
-                      onFlag={onFlag ? handleFlagWithToast : undefined}
-                      onUnflag={onUnflag ? handleUnflagWithToast : undefined}
-                      onArchive={onArchive ? handleArchiveWithToast : undefined}
-                      onUnarchive={onUnarchive ? handleUnarchiveWithToast : undefined}
-                      onMarkUnread={onMarkUnread}
-                      onDelete={handleDeleteWithToast}
-                      onSelect={() => handleSelectSession(item, flatIndex)}
-                      onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
-                      permissionMode={sessionOptions?.get(item.id)?.permissionMode}
-                      searchQuery={searchQuery}
-                      todoStates={todoStates}
-                      flatLabels={flatLabels}
-                      labels={labels}
-                      onLabelsChange={onLabelsChange}
-                      chatMatchCount={contentSearchResults.get(item.id)?.matchCount}
-                      isMultiSelectActive={isMultiSelectActive}
-                      isInMultiSelect={isSessionSelected(item.id)}
-                      onToggleSelect={() => handleToggleSelect(item, flatIndex)}
-                      onRangeSelect={() => handleRangeSelect(flatIndex)}
-                      onFocusZone={() => focusZone('session-list', { intent: 'click', moveFocus: false })}
-                    />
-                  )
-                })}
-              </div>
-            ))
+            /* Normal mode: show date-grouped sessions with team grouping */
+            dateGroups.map((group) => {
+              // Build a set of teammate IDs that belong to a lead in this group
+              // so we can skip them during iteration (they're rendered inside TeamGroup)
+              const teammateIdsInGroup = new Set<string>()
+              for (const item of group.sessions) {
+                if (item.isTeamLead && item.teammateSessionIds) {
+                  for (const tid of item.teammateSessionIds) teammateIdsInGroup.add(tid)
+                }
+              }
+
+              // Helper to render a SessionItem (reused by both standalone + TeamGroup)
+              const renderItem = (item: SessionMeta, isFirstInGroup: boolean) => {
+                const flatIndex = sessionIndexMap.get(item.id) ?? 0
+                const itemProps = getItemProps(item, flatIndex)
+                return (
+                  <SessionItem
+                    key={item.id}
+                    item={item}
+                    index={flatIndex}
+                    itemProps={itemProps}
+                    isSelected={selectionState.selected === item.id}
+                    isLast={flatIndex === flatItems.length - 1}
+                    isFirstInGroup={isFirstInGroup}
+                    onKeyDown={handleKeyDown}
+                    onRenameClick={handleRenameClick}
+                    onTodoStateChange={onTodoStateChange}
+                    onFlag={onFlag ? handleFlagWithToast : undefined}
+                    onUnflag={onUnflag ? handleUnflagWithToast : undefined}
+                    onArchive={onArchive ? handleArchiveWithToast : undefined}
+                    onUnarchive={onUnarchive ? handleUnarchiveWithToast : undefined}
+                    onMarkUnread={onMarkUnread}
+                    onDelete={handleDeleteWithToast}
+                    onSelect={() => handleSelectSession(item, flatIndex)}
+                    onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
+                    permissionMode={sessionOptions?.get(item.id)?.permissionMode}
+                    searchQuery={searchQuery}
+                    todoStates={todoStates}
+                    flatLabels={flatLabels}
+                    labels={labels}
+                    onLabelsChange={onLabelsChange}
+                    chatMatchCount={contentSearchResults.get(item.id)?.matchCount}
+                    isMultiSelectActive={isMultiSelectActive}
+                    isInMultiSelect={isSessionSelected(item.id)}
+                    onToggleSelect={() => handleToggleSelect(item, flatIndex)}
+                    onRangeSelect={() => handleRangeSelect(flatIndex)}
+                    onFocusZone={() => focusZone('session-list', { intent: 'click', moveFocus: false })}
+                  />
+                )
+              }
+
+              return (
+                <div key={group.date.toISOString()}>
+                  <SessionListSectionHeader label={group.label} />
+                  {group.sessions.map((item, indexInGroup) => {
+                    // Skip teammates — they're rendered inside their lead's TeamGroup
+                    if (item.parentSessionId) {
+                      return null
+                    }
+
+                    // Team lead — render as a collapsible TeamGroup
+                    if (item.isTeamLead && item.teammateSessionIds && item.teammateSessionIds.length > 0) {
+                      // Find teammate SessionMeta objects from the full list
+                      const teammates = (item.teammateSessionIds || [])
+                        .map(tid => group.sessions.find(s => s.id === tid) || paginatedItems.find(s => s.id === tid))
+                        .filter((t): t is SessionMeta => t != null)
+
+                      return (
+                        <TeamGroup
+                          key={item.id}
+                          lead={item}
+                          teammates={teammates}
+                          collapsedTeams={collapsedTeams}
+                          onToggleCollapse={handleToggleCollapse}
+                          renderSessionItem={renderItem}
+                        />
+                      )
+                    }
+
+                    // Regular session
+                    return renderItem(item, indexInGroup === 0)
+                  })}
+                </div>
+              )
+            })
           )}
           {/* Load more sentinel - triggers infinite scroll */}
           {hasMore && (

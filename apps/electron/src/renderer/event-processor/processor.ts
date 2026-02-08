@@ -206,6 +206,35 @@ export function processEvent(
       // This allows reusing existing turn-utils extraction logic for TurnCard todos
       return handleTodosUpdated(state, event)
 
+    case 'team_initialized': {
+      // Set teamId and isTeamLead on the session so UI renders TeamDashboard
+      const teamSession = {
+        ...state.session,
+        teamId: event.teamId,
+        isTeamLead: true,
+      }
+      return {
+        state: { ...state, session: teamSession },
+        effects: [],
+      }
+    }
+
+    case 'team_session_created': {
+      // A teammate session was spawned - update the lead session to track it
+      const existingTeammateIds = state.session.teammateSessionIds || []
+      const updatedLeadSession = {
+        ...state.session,
+        teamId: event.teamId,
+        isTeamLead: true,
+        teamColor: event.teamColor ?? state.session.teamColor,
+        teammateSessionIds: [...existingTeammateIds, event.teammateSessionId],
+      }
+      return {
+        state: { ...state, session: updatedLeadSession },
+        effects: [],
+      }
+    }
+
     default: {
       // Unknown event type - return state unchanged but as new reference
       // to ensure atom sync detects the "change"

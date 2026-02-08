@@ -431,6 +431,31 @@ export interface TodosUpdatedEvent {
 }
 
 /**
+ * Team initialized event - an agent team has been created and teammates are being spawned.
+ * Sets teamId and isTeamLead on the session so the UI can show the TeamDashboard.
+ */
+export interface TeamInitializedEvent {
+  type: 'team_initialized'
+  sessionId: string
+  teamId: string
+  teammateName?: string
+}
+
+/**
+ * Team session created event - a teammate session has been spawned.
+ * Updates the lead session's metadata to track the new teammate.
+ * sessionId is the lead session, teammateSessionId is the new teammate's session.
+ */
+export interface TeamSessionCreatedEvent {
+  type: 'team_session_created'
+  sessionId: string
+  teammateSessionId: string
+  teammateName: string
+  teamId: string
+  teamColor?: string
+}
+
+/**
  * Union of all agent events
  */
 export type AgentEvent =
@@ -473,6 +498,8 @@ export type AgentEvent =
   | SourceActivatedEvent
   | UsageUpdateEvent
   | TodosUpdatedEvent
+  | TeamInitializedEvent
+  | TeamSessionCreatedEvent
 
 /**
  * Side effects that need to be handled outside the pure processor

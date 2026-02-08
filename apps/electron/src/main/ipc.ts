@@ -42,6 +42,17 @@ function sanitizeFilename(name: string): string {
 }
 
 /**
+ * Get ISO week number for a date.
+ */
+function getISOWeekNumber(date: Date): number {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+  const dayNum = d.getUTCDay() || 7
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum)
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
+  return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+}
+
+/**
  * Get workspace by ID or name, throwing if not found.
  * Use this when a workspace must exist for the operation to proceed.
  */
@@ -1656,6 +1667,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const { loadWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
     const config = loadWorkspaceConfig(workspace.rootPath)
 
+    const qg = config?.agentTeams?.qualityGates
     return {
       name: config?.name,
       model: config?.defaults?.model,
@@ -1665,16 +1677,35 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       workingDirectory: config?.defaults?.workingDirectory,
       localMcpEnabled: config?.localMcpServers?.enabled ?? true,
       defaultLlmConnection: config?.defaults?.defaultLlmConnection,
+      agentTeamsEnabled: config?.agentTeams?.enabled ?? false,
+      agentTeamsModelPreset: config?.agentTeams?.modelPreset,
+      agentTeamsLeadModel: config?.agentTeams?.leadModel,
+      agentTeamsHeadModel: config?.agentTeams?.headModel,
+      agentTeamsWorkerModel: config?.agentTeams?.workerModel,
+      agentTeamsEscalationModel: config?.agentTeams?.escalationModel,
+      agentTeamsCostCapUsd: config?.agentTeams?.costCapUsd,
+      // Quality gate settings
+      qualityGatesEnabled: qg?.enabled ?? true,
+      qualityGatesPassThreshold: qg?.passThreshold ?? 90,
+      qualityGatesMaxCycles: qg?.maxReviewCycles ?? 5,
+      qualityGatesEnforceTDD: qg?.enforceTDD ?? true,
+      qualityGatesReviewModel: qg?.reviewModel ?? 'kimi-k2.5',
+      qualityGatesSyntaxEnabled: qg?.stages?.syntax?.enabled ?? true,
+      qualityGatesTestsEnabled: qg?.stages?.tests?.enabled ?? true,
+      qualityGatesArchEnabled: qg?.stages?.architecture?.enabled ?? true,
+      qualityGatesSimplicityEnabled: qg?.stages?.simplicity?.enabled ?? true,
+      qualityGatesErrorsEnabled: qg?.stages?.errors?.enabled ?? true,
+      qualityGatesCompletenessEnabled: qg?.stages?.completeness?.enabled ?? true,
     }
   })
 
   // Update a workspace setting
-  // Valid keys: 'name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled', 'defaultLlmConnection'
+  // Valid keys: 'name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', etc.
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_SETTINGS_UPDATE, async (_event, workspaceId: string, key: string, value: unknown) => {
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled', 'defaultLlmConnection']
+    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -1685,6 +1716,16 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       if (!getLlmConnection(value as string)) {
         throw new Error(`LLM connection "${value}" not found`)
       }
+    }
+
+    // Agent teams config key → agentTeams field mapping
+    const agentTeamsKeyMap: Record<string, string> = {
+      agentTeamsModelPreset: 'modelPreset',
+      agentTeamsLeadModel: 'leadModel',
+      agentTeamsHeadModel: 'headModel',
+      agentTeamsWorkerModel: 'workerModel',
+      agentTeamsEscalationModel: 'escalationModel',
+      agentTeamsCostCapUsd: 'costCapUsd',
     }
 
     const { loadWorkspaceConfig, saveWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
@@ -1700,6 +1741,49 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       // Store in localMcpServers.enabled (top-level, not in defaults)
       config.localMcpServers = config.localMcpServers || { enabled: true }
       config.localMcpServers.enabled = Boolean(value)
+    } else if (key === 'agentTeamsEnabled') {
+      // Store in agentTeams.enabled (top-level, not in defaults)
+      config.agentTeams = config.agentTeams || { enabled: false }
+      config.agentTeams.enabled = Boolean(value)
+    } else if (key in agentTeamsKeyMap) {
+      // Store agent teams model/cost settings in config.agentTeams
+      config.agentTeams = config.agentTeams || { enabled: false }
+      ;(config.agentTeams as unknown as Record<string, unknown>)[agentTeamsKeyMap[key]] = value
+    } else if (key.startsWith('qualityGates')) {
+      // Store quality gate settings in config.agentTeams.qualityGates
+      config.agentTeams = config.agentTeams || { enabled: false }
+      const qg: Record<string, unknown> = (config.agentTeams.qualityGates || {}) as Record<string, unknown>
+
+      // Top-level quality gate fields
+      const qgTopLevelMap: Record<string, string> = {
+        qualityGatesEnabled: 'enabled',
+        qualityGatesPassThreshold: 'passThreshold',
+        qualityGatesMaxCycles: 'maxReviewCycles',
+        qualityGatesEnforceTDD: 'enforceTDD',
+        qualityGatesReviewModel: 'reviewModel',
+      }
+
+      // Per-stage enabled toggles
+      const qgStageMap: Record<string, string> = {
+        qualityGatesSyntaxEnabled: 'syntax',
+        qualityGatesTestsEnabled: 'tests',
+        qualityGatesArchEnabled: 'architecture',
+        qualityGatesSimplicityEnabled: 'simplicity',
+        qualityGatesErrorsEnabled: 'errors',
+        qualityGatesCompletenessEnabled: 'completeness',
+      }
+
+      if (key in qgTopLevelMap) {
+        qg[qgTopLevelMap[key]] = value
+      } else if (key in qgStageMap) {
+        const stages = (qg.stages || {}) as Record<string, Record<string, unknown>>
+        const stageName = qgStageMap[key]
+        stages[stageName] = stages[stageName] || {}
+        stages[stageName].enabled = Boolean(value)
+        qg.stages = stages
+      }
+
+      config.agentTeams.qualityGates = qg as typeof config.agentTeams.qualityGates
     } else {
       // Update the setting in defaults
       config.defaults = config.defaults || {}
@@ -3310,5 +3394,332 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Note: Permission mode cycling settings (cyclablePermissionModes) are now workspace-level
   // and managed via WORKSPACE_SETTINGS_GET/UPDATE channels
+
+  // ============================================================
+  // Agent Teams
+  // ============================================================
+
+  // Get whether agent teams are enabled for a workspace
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_ENABLED, async (_event, workspaceId: string) => {
+    const workspace = getWorkspaceOrThrow(workspaceId)
+    const { isAgentTeamsEnabled } = await import('@craft-agent/shared/workspaces')
+    return isAgentTeamsEnabled(workspace.rootPath)
+  })
+
+  // Toggle agent teams on/off for a workspace
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SET_ENABLED, async (_event, workspaceId: string, enabled: boolean) => {
+    const workspace = getWorkspaceOrThrow(workspaceId)
+    const { setAgentTeamsEnabled } = await import('@craft-agent/shared/workspaces')
+    setAgentTeamsEnabled(workspace.rootPath, enabled)
+    ipcLog.info(`Agent teams ${enabled ? 'enabled' : 'disabled'} for workspace ${workspaceId}`)
+  })
+
+  // Create a new agent team
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_CREATE, async (_event, options: {
+    name: string;
+    leadSessionId: string;
+    workspaceId: string;
+    modelPreset?: string;
+  }) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const { getDefaultPreset } = await import('@craft-agent/shared/providers/presets')
+    const workspace = getWorkspaceOrThrow(options.workspaceId)
+    const preset = getDefaultPreset()
+
+    const team = teamManager.createTeam({
+      name: options.name,
+      leadSessionId: options.leadSessionId,
+      modelConfig: preset.config,
+      modelPreset: (options.modelPreset as any) || preset.id,
+      workspaceRootPath: workspace.rootPath,
+    })
+
+    ipcLog.info(`Agent team created: ${team.id} (${team.name})`)
+    return team
+  })
+
+  // Clean up a team
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_CLEANUP, async (_event, teamId: string) => {
+    // Find the lead session for this team and clean up via SessionManager
+    const sessions = sessionManager.getSessions()
+    const leadSession = sessions.find(s => s.teamId === teamId && s.isTeamLead)
+    if (leadSession) {
+      await sessionManager.cleanupTeam(leadSession.id)
+    }
+    ipcLog.info(`Agent team cleaned up: ${teamId}`)
+  })
+
+  // Get team status
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_STATUS, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.getTeam(teamId)
+  })
+
+  // Spawn a new teammate
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SPAWN_TEAMMATE, async (_event, options: {
+    teamId: string;
+    name: string;
+    role: string;
+    model: string;
+    provider: string;
+  }) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const teammate = teamManager.spawnTeammate(options)
+    ipcLog.info(`Teammate spawned: ${teammate.id} (${teammate.name}, ${teammate.model})`)
+    return teammate
+  })
+
+  // Shut down a teammate
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SHUTDOWN_TEAMMATE, async (_event, teamId: string, teammateId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    teamManager.shutdownTeammate(teamId, teammateId)
+    ipcLog.info(`Teammate shut down: ${teammateId}`)
+  })
+
+  // Send message between teammates
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SEND_MESSAGE, async (_event, teamId: string, from: string, to: string, content: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.sendMessage(teamId, from, to, content)
+  })
+
+  // Broadcast message to all teammates
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_BROADCAST, async (_event, teamId: string, from: string, content: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.broadcastMessage(teamId, from, content)
+  })
+
+  // Get task list
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_TASKS, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.getTasks(teamId)
+  })
+
+  // Update a task
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_UPDATE_TASK, async (_event, teamId: string, taskId: string, status: string, assignee?: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    teamManager.updateTaskStatus(teamId, taskId, status as any, assignee)
+  })
+
+  // Get cost summary
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_COST, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.getCostSummary(teamId)
+  })
+
+  // Swap teammate model
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SWAP_MODEL, async (_event, teamId: string, teammateId: string, newModel: string, newProvider: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const team = teamManager.getTeam(teamId)
+    if (!team) throw new Error(`Team not found: ${teamId}`)
+    const teammate = team.members.find(m => m.id === teammateId)
+    if (!teammate) throw new Error(`Teammate not found: ${teammateId}`)
+
+    const oldModel = teammate.model
+    teammate.model = newModel
+    teammate.provider = newProvider
+    ipcLog.info(`Teammate ${teammateId} model swapped: ${oldModel} → ${newModel}`)
+    return teammate
+  })
+
+  // Get provider API key status (returns masked key, never the raw secret)
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_PROVIDER_KEY, async (_event, provider: 'moonshot' | 'openrouter') => {
+    const manager = getCredentialManager()
+    let key: string | null = null
+    if (provider === 'moonshot') {
+      key = await manager.getMoonshotApiKey()
+    } else if (provider === 'openrouter') {
+      key = await manager.getOpenRouterApiKey()
+    }
+    if (!key) return { hasKey: false }
+    // Return masked version: show first 4 and last 4 chars
+    const masked = key.length > 10
+      ? `${key.slice(0, 4)}${'*'.repeat(key.length - 8)}${key.slice(-4)}`
+      : '*'.repeat(key.length)
+    return { hasKey: true, maskedKey: masked }
+  })
+
+  // Save provider API key to secure encrypted storage
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SET_PROVIDER_KEY, async (_event, provider: 'moonshot' | 'openrouter', key: string) => {
+    const manager = getCredentialManager()
+    if (provider === 'moonshot') {
+      await manager.setMoonshotApiKey(key)
+    } else if (provider === 'openrouter') {
+      await manager.setOpenRouterApiKey(key)
+    } else {
+      throw new Error(`Unknown provider: ${provider}`)
+    }
+    ipcLog.info(`Provider API key saved for: ${provider}`)
+  })
+
+  // ============================================================
+  // Usage Tracking Handlers
+  // ============================================================
+
+  // Get usage data for a specific session
+  ipcMain.handle(IPC_CHANNELS.USAGE_GET_SESSION, async (_event, sessionId: string) => {
+    // Will be implemented when persistence is ready
+    // For now return null
+    return null
+  })
+
+  // Get current week's usage summary (computed from session tokenUsage data)
+  ipcMain.handle(IPC_CHANNELS.USAGE_GET_WEEKLY, async () => {
+    try {
+      const sessions = sessionManager.getSessions()
+      if (!sessions.length) return null
+
+      // Compute current week boundaries (Monday to Sunday)
+      const now = new Date()
+      const dayOfWeek = now.getDay() // 0=Sun, 1=Mon, ...
+      const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek
+      const weekStart = new Date(now)
+      weekStart.setDate(now.getDate() + mondayOffset)
+      weekStart.setHours(0, 0, 0, 0)
+      const weekEnd = new Date(weekStart)
+      weekEnd.setDate(weekStart.getDate() + 6)
+      weekEnd.setHours(23, 59, 59, 999)
+
+      // Filter sessions to current week
+      const weekSessions = sessions.filter(s => {
+        const ts = s.lastMessageAt || s.createdAt
+        return ts >= weekStart.getTime() && ts <= weekEnd.getTime()
+      })
+
+      // Aggregate usage
+      let totalCalls = 0, totalIn = 0, totalOut = 0, totalCost = 0
+      const providerTotals: Record<string, { callCount: number; inputTokens: number; outputTokens: number; estimatedCostUsd: number }> = {}
+
+      for (const s of weekSessions) {
+        if (s.tokenUsage) {
+          totalIn += s.tokenUsage.inputTokens || 0
+          totalOut += s.tokenUsage.outputTokens || 0
+          totalCost += s.tokenUsage.costUsd || 0
+          totalCalls += 1 // Count sessions as calls (individual API call tracking not available from tokenUsage)
+        }
+      }
+
+      // Build week identifier
+      const weekNum = getISOWeekNumber(weekStart)
+      const weekIdentifier = `${weekStart.getFullYear()}-W${String(weekNum).padStart(2, '0')}`
+
+      return {
+        weekIdentifier,
+        startDate: weekStart.toISOString(),
+        endDate: weekEnd.toISOString(),
+        sessionCount: weekSessions.length,
+        totals: {
+          calls: totalCalls,
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          estimatedCostUsd: totalCost,
+          durationMs: 0,
+        },
+        providerBreakdown: providerTotals,
+        dailyBreakdown: [],
+        sessions: weekSessions.map(s => ({
+          sessionId: s.id,
+          startedAt: new Date(s.createdAt).toISOString(),
+          endedAt: new Date(s.lastMessageAt || s.createdAt).toISOString(),
+          calls: 1,
+          tokens: (s.tokenUsage?.inputTokens || 0) + (s.tokenUsage?.outputTokens || 0),
+          estimatedCostUsd: s.tokenUsage?.costUsd || 0,
+          primaryModel: s.model || 'unknown',
+          hadTeams: !!s.isTeamLead,
+        })),
+      }
+    } catch (err) {
+      ipcLog.error('Failed to compute weekly usage:', err)
+      return null
+    }
+  })
+
+  // Get recent weeks' usage summaries
+  ipcMain.handle(IPC_CHANNELS.USAGE_GET_RECENT_WEEKS, async (_event, count: number = 4) => {
+    try {
+      const sessions = sessionManager.getSessions()
+      if (!sessions.length) return []
+
+      // Group sessions by ISO week
+      const weekMap = new Map<string, typeof sessions>()
+      for (const s of sessions) {
+        const ts = new Date(s.lastMessageAt || s.createdAt)
+        const weekNum = getISOWeekNumber(ts)
+        const key = `${ts.getFullYear()}-W${String(weekNum).padStart(2, '0')}`
+        if (!weekMap.has(key)) weekMap.set(key, [])
+        weekMap.get(key)!.push(s)
+      }
+
+      // Sort weeks descending and take requested count (skip current week)
+      const now = new Date()
+      const currentWeekNum = getISOWeekNumber(now)
+      const currentWeekKey = `${now.getFullYear()}-W${String(currentWeekNum).padStart(2, '0')}`
+
+      const sortedWeeks = [...weekMap.entries()]
+        .filter(([key]) => key !== currentWeekKey)
+        .sort((a, b) => b[0].localeCompare(a[0]))
+        .slice(0, count)
+
+      return sortedWeeks.map(([weekId, weekSessions]) => {
+        let totalIn = 0, totalOut = 0, totalCost = 0
+        for (const s of weekSessions) {
+          if (s.tokenUsage) {
+            totalIn += s.tokenUsage.inputTokens || 0
+            totalOut += s.tokenUsage.outputTokens || 0
+            totalCost += s.tokenUsage.costUsd || 0
+          }
+        }
+        // Compute week start date from week identifier
+        const [yearStr, weekStr] = weekId.split('-W')
+        const jan1 = new Date(parseInt(yearStr), 0, 1)
+        const daysToMonday = (parseInt(weekStr) - 1) * 7
+        const weekStartDate = new Date(jan1.getTime() + daysToMonday * 86400000)
+
+        return {
+          weekIdentifier: weekId,
+          startDate: weekStartDate.toISOString(),
+          endDate: new Date(weekStartDate.getTime() + 6 * 86400000).toISOString(),
+          sessionCount: weekSessions.length,
+          totals: {
+            calls: weekSessions.length,
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            estimatedCostUsd: totalCost,
+            durationMs: 0,
+          },
+          providerBreakdown: {},
+          dailyBreakdown: [],
+          sessions: [],
+        }
+      })
+    } catch (err) {
+      ipcLog.error('Failed to compute recent weeks usage:', err)
+      return []
+    }
+  })
+
+  // Get usage alert thresholds
+  ipcMain.handle(IPC_CHANNELS.USAGE_GET_THRESHOLDS, async () => {
+    return { weeklySpendWarningUsd: 10.00, sessionCallsWarning: 100 }
+  })
+
+  // Set usage alert thresholds
+  ipcMain.handle(IPC_CHANNELS.USAGE_SET_THRESHOLDS, async (_event, thresholds: unknown) => {
+    // Will persist to config
+    return { success: true }
+  })
+
+  // Export usage data as CSV
+  ipcMain.handle(IPC_CHANNELS.USAGE_EXPORT_CSV, async (_event, csvContent: string) => {
+    const result = await dialog.showSaveDialog({
+      title: 'Export Usage Data',
+      defaultPath: `usage-export-${new Date().toISOString().split('T')[0]}.csv`,
+      filters: [{ name: 'CSV Files', extensions: ['csv'] }],
+    })
+    if (!result.canceled && result.filePath) {
+      await writeFile(result.filePath, csvContent, 'utf-8')
+      return { success: true, path: result.filePath }
+    }
+    return { success: false }
+  })
 
 }

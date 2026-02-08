@@ -11,6 +11,7 @@ let customPathToClaudeCodeExecutable: string | null = null;
 let customInterceptorPath: string | null = null;
 let customExecutable: string | null = null;
 let claudeConfigChecked = false;
+let agentTeamsEnabled = false;
 
 // UTF-8 BOM character — Windows editors/processes sometimes prepend this to files.
 // JSON parsers reject BOM, but the file content after BOM may be valid JSON.
@@ -157,6 +158,15 @@ export function setAnthropicOptionsEnv(env: Record<string, string>) {
 }
 
 /**
+ * Enable or disable the experimental agent teams feature for the SDK subprocess.
+ * When enabled, sets CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the SDK environment,
+ * which exposes team-related tools (spawn teammate, message, broadcast, task management).
+ */
+export function setAgentTeamsEnabled(enabled: boolean) {
+    agentTeamsEnabled = enabled;
+}
+
+/**
  * Override the path to the Claude Code executable (cli.js from the SDK).
  * This is needed when the SDK is bundled (e.g., in Electron) and can't auto-detect the path.
  */
@@ -193,6 +203,11 @@ export function getDefaultOptions(): Partial<Options> {
     const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
     const envFileFlag = `--env-file=${nullDevice}`;
 
+    // Agent teams env var — only set when enabled via workspace config
+    const agentTeamsEnv = agentTeamsEnabled
+        ? { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1' }
+        : {};
+
     // If custom path is set (e.g., for Electron), use it with minimal options
     if (customPathToClaudeCodeExecutable) {
         const executableArgs = [envFileFlag];
@@ -208,6 +223,7 @@ export function getDefaultOptions(): Partial<Options> {
             env: {
                 ...process.env,
                 ... optionsEnv,
+                ...agentTeamsEnv,
                 // Propagate debug mode from argv flag OR existing env var
                 CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
             }
@@ -228,6 +244,7 @@ export function getDefaultOptions(): Partial<Options> {
                 ...process.env,
                 BUN_BE_BUN: '1',
                 ... optionsEnv,
+                ...agentTeamsEnv,
                 // Propagate debug mode from argv flag OR existing env var
                 CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
             }
@@ -238,6 +255,7 @@ export function getDefaultOptions(): Partial<Options> {
         env: {
             ... process.env,
             ... optionsEnv,
+            ...agentTeamsEnv,
             // Propagate debug mode from argv flag OR existing env var
             CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
         }

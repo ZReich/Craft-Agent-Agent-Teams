@@ -182,6 +182,28 @@ export class CredentialManager {
     await this.set({ type: 'anthropic_api_key' }, { value: key });
   }
 
+  /** Get Moonshot API key (for Kimi models) */
+  async getMoonshotApiKey(): Promise<string | null> {
+    const cred = await this.get({ type: 'moonshot_api_key' });
+    return cred?.value || null;
+  }
+
+  /** Set Moonshot API key (for Kimi models) */
+  async setMoonshotApiKey(key: string): Promise<void> {
+    await this.set({ type: 'moonshot_api_key' }, { value: key });
+  }
+
+  /** Get OpenRouter API key (for third-party models) */
+  async getOpenRouterApiKey(): Promise<string | null> {
+    const cred = await this.get({ type: 'openrouter_api_key' });
+    return cred?.value || null;
+  }
+
+  /** Set OpenRouter API key (for third-party models) */
+  async setOpenRouterApiKey(key: string): Promise<void> {
+    await this.set({ type: 'openrouter_api_key' }, { value: key });
+  }
+
   /** Get Claude OAuth token */
   async getClaudeOAuth(): Promise<string | null> {
     const cred = await this.get({ type: 'claude_oauth' });

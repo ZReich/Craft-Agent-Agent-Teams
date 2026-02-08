@@ -52,6 +52,15 @@ const componentSpecificSections: ShortcutSection[] = [
       { keys: ['Esc'], description: 'Close dialog / blur input' },
     ],
   },
+  {
+    title: 'Agent Teams',
+    shortcuts: [
+      { keys: [cmdKey, 'T'], description: 'Toggle task list panel' },
+      { keys: [cmdKey, 'Shift', 'D'], description: 'Toggle delegate mode' },
+      { keys: ['Shift', '↑'], description: 'Previous teammate' },
+      { keys: ['Shift', '↓'], description: 'Next teammate' },
+    ],
+  },
 ]
 
 function Kbd({ children }: { children: React.ReactNode }) {

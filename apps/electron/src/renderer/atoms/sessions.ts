@@ -73,10 +73,20 @@ export interface SessionMeta {
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number
   // Sub-session hierarchy (1 level max)
-  /** Parent session ID (if this is a sub-session). Null/undefined = root session. */
+  /** Parent session ID (if this is a sub-session or teammate). Null/undefined = root session. */
   parentSessionId?: string
   /** Explicit sibling order (lazy - only populated when user reorders). */
   siblingOrder?: number
+  /** Team ID (if this session is part of an agent team) */
+  teamId?: string
+  /** Whether this session is the team lead */
+  isTeamLead?: boolean
+  /** Display name for teammate sessions */
+  teammateName?: string
+  /** IDs of teammate sessions (lead tracks its children) */
+  teammateSessionIds?: string[]
+  /** Team accent color (hex) */
+  teamColor?: string
 }
 
 /**
@@ -135,6 +145,13 @@ export function extractSessionMeta(session: Session): SessionMeta {
     // Archive state
     isArchived: session.isArchived,
     archivedAt: session.archivedAt,
+    // Agent team fields
+    teamId: session.teamId,
+    isTeamLead: session.isTeamLead,
+    parentSessionId: session.parentSessionId,
+    teammateName: session.teammateName,
+    teammateSessionIds: session.teammateSessionIds,
+    teamColor: session.teamColor,
   }
 }
 

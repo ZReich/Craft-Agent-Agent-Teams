@@ -166,6 +166,8 @@ export const NavigationRegistry = {
       labels: PlaceholderComponent, // LabelsSettingsPage
       shortcuts: PlaceholderComponent, // ShortcutsPage
       preferences: PlaceholderComponent, // PreferencesPage
+      'agent-teams': PlaceholderComponent, // AgentTeamsSettingsPage
+      usage: PlaceholderComponent, // UsageSettingsPage
     },
     defaultDetails: 'app', // Always has a default
     getFirstItem: () => 'app',

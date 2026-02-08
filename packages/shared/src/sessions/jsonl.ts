@@ -114,6 +114,15 @@ export function createSessionHeader(session: StoredSession): SessionHeader {
     preview: extractPreview(session.messages),
     tokenUsage: session.tokenUsage,
     lastFinalMessageId: extractLastFinalMessageId(session.messages),
+    // Hidden flag for mini-agent sessions (not shown in session list)
+    hidden: session.hidden,
+    // Agent team fields
+    teamId: session.teamId,
+    isTeamLead: session.isTeamLead,
+    parentSessionId: session.parentSessionId,
+    teammateName: session.teammateName,
+    teammateSessionIds: session.teammateSessionIds,
+    teamColor: session.teamColor,
   } as SessionHeader;
 }
 

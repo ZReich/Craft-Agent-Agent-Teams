@@ -1,6 +1,7 @@
 import { app } from 'electron'
 import * as Sentry from '@sentry/electron/main'
 import { basename, join } from 'path'
+import { homedir } from 'os'
 import { existsSync } from 'fs'
 import { rm, readFile, mkdir, writeFile, rename, open } from 'fs/promises'
 import { CraftAgent, type AgentEvent, setPermissionMode, type PermissionMode, unregisterSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest } from '@craft-agent/shared/agent'
@@ -34,7 +35,7 @@ import {
   migrateOrphanedDefaultConnections,
   type Workspace,
 } from '@craft-agent/shared/config'
-import { loadWorkspaceConfig } from '@craft-agent/shared/workspaces'
+import { loadWorkspaceConfig, isAgentTeamsEnabled } from '@craft-agent/shared/workspaces'
 import {
   // Session persistence functions
   listSessions as listStoredSessions,
@@ -67,15 +68,18 @@ import {
 import { loadWorkspaceSources, loadAllSources, getSourcesBySlugs, isSourceUsable, type LoadedSource, type McpServerConfig, getSourcesNeedingAuth, getSourceCredentialManager, getSourceServerBuilder, type SourceWithCredential, isApiOAuthProvider, SERVER_BUILD_ERRORS, TokenRefreshManager, createTokenGetter } from '@craft-agent/shared/sources'
 import { ConfigWatcher, type ConfigWatcherCallbacks } from '@craft-agent/shared/config'
 import { getValidClaudeOAuthToken } from '@craft-agent/shared/auth'
-import { setAnthropicOptionsEnv, setPathToClaudeCodeExecutable, setInterceptorPath, setExecutable } from '@craft-agent/shared/agent'
+import { setAnthropicOptionsEnv, setPathToClaudeCodeExecutable, setInterceptorPath, setExecutable, setAgentTeamsEnabled as setAgentTeamsEnvFlag } from '@craft-agent/shared/agent'
 import { toolMetadataStore } from '@craft-agent/shared/network-interceptor'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { generateSessionTitle, regenerateSessionTitle, formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon, type TitleGeneratorOptions } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta } from '@craft-agent/core/types'
-import { getToolIconsDir, isCodexModel, getMiniModel, getSummarizationModel } from '@craft-agent/shared/config'
+import type { ToolDisplayMeta, QualityGateConfig } from '@craft-agent/core/types'
+import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
+import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
+import { getAnthropicApiKey } from '@craft-agent/shared/config/storage'
+import { DEFAULT_MODEL, getToolIconsDir, isCodexModel, getMiniModel, getSummarizationModel } from '@craft-agent/shared/config'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
 import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
 import { listLabels } from '@craft-agent/shared/labels/storage'
@@ -129,6 +133,20 @@ export const AGENT_FLAGS = {
   /** Default modes enabled for new sessions */
   defaultModesEnabled: true,
 } as const
+
+/** Predefined team colors — high-contrast, accessible palette. Rotates by active team count. */
+const TEAM_COLORS = [
+  '#7c3aed', // violet
+  '#0891b2', // cyan
+  '#c2410c', // orange
+  '#15803d', // green
+  '#b91c1c', // red
+  '#1d4ed8', // blue
+  '#a16207', // amber
+  '#9333ea', // purple
+  '#0f766e', // teal
+  '#be185d', // pink
+] as const
 
 /**
  * Build MCP and API servers from sources using the new unified modules.
@@ -647,6 +665,12 @@ interface ManagedSession {
   // Sub-session hierarchy (1 level max)
   parentSessionId?: string
   siblingOrder?: number
+  // Agent team fields
+  teamId?: string
+  isTeamLead?: boolean
+  teammateName?: string
+  teammateSessionIds?: string[]
+  teamColor?: string
   // Token refresh manager for OAuth token refresh with rate limiting
   tokenRefreshManager: TokenRefreshManager
 }
@@ -782,6 +806,21 @@ export class SessionManager {
    * marked as unread when assistant completes - if user is viewing it, don't mark unread.
    */
   private activeViewingSession: Map<string, string> = new Map()
+
+  // Quality gate runner (lazy-initialized) and cycle tracking
+  private qualityGateRunner: QualityGateRunner | null = null
+  private qualityGateCycles: Map<string, number> = new Map()
+
+  private getQualityGateRunner(): QualityGateRunner {
+    if (!this.qualityGateRunner) {
+      const credManager = getCredentialManager()
+      this.qualityGateRunner = new QualityGateRunner({
+        getMoonshotApiKey: () => credManager.getMoonshotApiKey(),
+        getAnthropicApiKey: () => getAnthropicApiKey(),
+      })
+    }
+    return this.qualityGateRunner
+  }
 
   setWindowManager(wm: WindowManager): void {
     this.windowManager = wm
@@ -1243,6 +1282,13 @@ export class SessionManager {
             sharedUrl: meta.sharedUrl,
             sharedId: meta.sharedId,
             hidden: meta.hidden,
+            // Agent team fields (must be loaded for team grouping to persist across restarts)
+            teamId: meta.teamId,
+            isTeamLead: meta.isTeamLead,
+            parentSessionId: meta.parentSessionId,
+            teammateName: meta.teammateName,
+            teammateSessionIds: meta.teammateSessionIds,
+            teamColor: meta.teamColor,
             // Initialize TokenRefreshManager for this session
             tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
               log: (msg) => sessionLog.debug(msg),
@@ -1292,6 +1338,13 @@ export class SessionManager {
         model: managed.model,
         llmConnection: managed.llmConnection,
         connectionLocked: managed.connectionLocked,
+        // Agent team fields
+        teamId: managed.teamId,
+        isTeamLead: managed.isTeamLead,
+        parentSessionId: managed.parentSessionId,
+        teammateName: managed.teammateName,
+        teammateSessionIds: managed.teammateSessionIds,
+        teamColor: managed.teamColor,
         thinkingLevel: managed.thinkingLevel,
         messages: persistableMessages.map(messageToStored),
         tokenUsage: managed.tokenUsage ?? {
@@ -1612,6 +1665,14 @@ export class SessionManager {
         tokenUsage: m.tokenUsage,
         messageCount: m.messageCount,
         lastFinalMessageId: m.lastFinalMessageId,
+        hidden: m.hidden,
+        // Agent team fields
+        teamId: m.teamId,
+        isTeamLead: m.isTeamLead,
+        parentSessionId: m.parentSessionId,
+        teammateName: m.teammateName,
+        teammateSessionIds: m.teammateSessionIds,
+        teamColor: m.teamColor,
         // Runtime-only fields
         workspaceId: m.workspace.id,
         workspaceName: m.workspace.name,
@@ -1641,6 +1702,14 @@ export class SessionManager {
       lastMessageRole: m.lastMessageRole,
       tokenUsage: m.tokenUsage,
       lastFinalMessageId: m.lastFinalMessageId,
+      hidden: m.hidden,
+      // Agent team fields
+      teamId: m.teamId,
+      isTeamLead: m.isTeamLead,
+      parentSessionId: m.parentSessionId,
+      teammateName: m.teammateName,
+      teammateSessionIds: m.teammateSessionIds,
+      teamColor: m.teamColor,
       // Runtime-only fields
       workspaceId: m.workspace.id,
       workspaceName: m.workspace.name,
@@ -1779,6 +1848,12 @@ export class SessionManager {
       todoState: options?.todoState,
       labels: options?.labels,
       isFlagged: options?.isFlagged,
+      // Agent team fields
+      teamId: options?.teamId,
+      isTeamLead: options?.isTeamLead,
+      parentSessionId: options?.parentSessionId,
+      teammateName: options?.teammateName,
+      teamColor: options?.teamColor,
     })
 
     // Resolve connection to determine provider for model compatibility check
@@ -1833,6 +1908,12 @@ export class SessionManager {
       backgroundShellCommands: new Map(),
       messagesLoaded: true,  // New sessions don't need to load messages from disk
       hidden: options?.hidden,
+      // Agent team fields
+      teamId: options?.teamId,
+      isTeamLead: options?.isTeamLead,
+      parentSessionId: options?.parentSessionId,
+      teammateName: options?.teammateName,
+      teamColor: options?.teamColor,
       // Initialize TokenRefreshManager for this session (handles OAuth token refresh with rate limiting)
       tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
         log: (msg) => sessionLog.debug(msg),
@@ -1857,7 +1938,117 @@ export class SessionManager {
       thinkingLevel: defaultThinkingLevel,
       sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
       hidden: options?.hidden,
+      // Agent team fields
+      teamId: options?.teamId,
+      isTeamLead: options?.isTeamLead,
+      parentSessionId: options?.parentSessionId,
+      teammateName: options?.teammateName,
+      teamColor: options?.teamColor,
     }
+  }
+
+  /**
+   * Create a separate session for an agent team teammate.
+   * The teammate gets its own CraftAgent, SDK subprocess, and context window.
+   */
+  async createTeammateSession(params: {
+    parentSessionId: string
+    workspaceId: string
+    teamId: string
+    teammateName: string
+    prompt: string
+    model?: string
+  }): Promise<import('../shared/types').Session> {
+    const parent = this.sessions.get(params.parentSessionId)
+    if (!parent) {
+      throw new Error(`Parent session ${params.parentSessionId} not found`)
+    }
+
+    // Pick team color: count existing teams to rotate through the palette
+    let teamColor = parent.teamColor
+    if (!teamColor) {
+      const activeTeamIds = new Set<string>()
+      for (const [, s] of this.sessions) {
+        if (s.teamId) activeTeamIds.add(s.teamId)
+      }
+      teamColor = TEAM_COLORS[activeTeamIds.size % TEAM_COLORS.length]
+      // Set the color on the parent/lead session too
+      parent.teamColor = teamColor
+      parent.teamId = params.teamId
+      parent.isTeamLead = true
+    }
+
+    // Create the teammate session
+    const teammateSession = await this.createSession(params.workspaceId, {
+      teamId: params.teamId,
+      parentSessionId: params.parentSessionId,
+      teammateName: params.teammateName,
+      teamColor,
+      permissionMode: 'allow-all',
+      workingDirectory: parent.workingDirectory,
+      model: params.model,
+    })
+
+    // Track teammate in parent
+    if (!parent.teammateSessionIds) {
+      parent.teammateSessionIds = []
+    }
+    parent.teammateSessionIds.push(teammateSession.id)
+
+    // Persist parent with updated team fields
+    this.persistSession(parent)
+
+    // Emit team_session_created event to renderer
+    this.sendEvent({
+      type: 'team_session_created',
+      sessionId: params.parentSessionId,
+      teammateSessionId: teammateSession.id,
+      teammateName: params.teammateName,
+      teamId: params.teamId,
+      teamColor,
+    }, parent.workspace.id)
+
+    // Kick off the teammate by sending the prompt
+    // Use setTimeout to avoid blocking the caller
+    setTimeout(async () => {
+      try {
+        await this.sendMessage(teammateSession.id, params.prompt)
+      } catch (err) {
+        sessionLog.error(`Failed to start teammate ${params.teammateName}:`, err)
+      }
+    }, 100)
+
+    return teammateSession
+  }
+
+  /**
+   * Clean up an agent team — interrupt all running teammates and clear team state.
+   */
+  async cleanupTeam(leadSessionId: string): Promise<void> {
+    const lead = this.sessions.get(leadSessionId)
+    if (!lead || !lead.teammateSessionIds) return
+
+    sessionLog.info(`[AgentTeams] Cleaning up team for lead session ${leadSessionId}, ${lead.teammateSessionIds.length} teammates`)
+
+    // Interrupt all running teammate sessions
+    for (const teammateId of lead.teammateSessionIds) {
+      const teammate = this.sessions.get(teammateId)
+      if (teammate?.isProcessing && teammate.agent) {
+        try {
+          teammate.agent.forceAbort()
+          sessionLog.info(`[AgentTeams] Interrupted teammate ${teammateId}`)
+        } catch (err) {
+          sessionLog.error(`[AgentTeams] Failed to interrupt teammate ${teammateId}:`, err)
+        }
+      }
+    }
+
+    // Clear team state on lead
+    lead.teamId = undefined
+    lead.isTeamLead = undefined
+    lead.teammateSessionIds = undefined
+    lead.teamColor = undefined
+    this.persistSession(lead)
   }
 
   /**
@@ -2047,6 +2238,15 @@ export class SessionManager {
     if (!managed.agent) {
       const end = perf.start('agent.create', { sessionId: managed.id })
       const config = loadStoredConfig()
+
+      // Enable agent teams env var if workspace has it enabled
+      // This sets CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the SDK subprocess environment,
+      // which exposes team-related tools (spawn teammate, message, broadcast, task management)
+      const teamsEnabled = isAgentTeamsEnabled(managed.workspace.rootPath)
+      setAgentTeamsEnvFlag(teamsEnabled)
+      if (teamsEnabled) {
+        sessionLog.info(`Agent teams enabled for workspace ${managed.workspace.id}`)
+      }
 
       // Resolve LLM connection for this session
       const workspaceConfig = loadWorkspaceConfig(managed.workspace.rootPath)
@@ -2270,6 +2470,63 @@ export class SessionManager {
           debugMode: isDebugMode ? {
             enabled: true,
             logFilePath: getLogFilePath(),
+          } : undefined,
+          // Agent teams: callback to spawn teammates as separate sessions
+          onTeammateSpawnRequested: teamsEnabled ? async (params) => {
+            sessionLog.info(`[AgentTeams] Teammate spawn requested: ${params.teammateName} for team "${params.teamName}"`)
+            const teammateSession = await this.createTeammateSession({
+              parentSessionId: managed.id,
+              workspaceId: managed.workspace.id,
+              teamId: params.teamName,
+              teammateName: params.teammateName,
+              prompt: params.prompt,
+              model: params.model,
+            })
+            return { sessionId: teammateSession.id, agentId: teammateSession.id }
+          } : undefined,
+          // Agent teams: callback to route messages between teammate sessions
+          onTeammateMessage: teamsEnabled ? async (params) => {
+            const teammateIds = managed.teammateSessionIds || []
+            sessionLog.info(`[AgentTeams] Message routing: type=${params.type}, target=${params.targetName}, teammates=${teammateIds.length}`)
+
+            if (params.type === 'broadcast') {
+              // Send to all teammates
+              let delivered = 0
+              for (const tid of teammateIds) {
+                const teammate = this.sessions.get(tid)
+                if (teammate) {
+                  try {
+                    await this.sendMessage(tid, `[From Lead] ${params.content}`)
+                    delivered++
+                  } catch (err) {
+                    sessionLog.error(`[AgentTeams] Failed to broadcast to ${tid}:`, err)
+                  }
+                }
+              }
+              return { delivered: delivered > 0, error: delivered === 0 ? 'No teammates found' : undefined }
+            }
+
+            // Direct message: find teammate by name
+            for (const tid of teammateIds) {
+              const teammate = this.sessions.get(tid)
+              if (teammate?.teammateName === params.targetName || teammate?.name === params.targetName) {
+                if (params.type === 'shutdown_request') {
+                  // Force-abort the teammate
+                  if (teammate.agent && teammate.isProcessing) {
+                    teammate.agent.forceAbort()
+                  }
+                  return { delivered: true }
+                }
+                // Regular message
+                try {
+                  await this.sendMessage(tid, `[From Lead] ${params.content}`)
+                  return { delivered: true }
+                } catch (err) {
+                  return { delivered: false, error: String(err) }
+                }
+              }
+            }
+            return { delivered: false, error: `Teammate "${params.targetName}" not found` }
           } : undefined,
         })
         sessionLog.info(`Created Claude agent for session ${managed.id}${managed.sdkSessionId ? ' (resuming)' : ''}`)
@@ -3756,7 +4013,160 @@ export class SessionManager {
       await this.setTodoState(sessionId, 'done')
     }
 
-    // 4. Check queue and process or complete
+    // 4. Agent Teams: When a teammate session completes, run quality gates then relay results
+    //    This MUST happen before step 5 (queue/complete) so the lead gets the message
+    //    while it's still alive and listening.
+    if (reason === 'complete' && managed.parentSessionId && managed.teammateName) {
+      const lead = this.sessions.get(managed.parentSessionId)
+      if (lead && lead.isTeamLead) {
+        const lastAssistantMsg = [...managed.messages].reverse().find(m =>
+          m.role === 'assistant' && !m.isIntermediate
+        )
+        const resultContent = lastAssistantMsg?.content || '(No output produced)'
+        const teammateName = managed.teammateName
+
+        // Load quality gate config from workspace
+        const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+        const qgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
+
+        // Run quality gate pipeline if enabled
+        if (qgConfig.enabled) {
+          sessionLog.info(`[AgentTeams] Running quality gate pipeline for teammate "${teammateName}"`)
+
+          const cycleKey = `${sessionId}-qg`
+          const currentCycle = (this.qualityGateCycles.get(cycleKey) || 0) + 1
+          this.qualityGateCycles.set(cycleKey, currentCycle)
+
+          const runner = this.getQualityGateRunner()
+          const taskContext: TaskContext = {
+            taskDescription: managed.name || 'Teammate task',
+            workingDirectory: managed.workingDirectory,
+          }
+
+          try {
+            const result = await runner.runPipeline(resultContent, taskContext, qgConfig)
+            result.cycleCount = currentCycle
+            result.maxCycles = qgConfig.maxReviewCycles
+
+            if (result.passed) {
+              // PASSED — relay to lead with quality report
+              sessionLog.info(`[AgentTeams] Quality gate PASSED for "${teammateName}" (score: ${result.aggregateScore})`)
+              this.qualityGateCycles.delete(cycleKey) // Reset cycle counter
+
+              const successReport = formatSuccessReport(result)
+
+              setTimeout(async () => {
+                try {
+                  const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}\n\n---\n\n${successReport}`
+                  await this.sendMessage(managed.parentSessionId!, relayMessage)
+
+                  // Check if ALL teammates are now done
+                  const allDone = (lead.teammateSessionIds || []).every(tid => {
+                    const t = this.sessions.get(tid)
+                    return t && !t.isProcessing
+                  })
+                  if (allDone) {
+                    sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
+                    setTimeout(async () => {
+                      try {
+                        await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
+                      } catch (err) {
+                        sessionLog.error('[AgentTeams] Failed to send synthesis prompt:', err)
+                      }
+                    }, 500)
+                  }
+                } catch (err) {
+                  sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, err)
+                }
+              }, 200)
+
+            } else if (currentCycle >= qgConfig.maxReviewCycles) {
+              // MAX CYCLES REACHED — escalate and relay with warning
+              sessionLog.warn(`[AgentTeams] Quality gate max cycles (${qgConfig.maxReviewCycles}) reached for "${teammateName}", escalating`)
+              this.qualityGateCycles.delete(cycleKey)
+
+              let escalationNote = ''
+              try {
+                escalationNote = await runner.escalate(result, resultContent, taskContext, qgConfig)
+                result.escalatedTo = qgConfig.escalationModel
+              } catch (err) {
+                sessionLog.error('[AgentTeams] Escalation failed:', err)
+                escalationNote = 'Escalation failed — manual review required.'
+              }
+
+              const failureReport = formatFailureReport(result, qgConfig)
+
+              setTimeout(async () => {
+                try {
+                  const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (QUALITY GATE: ESCALATED after ${currentCycle} cycles):\n\n${resultContent}\n\n---\n\n${failureReport}\n\n**Escalation Diagnosis:**\n${escalationNote}`
+                  await this.sendMessage(managed.parentSessionId!, relayMessage)
+                } catch (err) {
+                  sessionLog.error(`[AgentTeams] Failed to relay escalated results from ${teammateName}:`, err)
+                }
+              }, 200)
+
+            } else {
+              // FAILED — auto-cycle: send feedback back to teammate for fixes
+              sessionLog.info(`[AgentTeams] Quality gate FAILED for "${teammateName}" (score: ${result.aggregateScore}, cycle ${currentCycle}/${qgConfig.maxReviewCycles})`)
+
+              const failureReport = formatFailureReport(result, qgConfig)
+
+              setTimeout(async () => {
+                try {
+                  const feedbackMessage = `[Quality Gate Review — Cycle ${currentCycle}/${qgConfig.maxReviewCycles}]\n\nYour work did not pass the quality gate. Please fix the issues below and try again.\n\n${failureReport}`
+                  await this.sendMessage(sessionId, feedbackMessage)
+                } catch (err) {
+                  sessionLog.error(`[AgentTeams] Failed to send quality gate feedback to ${teammateName}:`, err)
+                }
+              }, 200)
+            }
+          } catch (err) {
+            // Quality gate pipeline itself errored — don't block relay, just warn
+            sessionLog.error(`[AgentTeams] Quality gate pipeline error for "${teammateName}":`, err)
+            this.qualityGateCycles.delete(cycleKey)
+
+            // Fallback: relay without quality report
+            setTimeout(async () => {
+              try {
+                const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (quality gate skipped due to error):\n\n${resultContent}`
+                await this.sendMessage(managed.parentSessionId!, relayMessage)
+              } catch (relayErr) {
+                sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, relayErr)
+              }
+            }, 200)
+          }
+        } else {
+          // Quality gates disabled — original behavior
+          sessionLog.info(`[AgentTeams] Relaying results from teammate "${teammateName}" back to lead ${managed.parentSessionId}`)
+
+          setTimeout(async () => {
+            try {
+              const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}`
+              await this.sendMessage(managed.parentSessionId!, relayMessage)
+
+              const allDone = (lead.teammateSessionIds || []).every(tid => {
+                const t = this.sessions.get(tid)
+                return t && !t.isProcessing
+              })
+              if (allDone) {
+                sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
+                setTimeout(async () => {
+                  try {
+                    await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
+                  } catch (err) {
+                    sessionLog.error('[AgentTeams] Failed to send synthesis prompt:', err)
+                  }
+                }, 500)
+              }
+            } catch (err) {
+              sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, err)
+            }
+          }, 200)
+        }
+      }
+    }
+
+    // 5. Check queue and process or complete
     if (managed.messageQueue.length > 0) {
       // Has queued messages - process next
       this.processNextQueuedMessage(sessionId)
@@ -3770,7 +4180,7 @@ export class SessionManager {
       }, managed.workspace.id)
     }
 
-    // 5. Always persist
+    // 6. Always persist
     this.persistSession(managed)
   }
 
@@ -4433,6 +4843,39 @@ To view this task's output:
           message: event.message,
           statusType: isCompactionComplete ? 'compaction_complete' : undefined
         }, workspaceId)
+        break
+      }
+
+      case 'team_initialized': {
+        // Agent teams: When the lead agent spawns a teammate
+        const teamName = event.teamName
+        const teammateName = event.teammateName || 'Teammate'
+
+        sessionLog.info(`Agent team initialized: ${teamName}, spawning ${teammateName}`)
+
+        // Mark this session as a team lead
+        managed.teamId = teamName
+        managed.isTeamLead = true
+        this.persistSession(managed)
+
+        // Add an info message to the chat
+        const initMessage: Message = {
+          id: generateMessageId(),
+          role: 'info',
+          content: `Agent Team initializing: ${teamName}`,
+          timestamp: Date.now(),
+          infoLevel: 'info',
+        }
+        managed.messages.push(initMessage)
+
+        // Send team initialization event to renderer
+        this.sendEvent({
+          type: 'team_initialized',
+          sessionId,
+          teamId: teamName,
+          teammateName,
+        }, workspaceId)
+
         break
       }
 

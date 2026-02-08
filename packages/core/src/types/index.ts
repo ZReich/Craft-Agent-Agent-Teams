@@ -43,3 +43,43 @@ export type {
 } from './message.ts';
 export { generateMessageId } from './message.ts';
 
+// Agent Teams types
+export type {
+  AgentTeam,
+  AgentTeamStatus,
+  AgentTeammate,
+  AgentTeammateStatus,
+  TeammateTokenUsage,
+  TeamTask,
+  TeamTaskStatus,
+  TeammateMessage,
+  TeammateMessageType,
+  ModelProvider,
+  AvailableModel,
+  ModelCapability,
+  TeamRole,
+  TeamModelConfig,
+  ModelAssignment,
+  ModelPresetId,
+  ModelPreset,
+  WorkerTask,
+  WorkerMessage,
+  ReviewPolicy,
+  ReviewResult,
+  TeamActivityEvent,
+  TeamActivityType,
+  TeamCostSummary,
+} from './agent-teams.ts';
+
+// Usage tracking types
+export type {
+  SessionUsage,
+  ProviderUsage,
+  TeamSessionUsage,
+  WeeklyUsageSummary,
+  DailyUsage,
+  SessionUsageRef,
+  UsageAlertThresholds,
+  UsageAlert,
+} from './usage-tracking.ts';
+

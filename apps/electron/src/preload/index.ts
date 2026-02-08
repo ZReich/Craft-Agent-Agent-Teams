@@ -499,6 +499,67 @@ const api: ElectronAPI = {
   setDefaultLlmConnection: (slug: string) => ipcRenderer.invoke(IPC_CHANNELS.LLM_CONNECTION_SET_DEFAULT, slug),
   setWorkspaceDefaultLlmConnection: (workspaceId: string, slug: string | null) =>
     ipcRenderer.invoke(IPC_CHANNELS.LLM_CONNECTION_SET_WORKSPACE_DEFAULT, workspaceId, slug),
+
+  // Agent Teams
+  getAgentTeamsEnabled: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_ENABLED, workspaceId),
+  setAgentTeamsEnabled: (workspaceId: string, enabled: boolean) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SET_ENABLED, workspaceId, enabled),
+  createAgentTeam: (options: { name: string; leadSessionId: string; workspaceId: string; modelPreset?: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_CREATE, options),
+  cleanupAgentTeam: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_CLEANUP, teamId),
+  getAgentTeamStatus: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_STATUS, teamId),
+  spawnTeammate: (options: { teamId: string; name: string; role: string; model: string; provider: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SPAWN_TEAMMATE, options),
+  shutdownTeammate: (teamId: string, teammateId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SHUTDOWN_TEAMMATE, teamId, teammateId),
+  sendTeammateMessage: (teamId: string, from: string, to: string, content: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SEND_MESSAGE, teamId, from, to, content),
+  broadcastTeamMessage: (teamId: string, from: string, content: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_BROADCAST, teamId, from, content),
+  getTeamTasks: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_TASKS, teamId),
+  updateTeamTask: (teamId: string, taskId: string, status: string, assignee?: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_UPDATE_TASK, teamId, taskId, status, assignee),
+  getTeamCost: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_COST, teamId),
+  swapTeammateModel: (teamId: string, teammateId: string, newModel: string, newProvider: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SWAP_MODEL, teamId, teammateId, newModel, newProvider),
+  onAgentTeamEvent: (callback: (event: import('@craft-agent/core/types').TeamActivityEvent) => void) => {
+    const handler = (_event: unknown, data: import('@craft-agent/core/types').TeamActivityEvent) => callback(data)
+    ipcRenderer.on(IPC_CHANNELS.AGENT_TEAMS_EVENT, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_TEAMS_EVENT, handler)
+  },
+  getAgentTeamsProviderKey: (provider: 'moonshot' | 'openrouter') =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_PROVIDER_KEY, provider),
+  setAgentTeamsProviderKey: (provider: 'moonshot' | 'openrouter', key: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SET_PROVIDER_KEY, provider, key),
+
+  // Usage tracking
+  getSessionUsage: (sessionId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_SESSION, sessionId),
+  getWeeklyUsage: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_WEEKLY),
+  getRecentWeeksUsage: (count?: number) =>
+    ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_RECENT_WEEKS, count),
+  getUsageThresholds: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_THRESHOLDS),
+  setUsageThresholds: (thresholds: any) =>
+    ipcRenderer.invoke(IPC_CHANNELS.USAGE_SET_THRESHOLDS, thresholds),
+  exportUsageCsv: (csv: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.USAGE_EXPORT_CSV, csv),
+  onUsageCostUpdate: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data)
+    ipcRenderer.on(IPC_CHANNELS.USAGE_COST_UPDATE, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.USAGE_COST_UPDATE, handler)
+  },
+  onUsageAlert: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data)
+    ipcRenderer.on(IPC_CHANNELS.USAGE_ALERT, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.USAGE_ALERT, handler)
+  },
 }
 
 contextBridge.exposeInMainWorld('electronAPI', api)

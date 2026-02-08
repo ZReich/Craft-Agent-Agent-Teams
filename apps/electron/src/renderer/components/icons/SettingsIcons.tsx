@@ -158,6 +158,40 @@ export const PreferencesIcon = ({ className }: IconProps) => (
   </svg>
 )
 
+/** Team/users icon for agent teams */
+export const AgentTeamsIcon = ({ className }: IconProps) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    className={className}
+  >
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M9 2C6.79086 2 5 3.79086 5 6C5 8.20914 6.79086 10 9 10C11.2091 10 13 8.20914 13 6C13 3.79086 11.2091 2 9 2ZM17 7C15.3431 7 14 8.34315 14 10C14 11.6569 15.3431 13 17 13C18.6569 13 20 11.6569 20 10C20 8.34315 18.6569 7 17 7ZM2 17C2 14.2386 4.23858 12 7 12H11C13.7614 12 16 14.2386 16 17V18C16 19.6569 14.6569 21 13 21H5C3.34315 21 2 19.6569 2 18V17ZM17.5 15C17.5 15 17.2549 15 17.0142 15.0037C17.6358 15.8438 18 16.8792 18 18C18 19.1046 17.6463 20.1259 17.042 20.9591C17.1952 20.9861 17.3502 21 17.5 21H19C20.6569 21 22 19.6569 22 18V17C22 15.8954 21.1046 15 20 15H17.5Z"
+      fill="currentColor"
+    />
+  </svg>
+)
+
+/** Usage/trending icon for usage tracking settings */
+export const UsageIcon = ({ className }: IconProps) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    className={className}
+  >
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M3 3C3.55228 3 4 3.44772 4 4V18C4 18.5523 4.44772 19 5 19H21C21.5523 19 22 19.4477 22 20C22 20.5523 21.5523 21 21 21H5C3.34315 21 2 19.6569 2 18V4C2 3.44772 2.44772 3 3 3ZM7.29289 13.2929C7.68342 12.9024 8.31658 12.9024 8.70711 13.2929L11 15.5858L15.2929 11.2929C15.6834 10.9024 16.3166 10.9024 16.7071 11.2929L21.7071 16.2929C22.0976 16.6834 22.0976 17.3166 21.7071 17.7071C21.3166 18.0976 20.6834 18.0976 20.2929 17.7071L16 13.4142L11.7071 17.7071C11.3166 18.0976 10.6834 18.0976 10.2929 17.7071L7.29289 14.7071C6.90237 14.3166 6.90237 13.6834 7.29289 13.2929ZM17 7C17 6.44772 17.4477 6 18 6C18.5523 6 19 6.44772 19 7V9H21C21.5523 9 22 9.44772 22 10C22 10.5523 21.5523 11 21 11H19V13C19 13.5523 18.5523 14 18 14C17.4477 14 17 13.5523 17 13V11H15C14.4477 11 14 10.5523 14 10C14 9.44772 14.4477 9 15 9H17V7Z"
+      fill="currentColor"
+    />
+  </svg>
+)
+
 /**
  * Map of settings subpage IDs to their icon components.
  * Used by both AppMenu and SettingsNavigator for consistent icons.
@@ -172,4 +206,6 @@ export const SETTINGS_ICONS: Record<SettingsSubpage, React.ComponentType<IconPro
   labels: LabelsIcon,
   shortcuts: ShortcutsIcon,
   preferences: PreferencesIcon,
+  'agent-teams': AgentTeamsIcon,
+  usage: UsageIcon,
 }

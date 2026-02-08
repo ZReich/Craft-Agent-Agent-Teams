@@ -18,4 +18,6 @@ export {
   LabelsSettingsPage,
   ShortcutsPage,
   PreferencesPage,
+  AgentTeamsSettingsPage,
+  UsageSettingsPage,
 } from './settings'

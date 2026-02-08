@@ -441,6 +441,53 @@ export function setWorkspaceColorTheme(rootPath: string, themeId: string | undef
 }
 
 // ============================================================
+// Agent Teams Configuration
+// ============================================================
+
+/**
+ * Check if agent teams are enabled for a workspace.
+ * Resolution order: ENV (CRAFT_AGENT_TEAMS_ENABLED) > workspace config > default (false)
+ *
+ * @param rootPath - Absolute path to workspace root folder
+ * @returns true if agent teams should be enabled
+ */
+export function isAgentTeamsEnabled(rootPath: string): boolean {
+  // 1. Environment variable override (highest priority)
+  const envValue = process.env.CRAFT_AGENT_TEAMS_ENABLED;
+  if (envValue !== undefined) {
+    return envValue.toLowerCase() === 'true';
+  }
+
+  // 2. Workspace config
+  const config = loadWorkspaceConfig(rootPath);
+  if (config?.agentTeams?.enabled !== undefined) {
+    return config.agentTeams.enabled;
+  }
+
+  // 3. Default: disabled
+  return false;
+}
+
+/**
+ * Set agent teams enabled/disabled for a workspace.
+ *
+ * @param rootPath - Absolute path to workspace root folder
+ * @param enabled - Whether to enable agent teams
+ */
+export function setAgentTeamsEnabled(rootPath: string, enabled: boolean): void {
+  const config = loadWorkspaceConfig(rootPath);
+  if (!config) return;
+
+  if (!config.agentTeams) {
+    config.agentTeams = { enabled };
+  } else {
+    config.agentTeams.enabled = enabled;
+  }
+
+  saveWorkspaceConfig(rootPath, config);
+}
+
+// ============================================================
 // Local MCP Configuration
 // ============================================================
 

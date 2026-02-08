@@ -10,6 +10,8 @@ export type {
   CreateWorkspaceInput,
   LoadedWorkspace,
   WorkspaceSummary,
+  AgentTeamsConfig,
+  TeamModelDefaults,
 } from './types.ts';
 
 // Storage functions
@@ -36,6 +38,9 @@ export {
   renameWorkspaceFolder,
   // Auto-discovery
   discoverWorkspacesInDefaultLocation,
+  // Agent Teams
+  isAgentTeamsEnabled,
+  setAgentTeamsEnabled,
   // Constants
   CONFIG_DIR,
   DEFAULT_WORKSPACES_DIR,

@@ -13,6 +13,7 @@
 
 import type { PermissionMode } from '../agent/mode-manager.ts';
 import type { ThinkingLevel } from '../agent/thinking-levels.ts';
+import type { QualityGateConfig } from '@craft-agent/core/types';
 
 /**
  * Local MCP server configuration
@@ -25,6 +26,46 @@ export interface LocalMcpConfig {
    * Default: true (can be overridden by CRAFT_LOCAL_MCP_ENABLED env var)
    */
   enabled: boolean;
+}
+
+/**
+ * Agent Teams configuration
+ * Controls the experimental agent teams feature (multi-agent orchestration)
+ */
+export interface AgentTeamsConfig {
+  /** Whether agent teams are enabled for this workspace (default: false) */
+  enabled: boolean;
+  /** Default model configuration for team roles */
+  modelDefaults?: TeamModelDefaults;
+  /** Selected model preset ID (e.g., 'max-quality', 'balanced', 'cost-optimized', 'budget', 'custom') */
+  modelPreset?: string;
+  /** Model ID for the lead role */
+  leadModel?: string;
+  /** Model ID for the head role */
+  headModel?: string;
+  /** Model ID for worker agents */
+  workerModel?: string;
+  /** Model ID for the reviewer role (quality gate AI reviews) */
+  reviewerModel?: string;
+  /** Model ID for escalation handling */
+  escalationModel?: string;
+  /** Cost cap per session in USD (optional) */
+  costCapUsd?: number;
+  /** Auto-escalation: upgrade worker model after N failures */
+  autoEscalationThreshold?: number;
+  /** Quality gate configuration — automated code review pipeline */
+  qualityGates?: Partial<QualityGateConfig>;
+}
+
+/**
+ * Default model assignments for team roles
+ */
+export interface TeamModelDefaults {
+  lead?: { model: string; provider: string };
+  head?: { model: string; provider: string };
+  worker?: { model: string; provider: string };
+  reviewer?: { model: string; provider: string };
+  escalation?: { model: string; provider: string };
 }
 
 /**
@@ -49,6 +90,13 @@ export interface WorkspaceConfig {
     thinkingLevel?: ThinkingLevel; // Default thinking level ('off', 'think', 'max') - default: 'think'
     colorTheme?: string; // Color theme override for this workspace (preset ID). Undefined = inherit from app default.
   };
+
+  /**
+   * Agent Teams configuration.
+   * When enabled, the SDK exposes team-related tools (spawn teammate, message, broadcast, task management).
+   * Off by default — when disabled, Craft Agents behaves identically to stock.
+   */
+  agentTeams?: AgentTeamsConfig;
 
   /**
    * Local MCP server configuration.

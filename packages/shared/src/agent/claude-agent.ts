@@ -120,6 +120,19 @@ export interface ClaudeAgentConfig {
   };
   /** System prompt preset for mini agents ('default' | 'mini' or custom string) */
   systemPromptPreset?: 'default' | 'mini' | string;
+  /** Callback when a teammate spawn is requested (agent teams) */
+  onTeammateSpawnRequested?: (params: {
+    teamName: string;
+    teammateName: string;
+    prompt: string;
+    model?: string;
+  }) => Promise<{ sessionId: string; agentId: string }>;
+  /** Callback to send a message to a teammate session (agent teams) */
+  onTeammateMessage?: (params: {
+    targetName: string;
+    content: string;
+    type: 'message' | 'broadcast' | 'shutdown_request';
+  }) => Promise<{ delivered: boolean; error?: string }>;
 }
 
 // Permission request tracking
@@ -387,6 +400,10 @@ export class ClaudeAgent extends BaseAgent {
   // Cached context window size from modelUsage (for real-time usage_update events)
   // This is captured from the first result message and reused for subsequent usage updates
   private cachedContextWindow?: number;
+  // Agent teams: Track when this agent is acting as a team lead with active teammates
+  // When true, prevents premature session completion after spawning teammates
+  private activeTeamName: string | null = null;
+  private activeTeammateCount: number = 0;
 
   /**
    * Get the session ID for mode operations.
@@ -432,6 +449,11 @@ export class ClaudeAgent extends BaseAgent {
   // Callback when token usage is updated (for context window display).
   // Note: Full UsageTracker integration is planned for Phase 4 refactoring.
   public onUsageUpdate: ((update: { inputTokens: number; contextWindow?: number; cacheHitRate?: number }) => void) | null = null;
+
+  // Callback when a teammate spawn is requested (for agent teams with separate sessions)
+  public onTeammateSpawnRequested: ClaudeAgentConfig['onTeammateSpawnRequested'] = undefined;
+  // Callback to send messages to teammate sessions (for cross-session team communication)
+  public onTeammateMessage: ClaudeAgentConfig['onTeammateMessage'] = undefined;
 
   constructor(config: ClaudeAgentConfig) {
     // Resolve model: prioritize session model > config model (caller must provide via connection)
@@ -501,6 +523,14 @@ export class ClaudeAgent extends BaseAgent {
     if (!this.isHeadless) {
       this.startConfigWatcher();
     }
+
+    // Wire up team callbacks from config
+    if (config.onTeammateSpawnRequested) {
+      this.onTeammateSpawnRequested = config.onTeammateSpawnRequested;
+    }
+    if (config.onTeammateMessage) {
+      this.onTeammateMessage = config.onTeammateMessage;
+    }
   }
 
   // Config watcher methods (startConfigWatcher, stopConfigWatcher) are now inherited from BaseAgent
@@ -543,6 +573,18 @@ export class ClaudeAgent extends BaseAgent {
 
   // isInSafeMode() is now inherited from BaseAgent
   // shouldSuggestPlanning() and analyzePlanningNeed() are now inherited from BaseAgent
+
+  /**
+   * Clear active team state (for testing or manual team completion)
+   * This allows the session to complete normally on the next result message
+   */
+  public clearTeamState(): void {
+    if (this.activeTeamName) {
+      this.onDebug?.(`[AgentTeams] Clearing team state for "${this.activeTeamName}"`);
+    }
+    this.activeTeamName = null;
+    this.activeTeammateCount = 0;
+  }
 
   /**
    * Check if a tool requires permission and handle it
@@ -859,6 +901,110 @@ export class ClaudeAgent extends BaseAgent {
 
                 this.onDebug?.(`Allowed in safe mode: ${input.tool_name}`);
                 // Fall through to source blocking and other checks below
+              }
+
+              // ============================================================
+              // AGENT TEAMS: Intercept teammate spawn requests
+              // When the SDK tries to spawn a teammate via the Task tool with team_name,
+              // we intercept it and create a separate session instead of in-process execution.
+              // ============================================================
+              // --- Task tool: Spawn teammate as a separate session ---
+              if (input.tool_name === 'Task' && this.onTeammateSpawnRequested) {
+                const toolInput = input.tool_input as Record<string, unknown>;
+                if (toolInput.team_name && typeof toolInput.team_name === 'string') {
+                  const teamName = toolInput.team_name;
+                  const teammateName = (toolInput.name as string) || `teammate-${Date.now()}`;
+                  const prompt = (toolInput.prompt as string) || '';
+                  const model = toolInput.model as string | undefined;
+
+                  // CRITICAL: Set activeTeamName/Count NOW (before returning synthetic result)
+                  // This ensures the keep-alive check at completion time sees an active team.
+                  if (!this.activeTeamName) {
+                    this.activeTeamName = teamName;
+                  }
+                  this.activeTeammateCount++;
+
+                  this.onDebug?.(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}" (count: ${this.activeTeammateCount})`);
+
+                  try {
+                    const result = await this.onTeammateSpawnRequested({
+                      teamName,
+                      teammateName,
+                      prompt,
+                      model,
+                    });
+
+                    this.onDebug?.(`[AgentTeams] Teammate ${teammateName} spawned as session ${result.sessionId}`);
+
+                    return {
+                      outputContent: `Teammate "${teammateName}" spawned successfully as a separate session.\nagent_id: ${result.sessionId}\nname: ${teammateName}\nstatus: running\n\nThe teammate is now working independently in its own context window. You will receive their results when they complete.`,
+                    };
+                  } catch (err) {
+                    // Roll back count on failure
+                    this.activeTeammateCount--;
+                    if (this.activeTeammateCount <= 0) {
+                      this.activeTeamName = null;
+                      this.activeTeammateCount = 0;
+                    }
+                    this.onDebug?.(`[AgentTeams] Failed to spawn teammate ${teammateName}: ${err}`);
+                    return {
+                      outputContent: `Failed to spawn teammate "${teammateName}": ${err instanceof Error ? err.message : String(err)}`,
+                    };
+                  }
+                }
+              }
+
+              // --- SendMessage tool: Route messages to teammate sessions ---
+              if (input.tool_name === 'SendMessage' && this.onTeammateMessage) {
+                const toolInput = input.tool_input as Record<string, unknown>;
+                const msgType = (toolInput.type as string) || 'message';
+
+                // Handle direct messages, broadcasts, and shutdown requests
+                if (msgType === 'message' || msgType === 'broadcast' || msgType === 'shutdown_request') {
+                  const targetName = (toolInput.recipient as string) || '';
+                  const content = (toolInput.content as string) || '';
+
+                  this.onDebug?.(`[AgentTeams] Intercepting SendMessage: type=${msgType}, target=${targetName}`);
+
+                  try {
+                    const result = await this.onTeammateMessage({
+                      targetName,
+                      content,
+                      type: msgType as 'message' | 'broadcast' | 'shutdown_request',
+                    });
+
+                    if (result.delivered) {
+                      return {
+                        outputContent: msgType === 'broadcast'
+                          ? `Message broadcast to all teammates successfully.`
+                          : `Message delivered to "${targetName}" successfully.`,
+                      };
+                    } else {
+                      return {
+                        outputContent: `Failed to deliver message: ${result.error || 'Unknown error'}`,
+                      };
+                    }
+                  } catch (err) {
+                    return {
+                      outputContent: `Failed to send message: ${err instanceof Error ? err.message : String(err)}`,
+                    };
+                  }
+                }
+              }
+
+              // --- TeamCreate: Let SDK handle normally (creates metadata files) ---
+              // TeamCreate just creates config files at ~/.claude/teams/ which is fine.
+              // We don't need to intercept it.
+
+              // --- TeamDelete: Trigger our session-based cleanup ---
+              if (input.tool_name === 'TeamDelete' && this.onTeammateMessage) {
+                this.onDebug?.('[AgentTeams] Intercepting TeamDelete — cleaning up team sessions');
+                // Reset team state on this agent
+                this.activeTeamName = null;
+                this.activeTeammateCount = 0;
+                return {
+                  outputContent: 'Team deleted and sessions cleaned up successfully.',
+                };
               }
 
               // ============================================================
@@ -2186,6 +2332,24 @@ export class ClaudeAgent extends BaseAgent {
         for (const event of toolStartEvents) {
           if (event.type === 'tool_start' && event.toolName === 'Task') {
             activeParentTools.add(event.toolUseId);
+
+            // AGENT TEAMS: Detect when a teammate is being spawned
+            // If the Task tool has a team_name parameter, this is part of an agent team
+            const taskInput = event.input as Record<string, unknown>;
+            if (taskInput.team_name && typeof taskInput.team_name === 'string') {
+              // Track this as an active team - prevents premature session completion
+              this.activeTeamName = taskInput.team_name;
+              this.activeTeammateCount++;
+
+              // Emit team initialization event so UI can show TeamDashboard
+              events.push({
+                type: 'team_initialized',
+                teamName: taskInput.team_name,
+                teammateName: taskInput.name as string | undefined,
+                teamToolUseId: event.toolUseId,
+                turnId: event.turnId,
+              });
+            }
           }
         }
 
@@ -2406,7 +2570,23 @@ export class ClaudeAgent extends BaseAgent {
         };
 
         if (message.subtype === 'success') {
-          events.push({ type: 'complete', usage });
+          // AGENT TEAMS: Don't complete the session if we're managing an active team
+          // The lead agent needs to stay alive to coordinate teammates and synthesize results
+          if (this.activeTeamName && this.activeTeammateCount > 0) {
+            // Team is active - send usage update but keep session running
+            // The lead will continue processing and eventually send a message to synthesize results
+            this.onDebug?.(`[AgentTeams] Team "${this.activeTeamName}" active with ${this.activeTeammateCount} teammates - keeping session alive`);
+            events.push({
+              type: 'usage_update',
+              usage: {
+                inputTokens: usage.inputTokens,
+                contextWindow: usage.contextWindow,
+              },
+            });
+          } else {
+            // Normal completion - no active team
+            events.push({ type: 'complete', usage });
+          }
         } else {
           // Error result - emit error then complete with whatever usage we have
           const errorMsg = 'errors' in message ? message.errors.join(', ') : 'Query failed';

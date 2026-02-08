@@ -33,7 +33,7 @@ import {
 import { useSessionSelection, useIsMultiSelectActive, useSelectedIds, useSelectionCount } from '@/hooks/useSession'
 import { extractLabelId } from '@craft-agent/shared/labels'
 import type { TodoStateId } from '@/config/todo-states'
-import { SourceInfoPage, ChatPage } from '@/pages'
+import { SourceInfoPage, ChatPage, AgentTeamsSettingsPage, UsageSettingsPage } from '@/pages'
 import SkillInfoPage from '@/pages/SkillInfoPage'
 import { getSettingsPageComponent } from '@/pages/settings/settings-pages'
 

@@ -32,6 +32,10 @@ export interface Session {
   // Sub-session hierarchy (1 level max)
   parentSessionId?: string;      // Parent session ID (if this is a sub-session)
   siblingOrder?: number;         // Explicit order among siblings (lazy - only set on reorder)
+  // Agent Teams
+  teamId?: string;               // If this session is part of a team, the team ID
+  isTeamLead?: boolean;          // Whether this session is the team lead
+  parentTeamSessionId?: string;  // For teammate sessions: the lead session ID
 }
 
 /**
@@ -63,4 +67,7 @@ export interface SessionMetadata {
   // Sub-session hierarchy (1 level max)
   parentSessionId?: string;  // Parent session ID (if this is a sub-session)
   siblingOrder?: number;     // Explicit order among siblings (lazy - only set on reorder)
+  // Agent Teams
+  teamId?: string;         // If this session is part of a team
+  isTeamLead?: boolean;    // Whether this is the team lead session
 }
