@@ -1388,7 +1388,7 @@ export default function App() {
           workspaceId={windowWorkspaceId}
           onCreateSession={handleCreateSession}
           onInputChange={handleInputChange}
-          isReady={appState === 'ready'}
+          isReady={isFullyReady}
         >
           {/* Handle window close requests (X button, Cmd+W) - close modal first if open */}
           <WindowCloseHandler />

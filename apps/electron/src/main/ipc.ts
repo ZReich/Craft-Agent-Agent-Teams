@@ -3581,7 +3581,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
       // Filter sessions to current week
       const weekSessions = sessions.filter(s => {
-        const ts = s.lastMessageAt || s.createdAt
+        const ts = s.lastMessageAt || s.createdAt || 0
         return ts >= weekStart.getTime() && ts <= weekEnd.getTime()
       })
 
@@ -3618,8 +3618,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         dailyBreakdown: [],
         sessions: weekSessions.map(s => ({
           sessionId: s.id,
-          startedAt: new Date(s.createdAt).toISOString(),
-          endedAt: new Date(s.lastMessageAt || s.createdAt).toISOString(),
+          startedAt: new Date(s.createdAt ?? Date.now()).toISOString(),
+          endedAt: new Date(s.lastMessageAt || (s.createdAt ?? Date.now())).toISOString(),
           calls: 1,
           tokens: (s.tokenUsage?.inputTokens || 0) + (s.tokenUsage?.outputTokens || 0),
           estimatedCostUsd: s.tokenUsage?.costUsd || 0,
@@ -3642,7 +3642,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       // Group sessions by ISO week
       const weekMap = new Map<string, typeof sessions>()
       for (const s of sessions) {
-        const ts = new Date(s.lastMessageAt || s.createdAt)
+        const ts = new Date(s.lastMessageAt || s.createdAt || 0)
         const weekNum = getISOWeekNumber(ts)
         const key = `${ts.getFullYear()}-W${String(weekNum).padStart(2, '0')}`
         if (!weekMap.has(key)) weekMap.set(key, [])

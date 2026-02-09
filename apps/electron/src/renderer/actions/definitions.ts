@@ -180,6 +180,38 @@ export const actions = {
     inputSafe: true,  // Must work while typing in search input
   },
 
+  // ═══════════════════════════════════════════
+  // Agent Teams
+  // ═══════════════════════════════════════════
+  'teams.toggleTasks': {
+    id: 'teams.toggleTasks',
+    label: 'Toggle Task List',
+    description: 'Show or hide the agent teams task list panel',
+    defaultHotkey: 'mod+t',
+    category: 'Agent Teams',
+  },
+  'teams.toggleDelegate': {
+    id: 'teams.toggleDelegate',
+    label: 'Toggle Delegate Mode',
+    description: 'Enable or disable delegating work to teammates',
+    defaultHotkey: 'mod+shift+d',
+    category: 'Agent Teams',
+  },
+  'teams.nextTeammate': {
+    id: 'teams.nextTeammate',
+    label: 'Next Teammate',
+    description: 'Switch focus to the next teammate',
+    defaultHotkey: 'shift+down',
+    category: 'Agent Teams',
+  },
+  'teams.prevTeammate': {
+    id: 'teams.prevTeammate',
+    label: 'Previous Teammate',
+    description: 'Switch focus to the previous teammate',
+    defaultHotkey: 'shift+up',
+    category: 'Agent Teams',
+  },
+
 } as const satisfies Record<string, ActionDefinition>
 
 // Type-safe action IDs

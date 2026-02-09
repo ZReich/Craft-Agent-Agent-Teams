@@ -23,7 +23,7 @@ export interface InvalidProperty {
 export interface McpValidationResult {
   success: boolean;
   error?: string;
-  errorType?: 'failed' | 'needs-auth' | 'pending' | 'invalid-schema' | 'unknown';
+  errorType?: 'failed' | 'needs-auth' | 'pending' | 'invalid-schema' | 'unknown' | 'disabled';
   /** Typed error for API/billing failures - display as ErrorBanner */
   typedError?: AgentError;
   serverInfo?: {
@@ -570,6 +570,8 @@ export function getValidationErrorMessage(
       return 'Connection is still pending - try again.';
     case 'invalid-schema':
       return 'Server has tools with invalid property names.';
+    case 'disabled':
+      return 'Server is disabled.';
     case 'unknown':
     default:
       return 'Connection failed - check source configuration.';

@@ -193,7 +193,8 @@ export class QualityGateRunner {
     }
 
     // Stages 3-6: AI Reviews (parallel for speed)
-    const aiStages: QualityGateStageName[] = ['architecture', 'simplicity', 'errors', 'completeness'];
+    type AIReviewStage = 'architecture' | 'simplicity' | 'errors' | 'completeness';
+    const aiStages: AIReviewStage[] = ['architecture', 'simplicity', 'errors', 'completeness'];
     const enabledAiStages = aiStages.filter(s => config.stages[s].enabled);
 
     if (enabledAiStages.length > 0) {

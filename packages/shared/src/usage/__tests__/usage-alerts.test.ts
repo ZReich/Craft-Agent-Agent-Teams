@@ -239,10 +239,10 @@ describe('UsageAlertChecker', () => {
       const alerts = checker.checkAlerts(session, weekly);
 
       expect(alerts).toHaveLength(1);
-      expect(alerts[0].type).toBe('warning');
-      expect(alerts[0].message).toContain('Weekly spend');
-      expect(alerts[0].message).toContain('$15.00');
-      expect(alerts[0].message).toContain('$10.00');
+      expect(alerts[0]!.type).toBe('warning');
+      expect(alerts[0]!.message).toContain('Weekly spend');
+      expect(alerts[0]!.message).toContain('$15.00');
+      expect(alerts[0]!.message).toContain('$10.00');
     });
 
     test('should include formatted cost values in warning message', () => {
@@ -259,7 +259,7 @@ describe('UsageAlertChecker', () => {
 
       const alerts = checker.checkAlerts(session, weekly);
 
-      expect(alerts[0].message).toContain('$12.57');
+      expect(alerts[0]!.message).toContain('$12.57');
     });
 
     test('should include context data in warning', () => {
@@ -276,9 +276,9 @@ describe('UsageAlertChecker', () => {
 
       const alerts = checker.checkAlerts(session, weekly);
 
-      expect(alerts[0].context).toBeDefined();
-      expect(alerts[0].context?.spend).toBe(15.0);
-      expect(alerts[0].context?.threshold).toBe(10.0);
+      expect(alerts[0]!.context).toBeDefined();
+      expect(alerts[0]!.context?.spend).toBe(15.0);
+      expect(alerts[0]!.context?.threshold).toBe(10.0);
     });
 
     test('should respect custom weekly spend threshold', () => {
@@ -321,9 +321,9 @@ describe('UsageAlertChecker', () => {
       const alerts = checker.checkAlerts(session, weekly);
 
       expect(alerts).toHaveLength(1);
-      expect(alerts[0].type).toBe('info');
-      expect(alerts[0].message).toContain('High API usage');
-      expect(alerts[0].message).toContain('150 calls');
+      expect(alerts[0]!.type).toBe('info');
+      expect(alerts[0]!.message).toContain('High API usage');
+      expect(alerts[0]!.message).toContain('150 calls');
     });
 
     test('should include call count in context', () => {
@@ -335,8 +335,8 @@ describe('UsageAlertChecker', () => {
 
       const alerts = checker.checkAlerts(session, weekly);
 
-      expect(alerts[0].context).toBeDefined();
-      expect(alerts[0].context?.calls).toBe(150);
+      expect(alerts[0]!.context).toBeDefined();
+      expect(alerts[0]!.context?.calls).toBe(150);
     });
 
     test('should respect custom session calls threshold', () => {
@@ -564,9 +564,9 @@ describe('UsageAlertChecker', () => {
       const alerts = customChecker.checkAlerts(session, weekly);
 
       // Order should be: weekly spend warning, session calls info, cost cap error
-      expect(alerts[0].type).toBe('warning'); // Weekly spend
-      expect(alerts[1].type).toBe('info'); // Session calls
-      expect(alerts[2].type).toBe('error'); // Cost cap
+      expect(alerts[0]!.type).toBe('warning'); // Weekly spend
+      expect(alerts[1]!.type).toBe('info'); // Session calls
+      expect(alerts[2]!.type).toBe('error'); // Cost cap
     });
   });
 

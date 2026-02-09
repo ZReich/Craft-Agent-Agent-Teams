@@ -78,7 +78,6 @@ import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skill
 import type { ToolDisplayMeta, QualityGateConfig } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
 import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
-import { getAnthropicApiKey } from '@craft-agent/shared/config/storage'
 import { DEFAULT_MODEL, getToolIconsDir, isCodexModel, getMiniModel, getSummarizationModel } from '@craft-agent/shared/config'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
 import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
@@ -816,7 +815,7 @@ export class SessionManager {
       const credManager = getCredentialManager()
       this.qualityGateRunner = new QualityGateRunner({
         getMoonshotApiKey: () => credManager.getMoonshotApiKey(),
-        getAnthropicApiKey: () => getAnthropicApiKey(),
+        getAnthropicApiKey: () => credManager.getLlmApiKey('anthropic-api'),
       })
     }
     return this.qualityGateRunner
@@ -1287,7 +1286,7 @@ export class SessionManager {
             isTeamLead: meta.isTeamLead,
             parentSessionId: meta.parentSessionId,
             teammateName: meta.teammateName,
-            teammateSessionIds: meta.teammateSessionIds,
+            teammateSessionIds: (meta as any).teammateSessionIds,
             teamColor: meta.teamColor,
             // Initialize TokenRefreshManager for this session
             tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
@@ -2035,7 +2034,7 @@ export class SessionManager {
       const teammate = this.sessions.get(teammateId)
       if (teammate?.isProcessing && teammate.agent) {
         try {
-          teammate.agent.forceAbort()
+          teammate.agent.forceAbort(AbortReason.UserStop)
           sessionLog.info(`[AgentTeams] Interrupted teammate ${teammateId}`)
         } catch (err) {
           sessionLog.error(`[AgentTeams] Failed to interrupt teammate ${teammateId}:`, err)
@@ -2513,7 +2512,7 @@ export class SessionManager {
                 if (params.type === 'shutdown_request') {
                   // Force-abort the teammate
                   if (teammate.agent && teammate.isProcessing) {
-                    teammate.agent.forceAbort()
+                    teammate.agent.forceAbort(AbortReason.UserStop)
                   }
                   return { delivered: true }
                 }

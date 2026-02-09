@@ -106,7 +106,7 @@ export default function UsageSettingsPage() {
     setIsExporting(true)
     try {
       const api = window.electronAPI
-      if (!api?.exportUsageCsv) return
+      if (!api?.exportUsageCSV) return
 
       // Build CSV
       const rows = [
@@ -121,7 +121,7 @@ export default function UsageSettingsPage() {
         ],
       ]
       const csv = rows.map(r => r.join(',')).join('\n')
-      await api.exportUsageCsv(csv)
+      await api.exportUsageCSV(csv)
     } catch (err) {
       console.error('Export failed:', err)
     } finally {

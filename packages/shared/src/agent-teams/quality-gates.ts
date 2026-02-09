@@ -241,10 +241,10 @@ export function mergeQualityGateConfig(
   if (userConfig.stages) {
     merged.stages = { ...DEFAULT_QUALITY_GATE_CONFIG.stages };
     for (const [name, stageConfig] of Object.entries(userConfig.stages)) {
-      if (name in merged.stages) {
+      if (name in merged.stages && stageConfig) {
         merged.stages[name as QualityGateStageName] = {
           ...DEFAULT_QUALITY_GATE_CONFIG.stages[name as QualityGateStageName],
-          ...stageConfig,
+          ...(stageConfig as QualityGateStageConfig),
         };
       }
     }

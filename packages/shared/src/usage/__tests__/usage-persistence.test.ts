@@ -311,9 +311,9 @@ describe('UsagePersistence', () => {
 
       const weekly = await persistence.loadWeeklyUsage('2026-W06');
       expect(weekly?.providerBreakdown.anthropic).toBeDefined();
-      expect(weekly?.providerBreakdown.anthropic.callCount).toBe(5);
+      expect(weekly?.providerBreakdown.anthropic!.callCount).toBe(5);
       expect(weekly?.providerBreakdown.moonshot).toBeDefined();
-      expect(weekly?.providerBreakdown.moonshot.callCount).toBe(3);
+      expect(weekly?.providerBreakdown.moonshot!.callCount).toBe(3);
     });
 
     test('should update daily breakdown correctly', async () => {
@@ -454,7 +454,7 @@ describe('UsagePersistence', () => {
 
       // Should be sorted descending (most recent first)
       for (let i = 1; i < recent.length; i++) {
-        expect(recent[i - 1].weekIdentifier >= recent[i].weekIdentifier).toBe(true);
+        expect(recent[i - 1]!.weekIdentifier >= recent[i]!.weekIdentifier).toBe(true);
       }
     });
 
@@ -497,7 +497,7 @@ describe('UsagePersistence', () => {
 
       // Should only return the valid week
       expect(recent.length).toBe(1);
-      expect(recent[0].weekIdentifier).toBe('2026-W06');
+      expect(recent[0]!.weekIdentifier).toBe('2026-W06');
     });
   });
 

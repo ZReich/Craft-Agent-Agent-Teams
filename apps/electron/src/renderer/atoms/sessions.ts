@@ -306,8 +306,14 @@ export const initializeSessionsAtom = atom(
         backgroundTasksAtomFamily.remove(oldId)
       }
     }
-    // Reset loaded sessions tracking — new workspace needs fresh lazy loading
-    set(loadedSessionsAtom, new Set<string>())
+    // Reset loaded sessions tracking — new workspace needs fresh lazy loading.
+    // Preserve any sessions that were already loaded (e.g., by ensureMessagesLoaded
+    // racing ahead during startup) to avoid wiping their loaded state.
+    const existingLoaded = get(loadedSessionsAtom)
+    const preservedLoaded = new Set(
+      [...existingLoaded].filter(id => newIdSet.has(id))
+    )
+    set(loadedSessionsAtom, preservedLoaded)
 
     // Set individual session atoms
     for (const session of sessions) {

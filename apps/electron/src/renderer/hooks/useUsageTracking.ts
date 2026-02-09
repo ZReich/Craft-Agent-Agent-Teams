@@ -5,7 +5,7 @@
  */
 
 import { useState, useEffect, useCallback } from 'react'
-import type { SessionUsage, WeeklyUsageSummary, UsageAlert } from '../../../shared/types'
+import type { SessionUsage, WeeklyUsageSummary, UsageAlert, ProviderUsage } from '../../shared/types'
 
 export interface UsageMetrics {
   session: {
@@ -77,15 +77,15 @@ export function useUsageTracking(sessionId?: string) {
     session: {
       calls: sessionUsage?.totalCalls ?? 0,
       inputTokens: Object.values(sessionUsage?.providers ?? {}).reduce(
-        (s, p) => s + p.inputTokens,
+        (s: number, p: ProviderUsage) => s + p.inputTokens,
         0
       ),
       outputTokens: Object.values(sessionUsage?.providers ?? {}).reduce(
-        (s, p) => s + p.outputTokens,
+        (s: number, p: ProviderUsage) => s + p.outputTokens,
         0
       ),
       estimatedCostUsd: Object.values(sessionUsage?.providers ?? {}).reduce(
-        (s, p) => s + p.estimatedCostUsd,
+        (s: number, p: ProviderUsage) => s + p.estimatedCostUsd,
         0
       ),
       durationMs: sessionUsage?.totalDurationMs ?? 0,

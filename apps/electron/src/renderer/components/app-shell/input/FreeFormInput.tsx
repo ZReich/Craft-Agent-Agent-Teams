@@ -1981,13 +1981,17 @@ function WorkingDirectoryBadge({
 
   const handleChooseFolder = async () => {
     if (!window.electronAPI) return
-    setPopoverOpen(false)
+    // Don't close the popover before the dialog — the native folder dialog
+    // is modal on Windows and closing the popover first causes the UI to
+    // flash back to the input without visual confirmation of what happened.
     const selectedPath = await window.electronAPI.openFolderDialog()
     if (selectedPath) {
       addRecentDir(selectedPath)
       setRecentDirs(getRecentDirs())
       onWorkingDirectoryChange(selectedPath)
     }
+    // Close after the dialog completes (whether user picked or cancelled)
+    setPopoverOpen(false)
   }
 
   const handleSelectRecent = (path: string) => {

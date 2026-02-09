@@ -27,6 +27,8 @@ interface ShortcutSection {
   shortcuts: ShortcutItem[]
 }
 
+const cmdKey = isMac ? '⌘' : 'Ctrl'
+
 // Component-specific shortcuts that aren't in the centralized registry
 const componentSpecificSections: ShortcutSection[] = [
   {

@@ -548,7 +548,7 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_THRESHOLDS),
   setUsageThresholds: (thresholds: any) =>
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_SET_THRESHOLDS, thresholds),
-  exportUsageCsv: (csv: string) =>
+  exportUsageCSV: (csv: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_EXPORT_CSV, csv),
   onUsageCostUpdate: (callback: (data: any) => void) => {
     const handler = (_event: any, data: any) => callback(data)

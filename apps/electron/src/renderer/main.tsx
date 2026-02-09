@@ -29,6 +29,7 @@ const IGNORED_CONSOLE_PATTERNS = [
 // NOTE: Source map upload is intentionally disabled — see main/index.ts for details.
 sentryInit(
   {
+    // @ts-ignore -- Integration type mismatch between @sentry/electron and @sentry/react due to transitive @sentry/core version skew (10.38 vs 10.36)
     integrations: [captureConsoleIntegration({ levels: ['warn', 'error'] })],
 
     beforeSend(event) {

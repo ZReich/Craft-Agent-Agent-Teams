@@ -43,8 +43,8 @@ export class UsagePersistence {
   /** Get week start (Monday) and end (Sunday) dates from week identifier */
   private getWeekDates(weekIdentifier: string): { start: string; end: string } {
     const [yearStr, weekStr] = weekIdentifier.split('-W');
-    const year = parseInt(yearStr);
-    const week = parseInt(weekStr);
+    const year = parseInt(yearStr!);
+    const week = parseInt(weekStr!);
     const jan4 = new Date(Date.UTC(year, 0, 4));
     const dayOfWeek = jan4.getUTCDay() || 7;
     const monday = new Date(jan4);
@@ -158,7 +158,7 @@ export class UsagePersistence {
     }
 
     // Update daily breakdown
-    const sessionDate = new Date(usage.startedAt).toISOString().split('T')[0];
+    const sessionDate = new Date(usage.startedAt).toISOString().split('T')[0]!;
     let dayEntry = weekly.dailyBreakdown.find(d => d.date.startsWith(sessionDate));
     if (!dayEntry) {
       dayEntry = {

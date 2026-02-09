@@ -105,7 +105,7 @@ export function TeamStatusBar({ session }: TeamStatusBarProps) {
           </span>
           <button
             type="button"
-            onClick={() => navigate(routes.view.allChats(parentSessionId))}
+            onClick={() => navigate(routes.view.allSessions(parentSessionId))}
             className="font-medium hover:underline cursor-pointer"
             style={{ color: teamColor }}
           >
@@ -187,7 +187,7 @@ export function TeamStatusBar({ session }: TeamStatusBarProps) {
                 <button
                   key={teammate.id}
                   type="button"
-                  onClick={() => navigate(routes.view.allChats(teammate.id))}
+                  onClick={() => navigate(routes.view.allSessions(teammate.id))}
                   className={cn(
                     'inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs',
                     'bg-muted text-muted-foreground',

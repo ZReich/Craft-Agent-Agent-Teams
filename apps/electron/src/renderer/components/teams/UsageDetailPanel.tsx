@@ -182,14 +182,14 @@ export function UsageDetailPanel({ sessionId, className }: UsageDetailPanelProps
                     By Provider
                   </h4>
                   <div className="space-y-1.5">
-                    {providers.map(([providerKey, usage]: [string, ProviderUsage]) => (
+                    {(providers as [string, ProviderUsage][]).map(([providerKey, usage]) => (
                       <div key={providerKey} className="flex items-center justify-between py-1">
                         <div className="flex items-center gap-2 min-w-0">
                           <span className="text-sm">
                             {PROVIDER_NAMES[providerKey] || providerKey}
                           </span>
                           <Badge variant="outline" className="text-[10px] px-1 py-0 h-4">
-                            {usage.calls} calls
+                            {usage.callCount} calls
                           </Badge>
                         </div>
                         <div className="flex items-center gap-3 shrink-0 text-xs text-muted-foreground">

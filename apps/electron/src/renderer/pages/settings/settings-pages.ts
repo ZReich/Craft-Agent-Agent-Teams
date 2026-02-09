@@ -23,6 +23,8 @@ import PermissionsSettingsPage from './PermissionsSettingsPage'
 import LabelsSettingsPage from './LabelsSettingsPage'
 import ShortcutsPage from './ShortcutsPage'
 import PreferencesPage from './PreferencesPage'
+import AgentTeamsSettingsPage from './AgentTeamsSettingsPage'
+import UsageSettingsPage from './UsageSettingsPage'
 
 /**
  * Map of settings subpage IDs to their page components.
@@ -38,6 +40,8 @@ export const SETTINGS_PAGE_COMPONENTS: Record<SettingsSubpage, ComponentType> = 
   labels: LabelsSettingsPage,
   shortcuts: ShortcutsPage,
   preferences: PreferencesPage,
+  'agent-teams': AgentTeamsSettingsPage,
+  usage: UsageSettingsPage,
 }
 
 /**

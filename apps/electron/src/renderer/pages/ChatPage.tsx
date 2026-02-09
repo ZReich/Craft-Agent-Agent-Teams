@@ -20,7 +20,7 @@ import { StyledDropdownMenuContent, StyledDropdownMenuItem, StyledDropdownMenuSe
 import { useAppShellContext, usePendingPermission, usePendingCredential, useSessionOptionsFor, useSession as useSessionData } from '@/context/AppShellContext'
 import { rendererPerf } from '@/lib/perf'
 import { routes } from '@/lib/navigate'
-import { ensureSessionMessagesLoadedAtom, loadedSessionsAtom, sessionMetaMapAtom } from '@/atoms/sessions'
+import { ensureSessionMessagesLoadedAtom, loadedSessionsAtom, sessionMetaMapAtom, updateSessionMetaAtom, updateSessionAtom } from '@/atoms/sessions'
 import { getSessionTitle } from '@/utils/session'
 // Model resolution: connection.defaultModel (no hardcoded defaults)
 import { resolveEffectiveConnectionSlug, isSessionConnectionUnavailable } from '@config/llm-connections'
@@ -89,11 +89,16 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
   const sessionMeta = sessionMetaMap.get(sessionId)
 
-  // Fallback: ensure messages are loaded when session is viewed
+  // Fallback: ensure messages are loaded when session is viewed.
+  // Gate on sessionMeta existence to avoid racing ahead of initializeSessions —
+  // if we load messages before sessions are initialized, initializeSessions
+  // could reset the loaded tracking and the messages would disappear.
   const ensureMessagesLoaded = useSetAtom(ensureSessionMessagesLoadedAtom)
   React.useEffect(() => {
-    ensureMessagesLoaded(sessionId)
-  }, [sessionId, ensureMessagesLoaded])
+    if (sessionMeta) {
+      ensureMessagesLoaded(sessionId)
+    }
+  }, [sessionId, sessionMeta, ensureMessagesLoaded])
 
   // Perf: Mark when session data is available
   const sessionLoadedMarkedRef = React.useRef<string | null>(null)
@@ -167,12 +172,19 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onInputChange(sessionId, value)
   }, [sessionId, onInputChange])
 
-  // Session model change handler - persists per-session model and connection
+  // Session model change handler - optimistic update + persist per-session model and connection.
+  // Optimistic update ensures the UI reflects the change instantly instead of
+  // waiting for the IPC round-trip (session_model_changed event from main process).
+  const updateSession = useSetAtom(updateSessionAtom)
+  const updateMeta = useSetAtom(updateSessionMetaAtom)
   const handleModelChange = React.useCallback((model: string, connection?: string) => {
+    // Optimistic: update atom + metadata immediately so the dropdown reflects the change
+    updateSession(sessionId, (prev) => prev ? { ...prev, model } : prev)
+    updateMeta(sessionId, { model })
     if (activeWorkspaceId) {
       window.electronAPI.setSessionModel(sessionId, activeWorkspaceId, model, connection)
     }
-  }, [sessionId, activeWorkspaceId])
+  }, [sessionId, activeWorkspaceId, updateSession, updateMeta])
 
   // Session connection change handler - can only change before first message
   const handleConnectionChange = React.useCallback(async (connectionSlug: string) => {
