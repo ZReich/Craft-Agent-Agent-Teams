@@ -427,6 +427,10 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
       lastFinalMessageId: header.lastFinalMessageId,
       // Explicit unread flag - single source of truth for NEW badge (state machine approach)
       hasUnread: header.hasUnread,
+      // SDD state
+      sddEnabled: header.sddEnabled,
+      activeSpecId: header.activeSpecId,
+      sddComplianceReports: header.sddComplianceReports,
       // Hidden flag for mini-agent sessions (not shown in session list)
       hidden: header.hidden,
       // Archive state
@@ -558,6 +562,9 @@ export async function updateSessionMetadata(
     | 'sharedId'
     | 'model'
     | 'llmConnection'
+    | 'sddEnabled'
+    | 'activeSpecId'
+    | 'sddComplianceReports'
     | 'isArchived'
     | 'archivedAt'
   >>
@@ -579,6 +586,9 @@ export async function updateSessionMetadata(
   if ('sharedId' in updates) session.sharedId = updates.sharedId;
   if (updates.model !== undefined) session.model = updates.model;
   if (updates.llmConnection !== undefined) session.llmConnection = updates.llmConnection;
+  if (updates.sddEnabled !== undefined) session.sddEnabled = updates.sddEnabled;
+  if ('activeSpecId' in updates) session.activeSpecId = updates.activeSpecId;
+  if (updates.sddComplianceReports !== undefined) session.sddComplianceReports = updates.sddComplianceReports;
   if (updates.isArchived !== undefined) session.isArchived = updates.isArchived;
   if ('archivedAt' in updates) session.archivedAt = updates.archivedAt;
 

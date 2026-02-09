@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Headless execution mode
 - Dynamic status system
 - Session persistence
+- Agent team orchestration including SDD/DRI validation and synthesis events
 
 ## Package Exports
 

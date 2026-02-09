@@ -36,6 +36,10 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
     simplicity: { enabled: true, weight: 15 },
     errors: { enabled: true, weight: 25 },
     completeness: { enabled: true, weight: 15 },
+    // SDD stages — only scored when a spec is provided at pipeline runtime
+    spec_compliance: { enabled: true, weight: 20 },
+    traceability: { enabled: true, weight: 15 },
+    rollout_safety: { enabled: false, weight: 10 },
   },
 };
 
@@ -49,7 +53,7 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
  * they act as hard gates that block regardless of score.
  */
 export function computeAggregateScore(
-  stages: Record<QualityGateStageName, QualityGateStageResult>,
+  stages: Partial<Record<QualityGateStageName, QualityGateStageResult>>,
   stageConfigs: Record<QualityGateStageName, QualityGateStageConfig>,
 ): number {
   let totalWeight = 0;
@@ -128,6 +132,7 @@ export function formatFailureReport(
     lines.push('### BLOCKING Issues (must fix first)');
     for (const name of binaryFailures) {
       const stageResult = result.stages[name];
+      if (!stageResult) continue;
       lines.push(`\n**${stageName(name)}** — FAILED`);
       for (const issue of stageResult.issues) {
         lines.push(`- ${issue}`);
@@ -223,6 +228,9 @@ function stageName(name: QualityGateStageName | string): string {
     simplicity: 'Simplicity Review',
     errors: 'Error Analysis',
     completeness: 'Completeness Check',
+    spec_compliance: 'Spec Compliance',
+    traceability: 'Requirement Traceability',
+    rollout_safety: 'Rollout Safety',
   };
   return names[name] || name;
 }

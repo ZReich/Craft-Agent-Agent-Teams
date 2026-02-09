@@ -5,6 +5,8 @@
  * that collaborate on complex tasks with a shared task list and mailbox.
  */
 
+import type { TicketReference } from './sdd.ts';
+
 // ============================================================
 // Team & Teammate Types
 // ============================================================
@@ -89,6 +91,14 @@ export interface TeamTask {
   title: string;
   description?: string;
   status: TeamTaskStatus;
+  /** Which spec requirements this task addresses */
+  requirementIds?: string[];
+  /** DRI owner for this task */
+  driOwner?: string;
+  /** DRI reviewer for this task */
+  driReviewer?: string;
+  /** Linked ticket references */
+  ticketLinks?: TicketReference[];
   /** ID of the teammate assigned to this task */
   assignee?: string;
   /** IDs of tasks that must complete before this one */
@@ -185,7 +195,14 @@ export interface ModelAssignment {
 // Model Presets
 // ============================================================
 
-export type ModelPresetId = 'max-quality' | 'balanced' | 'cost-optimized' | 'budget' | 'custom';
+export type ModelPresetId =
+  | 'max-quality'
+  | 'balanced'
+  | 'cost-optimized'
+  | 'budget'
+  | 'custom'
+  | 'codex-balanced'
+  | 'codex-full';
 
 export interface ModelPreset {
   id: ModelPresetId;
@@ -246,7 +263,7 @@ export interface ReviewResult {
 // ============================================================
 
 /** Names of each quality gate stage */
-export type QualityGateStageName = 'syntax' | 'tests' | 'architecture' | 'simplicity' | 'errors' | 'completeness';
+export type QualityGateStageName = 'syntax' | 'tests' | 'architecture' | 'simplicity' | 'errors' | 'completeness' | 'spec_compliance' | 'traceability' | 'rollout_safety';
 
 /** Result from a single quality gate stage */
 export interface QualityGateStageResult {
@@ -278,6 +295,10 @@ export interface QualityGateResult {
     simplicity: QualityGateStageResult;
     errors: QualityGateStageResult;
     completeness: QualityGateStageResult;
+    /** SDD stages — only present when a spec is provided */
+    spec_compliance?: QualityGateStageResult;
+    traceability?: QualityGateStageResult;
+    rollout_safety?: QualityGateStageResult;
   };
   /** How many review cycles have run for this task */
   cycleCount: number;

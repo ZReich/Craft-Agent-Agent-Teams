@@ -47,6 +47,13 @@ import { generateMessageId, debug } from '@craft-agent/core';
 - `Session` - Conversation scope bound to SDK session
 - `StoredSession` - Session with messages for persistence
 - `SessionMetadata` - Lightweight session listing info
+- Session SDD fields: `sddEnabled`, `activeSpecId`, `sddComplianceReports`
+
+### Spec-Driven Development (SDD)
+- `Spec` - Structured specification document with requirements and DRIs
+- `SpecRequirement` - Requirement metadata and ownership
+- `SpecComplianceReport` - Coverage report emitted at completion
+- `DRIAssignment` - Directly Responsible Individual assignments
 
 ### Messages
 - `Message` - Runtime message with all fields
@@ -83,6 +90,7 @@ src/
 ├── types/
 │   ├── workspace.ts  # Workspace, auth types
 │   ├── session.ts    # Session types
+│   ├── sdd.ts        # Spec-driven development types
 │   └── message.ts    # Message, event types
 └── utils/
     └── debug.ts      # Debug utility

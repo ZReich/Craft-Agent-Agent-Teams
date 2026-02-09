@@ -12,6 +12,7 @@ import type {
   StoredAttachment as CoreStoredAttachment,
   ContentBadge,
   ToolDisplayMeta,
+  SpecComplianceReport,
 } from '@craft-agent/core/types';
 
 // Import mode types from dedicated subpath export (avoids pulling in SDK)
@@ -34,6 +35,7 @@ export type {
   CoreStoredAttachment as StoredAttachment,
   ContentBadge,
   ToolDisplayMeta,
+  SpecComplianceReport,
 };
 
 // Import and re-export auth types for onboarding
@@ -500,6 +502,12 @@ export interface Session {
   teammateSessionIds?: string[]
   /** Team accent color (hex, e.g., "#7c3aed") */
   teamColor?: string
+  /** Whether SDD/spec mode is enabled for this session */
+  sddEnabled?: boolean
+  /** Currently active spec identifier */
+  activeSpecId?: string
+  /** Generated SDD compliance reports */
+  sddComplianceReports?: SpecComplianceReport[]
 }
 
 /**
@@ -573,6 +581,7 @@ export type SessionEvent =
   // Source events
   | { type: 'sources_changed'; sessionId: string; enabledSourceSlugs: string[] }
   | { type: 'labels_changed'; sessionId: string; labels: string[] }
+  | { type: 'sdd_compliance_report'; sessionId: string; report: SpecComplianceReport }
   // LLM connection events
   | { type: 'connection_changed'; sessionId: string; connectionSlug: string }
   // Background task/shell events
@@ -975,6 +984,14 @@ export const IPC_CHANNELS = {
   AGENT_TEAMS_GET_PROVIDER_KEY: 'agentTeams:getProviderKey',
   AGENT_TEAMS_SET_PROVIDER_KEY: 'agentTeams:setProviderKey',
 
+  // Spec-Driven Development (SDD)
+  SDD_GET_STATE: 'sdd:getState',
+  SDD_SET_ENABLED: 'sdd:setEnabled',
+  SDD_SET_SPEC: 'sdd:setSpec',
+  SDD_GET_COMPLIANCE: 'sdd:getCompliance',
+  SDD_VALIDATE_DRI: 'sdd:validateDRI',
+  SDD_CAN_CLOSE: 'sdd:canClose',
+
   // Usage tracking
   USAGE_GET_SESSION: 'usage:getSession',
   USAGE_GET_WEEKLY: 'usage:getWeekly',
@@ -1326,6 +1343,14 @@ export interface ElectronAPI {
   getAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter'): Promise<{ hasKey: boolean; maskedKey?: string }>
   setAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter', key: string): Promise<void>
 
+  // SDD
+  getSDDState(sessionId: string): Promise<{ sddEnabled: boolean; activeSpecId?: string; sddComplianceReports: SpecComplianceReport[] }>
+  setSDDEnabled(sessionId: string, enabled: boolean): Promise<{ success: boolean }>
+  setSDDSpec(sessionId: string, specId?: string): Promise<{ success: boolean }>
+  getSDDCompliance(sessionId: string): Promise<SpecComplianceReport[]>
+  validateSDDDRI(teamId: string): Promise<{ valid: boolean; missing: string[] }>
+  canCloseSDDPlan(teamId: string): Promise<{ canClose: boolean; blockers: string[] }>
+
   // Usage tracking
   getSessionUsage(sessionId: string): Promise<SessionUsage | null>
   getWeeklyUsage(): Promise<WeeklyUsageSummary | null>
@@ -1393,6 +1418,8 @@ export interface WorkspaceSettings {
   agentTeamsHeadModel?: string
   /** Model ID for worker agents */
   agentTeamsWorkerModel?: string
+  /** Model ID for reviewer role (quality gate AI reviews) */
+  agentTeamsReviewerModel?: string
   /** Model ID for escalation handling */
   agentTeamsEscalationModel?: string
   /** Cost cap in USD for agent teams operations */
@@ -1409,6 +1436,13 @@ export interface WorkspaceSettings {
   qualityGatesSimplicityEnabled?: boolean
   qualityGatesErrorsEnabled?: boolean
   qualityGatesCompletenessEnabled?: boolean
+  // Spec-driven development settings (stored in sdd workspace config)
+  sddEnabled?: boolean
+  sddRequireDRIAssignment?: boolean
+  sddRequireFullCoverage?: boolean
+  sddAutoComplianceReports?: boolean
+  sddDefaultSpecTemplate?: string
+  sddSpecTemplates?: Array<{ id: string; name: string; description?: string }>
 }
 
 /**

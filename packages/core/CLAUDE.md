@@ -20,6 +20,7 @@ packages/core/
 │   │   ├── index.ts       # Type re-exports
 │   │   ├── workspace.ts   # Workspace, auth, config types
 │   │   ├── session.ts     # Session, metadata types
+│   │   ├── sdd.ts         # Spec-driven development types
 │   │   └── message.ts     # Message, token, event types
 │   └── utils/
 │       ├── index.ts       # Utility re-exports
@@ -48,6 +49,16 @@ packages/core/
 | `Session` | Conversation scope with SDK session binding |
 | `StoredSession` | Session with persisted messages and tokens |
 | `SessionMetadata` | Lightweight session info for listings |
+| SDD fields | `sddEnabled`, `activeSpecId`, `sddComplianceReports` on session types |
+
+### SDD Types (`types/sdd.ts`)
+
+| Type | Description |
+|------|-------------|
+| `Spec` | Structured spec with requirements and DRIs |
+| `SpecRequirement` | Requirement details and ownership |
+| `SpecComplianceReport` | Compliance/coverage report |
+| `DRIAssignment` | Directly Responsible Individual assignment |
 
 ### Message Types (`types/message.ts`)
 

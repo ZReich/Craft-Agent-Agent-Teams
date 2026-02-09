@@ -36,6 +36,7 @@ import {
   type Workspace,
 } from '@craft-agent/shared/config'
 import { loadWorkspaceConfig, isAgentTeamsEnabled } from '@craft-agent/shared/workspaces'
+import { getLlmConnections } from '@craft-agent/shared/config'
 import {
   // Session persistence functions
   listSessions as listStoredSessions,
@@ -75,7 +76,7 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { generateSessionTitle, regenerateSessionTitle, formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon, type TitleGeneratorOptions } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta, QualityGateConfig } from '@craft-agent/core/types'
+import type { ToolDisplayMeta, QualityGateConfig, SpecComplianceReport } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
 import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
 import { DEFAULT_MODEL, getToolIconsDir, isCodexModel, getMiniModel, getSummarizationModel } from '@craft-agent/shared/config'
@@ -83,6 +84,7 @@ import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/
 import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
 import { listLabels } from '@craft-agent/shared/labels/storage'
 import { extractLabelId } from '@craft-agent/shared/labels'
+import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
 
 /**
  * Sanitize message content for use as session title.
@@ -695,6 +697,10 @@ interface ManagedSession {
   teammateName?: string
   teammateSessionIds?: string[]
   teamColor?: string
+  // SDD fields
+  sddEnabled?: boolean
+  activeSpecId?: string
+  sddComplianceReports?: SpecComplianceReport[]
   // Token refresh manager for OAuth token refresh with rate limiting
   tokenRefreshManager: TokenRefreshManager
   // Deduplication: track last sent message content and timestamp to prevent double-sends
@@ -844,6 +850,23 @@ export class SessionManager {
       this.qualityGateRunner = new QualityGateRunner({
         getMoonshotApiKey: () => credManager.getMoonshotApiKey(),
         getAnthropicApiKey: () => credManager.getLlmApiKey('anthropic-api'),
+        getOpenAiConfig: async () => {
+          const connections = getLlmConnections()
+          for (const conn of connections) {
+            if (conn.providerType !== 'openai' && conn.providerType !== 'openai_compat') continue
+            if (conn.authType !== 'api_key' && conn.authType !== 'api_key_with_endpoint' && conn.authType !== 'bearer_token') {
+              continue
+            }
+            const apiKey = await credManager.getLlmApiKey(conn.slug)
+            if (apiKey) {
+              return {
+                apiKey,
+                baseUrl: conn.baseUrl ?? null,
+              }
+            }
+          }
+          return null
+        },
       })
     }
     return this.qualityGateRunner
@@ -1315,6 +1338,9 @@ export class SessionManager {
             teammateName: meta.teammateName,
             teammateSessionIds: (meta as any).teammateSessionIds,
             teamColor: meta.teamColor,
+            sddEnabled: meta.sddEnabled,
+            activeSpecId: meta.activeSpecId,
+            sddComplianceReports: meta.sddComplianceReports,
             // Initialize TokenRefreshManager for this session
             tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
               log: (msg) => sessionLog.debug(msg),
@@ -1371,6 +1397,9 @@ export class SessionManager {
         teammateName: managed.teammateName,
         teammateSessionIds: managed.teammateSessionIds,
         teamColor: managed.teamColor,
+        sddEnabled: managed.sddEnabled,
+        activeSpecId: managed.activeSpecId,
+        sddComplianceReports: managed.sddComplianceReports,
         thinkingLevel: managed.thinkingLevel,
         messages: persistableMessages.map(messageToStored),
         tokenUsage: managed.tokenUsage ?? {
@@ -1783,6 +1812,9 @@ export class SessionManager {
       managed.enabledSourceSlugs = storedSession.enabledSourceSlugs
       managed.sharedUrl = storedSession.sharedUrl
       managed.sharedId = storedSession.sharedId
+      managed.sddEnabled = storedSession.sddEnabled
+      managed.activeSpecId = storedSession.activeSpecId
+      managed.sddComplianceReports = storedSession.sddComplianceReports
       // Sync name from disk - ensures title persistence across lazy loading
       managed.name = storedSession.name
       // Restore LLM connection state - ensures correct provider on resume
@@ -1852,6 +1884,8 @@ export class SessionManager {
     const defaultThinkingLevel = wsConfig?.defaults?.thinkingLevel ?? globalDefaults.workspaceDefaults.thinkingLevel
     // Get default model from workspace config (used when no session-specific model is set)
     const defaultModel = wsConfig?.defaults?.model
+    // Get default SDD mode from workspace config
+    const defaultSddEnabled = wsConfig?.sdd?.sddEnabled ?? false
 
     // Resolve working directory from options:
     // - 'user_default' or undefined: Use workspace's configured default
@@ -1940,6 +1974,8 @@ export class SessionManager {
       parentSessionId: options?.parentSessionId,
       teammateName: options?.teammateName,
       teamColor: options?.teamColor,
+      sddEnabled: defaultSddEnabled,
+      sddComplianceReports: [],
       // Initialize TokenRefreshManager for this session (handles OAuth token refresh with rate limiting)
       tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
         log: (msg) => sessionLog.debug(msg),
@@ -1947,6 +1983,7 @@ export class SessionManager {
     }
 
     this.sessions.set(storedSession.id, managed)
+    this.persistSession(managed)
 
     return {
       id: storedSession.id,
@@ -1970,6 +2007,8 @@ export class SessionManager {
       parentSessionId: options?.parentSessionId,
       teammateName: options?.teammateName,
       teamColor: options?.teamColor,
+      sddEnabled: defaultSddEnabled,
+      sddComplianceReports: [],
     }
   }
 
@@ -2107,6 +2146,7 @@ export class SessionManager {
       ?? wsConfig?.defaults?.permissionMode
       ?? globalDefaults.workspaceDefaults.permissionMode
     const defaultThinkingLevel = wsConfig?.defaults?.thinkingLevel ?? globalDefaults.workspaceDefaults.thinkingLevel
+    const defaultSddEnabled = wsConfig?.sdd?.sddEnabled ?? false
 
     const managed: ManagedSession = {
       id: storedSession.id,
@@ -2129,6 +2169,8 @@ export class SessionManager {
       backgroundShellCommands: new Map(),
       messagesLoaded: true,
       parentSessionId,
+      sddEnabled: defaultSddEnabled,
+      sddComplianceReports: [],
       // Initialize TokenRefreshManager for this session
       tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
         log: (msg) => sessionLog.debug(msg),
@@ -2136,6 +2178,7 @@ export class SessionManager {
     }
 
     this.sessions.set(storedSession.id, managed)
+    this.persistSession(managed)
 
     // Notify all windows that a sub-session was created (for session list updates)
     this.sendEvent({
@@ -2160,6 +2203,8 @@ export class SessionManager {
       thinkingLevel: defaultThinkingLevel,
       sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
       parentSessionId,
+      sddEnabled: defaultSddEnabled,
+      sddComplianceReports: [],
     }
   }
 
@@ -2359,6 +2404,59 @@ export class SessionManager {
             model: managed.model,
             llmConnection: managed.llmConnection,
           },
+          // Agent teams: callback to spawn teammates as separate sessions (Codex lead parity)
+          onTeammateSpawnRequested: teamsEnabled ? async (params) => {
+            sessionLog.info(`[AgentTeams] (Codex) Teammate spawn requested: ${params.teammateName} for team "${params.teamName}"`)
+            const teammateSession = await this.createTeammateSession({
+              parentSessionId: managed.id,
+              workspaceId: managed.workspace.id,
+              teamId: params.teamName,
+              teammateName: params.teammateName,
+              prompt: params.prompt,
+              model: params.model,
+            })
+            return { sessionId: teammateSession.id, agentId: teammateSession.id }
+          } : undefined,
+          // Agent teams: callback to route messages between teammate sessions (Codex lead parity)
+          onTeammateMessage: teamsEnabled ? async (params) => {
+            const teammateIds = managed.teammateSessionIds || []
+            sessionLog.info(`[AgentTeams] (Codex) Message routing: type=${params.type}, target=${params.targetName}, teammates=${teammateIds.length}`)
+
+            if (params.type === 'broadcast') {
+              let delivered = 0
+              for (const tid of teammateIds) {
+                const teammate = this.sessions.get(tid)
+                if (teammate) {
+                  try {
+                    await this.sendMessage(tid, `[From Lead] ${params.content}`)
+                    delivered++
+                  } catch (err) {
+                    sessionLog.error(`[AgentTeams] (Codex) Failed to broadcast to ${tid}:`, err)
+                  }
+                }
+              }
+              return { delivered: delivered > 0, error: delivered === 0 ? 'No teammates found' : undefined }
+            }
+
+            for (const tid of teammateIds) {
+              const teammate = this.sessions.get(tid)
+              if (teammate?.teammateName === params.targetName || teammate?.name === params.targetName) {
+                if (params.type === 'shutdown_request') {
+                  if (teammate.agent && teammate.isProcessing) {
+                    teammate.agent.forceAbort(AbortReason.UserStop)
+                  }
+                  return { delivered: true }
+                }
+                try {
+                  await this.sendMessage(tid, `[From Lead] ${params.content}`)
+                  return { delivered: true }
+                } catch (err) {
+                  return { delivered: false, error: String(err) }
+                }
+              }
+            }
+            return { delivered: false, error: `Teammate "${params.targetName}" not found` }
+          } : undefined,
           // Critical: Immediately persist SDK session ID when captured to prevent loss on crash.
           onSdkSessionIdUpdate: (sdkSessionId: string) => {
             managed.sdkSessionId = sdkSessionId
@@ -3235,6 +3333,68 @@ export class SessionManager {
   }
 
   /**
+   * Get SDD state for a session.
+   */
+  getSessionSDDState(sessionId: string): {
+    sddEnabled: boolean
+    activeSpecId?: string
+    sddComplianceReports: SpecComplianceReport[]
+  } {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    return {
+      sddEnabled: managed.sddEnabled ?? false,
+      activeSpecId: managed.activeSpecId,
+      sddComplianceReports: managed.sddComplianceReports ?? [],
+    }
+  }
+
+  /**
+   * Enable/disable SDD mode for a session.
+   */
+  async setSessionSDDEnabled(sessionId: string, enabled: boolean): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    managed.sddEnabled = enabled
+    if (!enabled) {
+      managed.activeSpecId = undefined
+    }
+    this.persistSession(managed)
+  }
+
+  /**
+   * Set active spec for a session.
+   */
+  async setSessionActiveSpec(sessionId: string, specId?: string): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    managed.activeSpecId = specId
+    if (managed.teamId) {
+      // Team manager currently stores full spec objects when available.
+      // For ID-only updates, clear the cached spec to avoid stale linkage.
+      teamManager.setTeamSpec(managed.teamId, undefined)
+    }
+    this.persistSession(managed)
+  }
+
+  /**
+   * Get SDD compliance reports for a session.
+   */
+  getSessionComplianceReports(sessionId: string): SpecComplianceReport[] {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    return managed.sddComplianceReports ?? []
+  }
+
+  /**
    * Get the last final assistant message ID from a list of messages
    * A "final" message is one where:
    * - role === 'assistant' AND
@@ -4009,6 +4169,133 @@ export class SessionManager {
   }
 
   /**
+   * SDD pre-completion hook.
+   * Validates requirement coverage before allowing completion when enforced by workspace config.
+   */
+  private onBeforeSessionComplete(
+    managed: ManagedSession
+  ): { allowCompletion: boolean; blockMessage?: string; report?: SpecComplianceReport } {
+    if (!managed.sddEnabled || !managed.activeSpecId) {
+      return { allowCompletion: true }
+    }
+
+    const report = this.generateSpecComplianceReport(managed)
+    if (!report) {
+      return { allowCompletion: true }
+    }
+
+    const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+    const requireFullCoverage = wsConfig?.sdd?.requireFullCoverage === true
+
+    if (requireFullCoverage && report.overallCoverage < 100) {
+      return {
+        allowCompletion: false,
+        blockMessage: `[SDD] Completion blocked: requirement coverage is ${report.overallCoverage}%. Full coverage is required in this workspace.`,
+        report,
+      }
+    }
+
+    return { allowCompletion: true, report }
+  }
+
+  /**
+   * SDD post-completion hook.
+   * Persists compliance report in session metadata for UI retrieval.
+   */
+  private onAfterSessionComplete(
+    managed: ManagedSession,
+    reportFromBeforeHook?: SpecComplianceReport
+  ): SpecComplianceReport | undefined {
+    if (!managed.sddEnabled || !managed.activeSpecId) {
+      return undefined
+    }
+
+    const report = reportFromBeforeHook ?? this.generateSpecComplianceReport(managed)
+    if (!report) {
+      return undefined
+    }
+
+    const reports = managed.sddComplianceReports ?? []
+    managed.sddComplianceReports = [...reports, report]
+    this.persistSession(managed)
+    return report
+  }
+
+  /**
+   * Build a lightweight compliance report from team task linkage.
+   * Falls back to task-derived requirements when no full spec is cached.
+   */
+  private generateSpecComplianceReport(managed: ManagedSession): SpecComplianceReport | undefined {
+    if (!managed.activeSpecId) return undefined
+
+    const teamId = managed.teamId
+    const tasks = teamId ? teamManager.getTasks(teamId) : []
+    const spec = teamId ? teamManager.getTeamSpec(teamId) : undefined
+
+    const requirementIds = spec?.requirements.map(r => r.id)
+      ?? [...new Set(tasks.flatMap(task => task.requirementIds ?? []))]
+
+    const requirementsCoverage = requirementIds.map(requirementId => {
+      const linkedTasks = tasks.filter(task => (task.requirementIds ?? []).includes(requirementId))
+      const coverage: 'full' | 'partial' | 'none' = linkedTasks.length > 0 ? 'full' : 'none'
+      return {
+        requirementId,
+        coverage,
+        referencedInFiles: [],
+        referencedInTests: [],
+        notes: linkedTasks.length > 0
+          ? `${linkedTasks.length} linked task(s)`
+          : 'No linked tasks',
+      }
+    })
+
+    const fullCount = requirementsCoverage.filter(r => r.coverage === 'full').length
+    const overallCoverage = requirementsCoverage.length > 0
+      ? Math.round((fullCount / requirementsCoverage.length) * 100)
+      : 100
+
+    const unreferencedRequirements = requirementsCoverage
+      .filter(r => r.coverage === 'none')
+      .map(r => r.requirementId)
+
+    const traceabilityMap = requirementsCoverage.map(r => ({
+      requirementId: r.requirementId,
+      files: [],
+      tests: [],
+      tasks: tasks
+        .filter(task => (task.requirementIds ?? []).includes(r.requirementId))
+        .map(task => task.id),
+      tickets: tasks
+        .flatMap(task => task.ticketLinks ?? [])
+        .filter(ticket => (ticket.requirementIds ?? []).includes(r.requirementId))
+        .map(ticket => ticket.ticketId),
+    }))
+
+    const hasRollbackPlan = !!spec?.rollbackPlan || tasks.some(t => /rollback/i.test(t.title))
+    const hasMonitoring = !!spec?.observabilityPlan || tasks.some(t => /monitor/i.test(t.title))
+    const hasFeatureFlags = tasks.some(t => /feature flag/i.test(t.title) || /flag/i.test(t.description || ''))
+
+    return {
+      specId: managed.activeSpecId,
+      timestamp: new Date().toISOString(),
+      overallCoverage,
+      requirementsCoverage,
+      unreferencedRequirements,
+      traceabilityMap,
+      rolloutSafetyCheck: {
+        hasRollbackPlan,
+        hasMonitoring,
+        hasFeatureFlags,
+        issues: [
+          ...(hasRollbackPlan ? [] : ['Missing rollback plan']),
+          ...(hasMonitoring ? [] : ['Missing monitoring plan']),
+          ...(hasFeatureFlags ? [] : ['No feature-flag strategy detected']),
+        ],
+      },
+    }
+  }
+
+  /**
    * Central handler for when processing stops (any reason).
    * Single source of truth for cleanup and queue processing.
    *
@@ -4032,6 +4319,36 @@ export class SessionManager {
     // (may allow display sleep if no other sessions are active)
     const { onSessionStopped } = await import('./power-manager')
     onSessionStopped()
+
+    // SDD pre/post completion hooks
+    if (reason === 'complete') {
+      const beforeResult = this.onBeforeSessionComplete(managed)
+      if (!beforeResult.allowCompletion && beforeResult.blockMessage) {
+        const warningMessage: Message = {
+          id: generateMessageId(),
+          role: 'warning',
+          content: beforeResult.blockMessage,
+          timestamp: Date.now(),
+          infoLevel: 'warning',
+        }
+        managed.messages.push(warningMessage)
+        this.sendEvent({
+          type: 'info',
+          sessionId,
+          message: beforeResult.blockMessage,
+          level: 'warning',
+        }, managed.workspace.id)
+      }
+
+      const complianceReport = this.onAfterSessionComplete(managed, beforeResult.report)
+      if (complianceReport) {
+        this.sendEvent({
+          type: 'sdd_compliance_report',
+          sessionId,
+          report: complianceReport,
+        }, managed.workspace.id)
+      }
+    }
 
     // 2. Handle unread state based on whether user is viewing this session
     //    This is the explicit state machine for NEW badge:

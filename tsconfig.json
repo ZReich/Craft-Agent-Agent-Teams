@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "types": ["node", "bun"],
     "lib": ["ESNext"],
     "target": "ESNext",
     "module": "ESNext",
@@ -22,9 +23,24 @@
     "noPropertyAccessFromIndexSignature": false,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@craft-agent/core": ["packages/core/src/index.ts"],
+      "@craft-agent/core/*": ["packages/core/src/*"],
+      "@craft-agent/shared": ["packages/shared/src/index.ts"],
+      "@craft-agent/shared/*": ["packages/shared/src/*"],
+      "@craft-agent/codex-types": ["packages/codex-types/src/index.ts"],
+      "@craft-agent/codex-types/*": ["packages/codex-types/src/*"],
+      "@craft-agent/session-tools-core": ["packages/session-tools-core/src/index.ts"],
+      "@craft-agent/session-tools-core/*": ["packages/session-tools-core/src/*"]
     }
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules"]
+  "include": ["src/**/*", "packages/core/src/**/*", "packages/shared/src/**/*"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "apps",
+    "packages/*/tests/**/*",
+    "packages/shared/src/**/__tests__/**",
+    "packages/shared/src/**/*.test.ts"
+  ]
 }

@@ -16,10 +16,13 @@ import { PanelHeader } from '@/components/app-shell/PanelHeader'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { HeaderMenu } from '@/components/ui/HeaderMenu'
 import { useAppShellContext } from '@/context/AppShellContext'
-import { routes } from '@/lib/navigate'
+import { navigate, routes } from '@/lib/navigate'
 import { Spinner } from '@craft-agent/ui'
+import { Button } from '@/components/ui/button'
 import type { DetailsPageMeta } from '@/lib/navigation-registry'
 import type { ModelPresetId, ModelAssignment, WorkspaceSettings } from '../../../shared/types'
+import { OPENAI_MODELS, isCodexModel } from '@config/models'
+import { isOpenAIProvider } from '@config/llm-connections'
 
 import {
   SettingsSection,
@@ -37,13 +40,20 @@ export const meta: DetailsPageMeta = {
   slug: 'agent-teams',
 }
 
-// Available models for role assignment
-const MODEL_OPTIONS = [
+// Available models for role assignment (Claude + Kimi)
+const BASE_MODEL_OPTIONS = [
   { value: 'claude-opus-4-6', label: 'Opus 4.6', description: 'Most capable ($15/$75 per 1M tokens)' },
   { value: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5', description: 'Best balance ($3/$15 per 1M tokens)' },
   { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', description: 'Fastest ($0.80/$4 per 1M tokens)' },
   { value: 'kimi-k2.5', label: 'Kimi K2.5', description: 'Cost-effective worker ($1.50/$7.50 per 1M tokens)' },
 ]
+
+const CODEX_MODEL_OPTIONS = OPENAI_MODELS.map((model) => ({
+  value: model.id,
+  label: model.name,
+  description: `${model.description} (Codex)`,
+}))
+
 
 // Preset configurations
 const PRESET_OPTIONS: { id: ModelPresetId; name: string; description: string; cost: string }[] = [
@@ -51,6 +61,8 @@ const PRESET_OPTIONS: { id: ModelPresetId; name: string; description: string; co
   { id: 'balanced', name: 'Balanced', description: 'Opus lead, Sonnet workers', cost: '$$$' },
   { id: 'cost-optimized', name: 'Cost Optimized', description: 'Opus lead, Kimi workers', cost: '$$' },
   { id: 'budget', name: 'Budget', description: 'Sonnet lead, Kimi workers', cost: '$' },
+  { id: 'codex-balanced', name: 'Codex Balanced', description: 'Codex lead/head, Sonnet workers', cost: '$$$' },
+  { id: 'codex-full', name: 'Codex Full', description: 'Codex everywhere', cost: '$$$$' },
   { id: 'custom', name: 'Custom', description: 'Choose every role', cost: '' },
 ]
 
@@ -59,6 +71,8 @@ const PRESET_CONFIGS: Record<ModelPresetId, { lead: string; head: string; worker
   'balanced': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-sonnet-4-5-20250929', reviewer: 'kimi-k2.5', escalation: 'claude-opus-4-6' },
   'cost-optimized': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
   'budget': { lead: 'claude-sonnet-4-5-20250929', head: 'kimi-k2.5', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
+  'codex-balanced': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'claude-sonnet-4-5-20250929', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
+  'codex-full': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'gpt-5.1-codex-mini', reviewer: 'kimi-k2.5', escalation: 'claude-opus-4-6' },
   'custom': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-sonnet-4-5-20250929', reviewer: 'kimi-k2.5', escalation: 'claude-opus-4-6' },
 }
 
@@ -70,7 +84,7 @@ function getProvider(model: string): string {
 }
 
 export default function AgentTeamsSettingsPage() {
-  const { activeWorkspaceId } = useAppShellContext()
+  const { activeWorkspaceId, llmConnections } = useAppShellContext()
 
   // Loading state
   const [isLoading, setIsLoading] = useState(true)
@@ -85,6 +99,7 @@ export default function AgentTeamsSettingsPage() {
   const [leadModel, setLeadModel] = useState('claude-opus-4-6')
   const [headModel, setHeadModel] = useState('claude-sonnet-4-5-20250929')
   const [workerModel, setWorkerModel] = useState('kimi-k2.5')
+  const [reviewerModel, setReviewerModel] = useState('kimi-k2.5')
   const [escalationModel, setEscalationModel] = useState('claude-sonnet-4-5-20250929')
 
   // Provider API keys (stored in encrypted secure storage, not plaintext config)
@@ -109,6 +124,16 @@ export default function AgentTeamsSettingsPage() {
   const [qgSimplicityEnabled, setQgSimplicityEnabled] = useState(true)
   const [qgErrorsEnabled, setQgErrorsEnabled] = useState(true)
   const [qgCompletenessEnabled, setQgCompletenessEnabled] = useState(true)
+  const [sddEnabled, setSddEnabled] = useState(false)
+  const [sddRequireDriAssignment, setSddRequireDriAssignment] = useState(true)
+  const [sddRequireFullCoverage, setSddRequireFullCoverage] = useState(true)
+  const [sddAutoComplianceReports, setSddAutoComplianceReports] = useState(true)
+  const [sddDefaultTemplate, setSddDefaultTemplate] = useState('default')
+  const [sddTemplateOptions, setSddTemplateOptions] = useState<Array<{ value: string; label: string; description?: string }>>([
+    { value: 'default', label: 'Default Template', description: 'Balanced spec skeleton for most features' },
+  ])
+
+  const hasOpenAiConnection = (llmConnections || []).some((conn) => isOpenAIProvider(conn.providerType))
 
   // Load settings
   useEffect(() => {
@@ -131,6 +156,10 @@ export default function AgentTeamsSettingsPage() {
         if (settings?.agentTeamsLeadModel) setLeadModel(settings.agentTeamsLeadModel)
         if (settings?.agentTeamsHeadModel) setHeadModel(settings.agentTeamsHeadModel)
         if (settings?.agentTeamsWorkerModel) setWorkerModel(settings.agentTeamsWorkerModel)
+        if (settings?.agentTeamsReviewerModel) {
+          setReviewerModel(settings.agentTeamsReviewerModel)
+          setQgReviewModel(settings.agentTeamsReviewerModel)
+        }
         if (settings?.agentTeamsEscalationModel) setEscalationModel(settings.agentTeamsEscalationModel)
         if (settings?.agentTeamsCostCapUsd) {
           setCostCapEnabled(true)
@@ -142,13 +171,30 @@ export default function AgentTeamsSettingsPage() {
         if (settings?.qualityGatesPassThreshold) setQgPassThreshold(String(settings.qualityGatesPassThreshold))
         if (settings?.qualityGatesMaxCycles) setQgMaxCycles(String(settings.qualityGatesMaxCycles))
         if (settings?.qualityGatesEnforceTDD !== undefined) setQgEnforceTDD(settings.qualityGatesEnforceTDD)
-        if (settings?.qualityGatesReviewModel) setQgReviewModel(settings.qualityGatesReviewModel)
+        if (settings?.qualityGatesReviewModel) {
+          setQgReviewModel(settings.qualityGatesReviewModel)
+          if (!settings?.agentTeamsReviewerModel) {
+            setReviewerModel(settings.qualityGatesReviewModel)
+          }
+        }
         if (settings?.qualityGatesSyntaxEnabled !== undefined) setQgSyntaxEnabled(settings.qualityGatesSyntaxEnabled)
         if (settings?.qualityGatesTestsEnabled !== undefined) setQgTestsEnabled(settings.qualityGatesTestsEnabled)
         if (settings?.qualityGatesArchEnabled !== undefined) setQgArchEnabled(settings.qualityGatesArchEnabled)
         if (settings?.qualityGatesSimplicityEnabled !== undefined) setQgSimplicityEnabled(settings.qualityGatesSimplicityEnabled)
         if (settings?.qualityGatesErrorsEnabled !== undefined) setQgErrorsEnabled(settings.qualityGatesErrorsEnabled)
         if (settings?.qualityGatesCompletenessEnabled !== undefined) setQgCompletenessEnabled(settings.qualityGatesCompletenessEnabled)
+        if (settings?.sddEnabled !== undefined) setSddEnabled(settings.sddEnabled)
+        if (settings?.sddRequireDRIAssignment !== undefined) setSddRequireDriAssignment(settings.sddRequireDRIAssignment)
+        if (settings?.sddRequireFullCoverage !== undefined) setSddRequireFullCoverage(settings.sddRequireFullCoverage)
+        if (settings?.sddAutoComplianceReports !== undefined) setSddAutoComplianceReports(settings.sddAutoComplianceReports)
+        if (settings?.sddDefaultSpecTemplate) setSddDefaultTemplate(settings.sddDefaultSpecTemplate)
+        if (settings?.sddSpecTemplates && settings.sddSpecTemplates.length > 0) {
+          setSddTemplateOptions(settings.sddSpecTemplates.map((template) => ({
+            value: template.id,
+            label: template.name,
+            description: template.description,
+          })))
+        }
 
         // Load provider API key status from secure storage
         const [moonshotStatus, openrouterStatus] = await Promise.all([
@@ -212,11 +258,15 @@ export default function AgentTeamsSettingsPage() {
         setLeadModel(config.lead)
         setHeadModel(config.head)
         setWorkerModel(config.worker)
+        setReviewerModel(config.reviewer)
         setEscalationModel(config.escalation)
         saveSetting('agentTeamsLeadModel', config.lead)
         saveSetting('agentTeamsHeadModel', config.head)
         saveSetting('agentTeamsWorkerModel', config.worker)
+        saveSetting('agentTeamsReviewerModel', config.reviewer)
         saveSetting('agentTeamsEscalationModel', config.escalation)
+        setQgReviewModel(config.reviewer)
+        saveSetting('qualityGatesReviewModel', config.reviewer)
       }
     },
     [saveSetting]
@@ -242,6 +292,15 @@ export default function AgentTeamsSettingsPage() {
     setSelectedPreset('custom')
     saveSetting('agentTeamsModelPreset', 'custom')
     saveSetting('agentTeamsWorkerModel', v)
+  }, [saveSetting])
+
+  const handleReviewerChange = useCallback((v: string) => {
+    setReviewerModel(v)
+    setQgReviewModel(v)
+    setSelectedPreset('custom')
+    saveSetting('agentTeamsModelPreset', 'custom')
+    saveSetting('agentTeamsReviewerModel', v)
+    saveSetting('qualityGatesReviewModel', v)
   }, [saveSetting])
 
   const handleEscalationChange = useCallback((v: string) => {
@@ -336,7 +395,9 @@ export default function AgentTeamsSettingsPage() {
 
   const handleQgReviewModelChange = useCallback((v: string) => {
     setQgReviewModel(v)
+    setReviewerModel(v)
     saveSetting('qualityGatesReviewModel', v)
+    saveSetting('agentTeamsReviewerModel', v)
   }, [saveSetting])
 
   const handleQgStageToggle = useCallback((stage: string, enabled: boolean) => {
@@ -350,10 +411,70 @@ export default function AgentTeamsSettingsPage() {
     }
   }, [saveSetting])
 
+  const handleSddEnabledToggle = useCallback((enabled: boolean) => {
+    setSddEnabled(enabled)
+    saveSetting('sddEnabled', enabled)
+
+    if (enabled && !sddRequireDriAssignment) {
+      setSddRequireDriAssignment(true)
+      saveSetting('sddRequireDRIAssignment', true)
+    }
+  }, [saveSetting, sddRequireDriAssignment])
+
+  const handleSddRequireDriToggle = useCallback((enabled: boolean) => {
+    setSddRequireDriAssignment(enabled)
+    saveSetting('sddRequireDRIAssignment', enabled)
+  }, [saveSetting])
+
+  const handleSddRequireCoverageToggle = useCallback((enabled: boolean) => {
+    setSddRequireFullCoverage(enabled)
+    saveSetting('sddRequireFullCoverage', enabled)
+  }, [saveSetting])
+
+  const handleSddAutoComplianceToggle = useCallback((enabled: boolean) => {
+    setSddAutoComplianceReports(enabled)
+    saveSetting('sddAutoComplianceReports', enabled)
+  }, [saveSetting])
+
+  const handleSddTemplateChange = useCallback((templateId: string) => {
+    setSddDefaultTemplate(templateId)
+    saveSetting('sddDefaultSpecTemplate', templateId)
+  }, [saveSetting])
+
+  const hasCodexConnection = llmConnections.some((conn) =>
+    isOpenAIProvider(conn.providerType) && conn.isAuthenticated
+  )
+
+  const codexSelected = [leadModel, headModel, workerModel, reviewerModel, escalationModel, qgReviewModel].some((model) =>
+    isCodexModel(model)
+  )
+
+  const roleModelOptions = React.useMemo(() => {
+    if (hasCodexConnection || codexSelected) {
+      return [
+        ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('claude-')),
+        ...CODEX_MODEL_OPTIONS,
+        ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('kimi-')),
+      ]
+    }
+    return BASE_MODEL_OPTIONS
+  }, [hasCodexConnection, codexSelected])
+
+  const reviewModelOptions = React.useMemo(() => {
+    if (hasCodexConnection || codexSelected) {
+      return [
+        ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('claude-')),
+        ...CODEX_MODEL_OPTIONS,
+        ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('kimi-')),
+      ]
+    }
+    return BASE_MODEL_OPTIONS
+  }, [hasCodexConnection, codexSelected])
+
   // Check which non-Claude providers are needed
-  const needsMoonshot = workerModel.startsWith('kimi-') || headModel.startsWith('kimi-') || leadModel.startsWith('kimi-')
-  const needsOpenRouter = [leadModel, headModel, workerModel, escalationModel].some(m =>
-    !m.startsWith('claude-') && !m.startsWith('kimi-')
+  const needsMoonshot = [leadModel, headModel, workerModel, reviewerModel].some(m => m.startsWith('kimi-'))
+  const needsOpenRouter = [leadModel, headModel, workerModel, reviewerModel, escalationModel].some(m =>
+    !m.startsWith('claude-') && !m.startsWith('kimi-') && !isCodexModel(m)
   )
 
   // Empty state
@@ -399,6 +520,11 @@ export default function AgentTeamsSettingsPage() {
                     checked={teamsEnabled}
                     onCheckedChange={handleTeamsToggle}
                   />
+                  {!hasOpenAiConnection && (
+                    <div className="text-xs text-amber-600 mt-2">
+                      Codex lead requires an OpenAI connection. Add one in API setup to use Codex as the lead model.
+                    </div>
+                  )}
                 </SettingsCard>
               </SettingsSection>
 
@@ -444,31 +570,61 @@ export default function AgentTeamsSettingsPage() {
                           description="Orchestrator that plans work and delegates"
                           value={leadModel}
                           onValueChange={handleLeadChange}
-                          options={MODEL_OPTIONS}
+                          options={roleModelOptions}
                         />
                         <SettingsMenuSelectRow
                           label="Head"
                           description="Coordinates sub-teams or complex sub-tasks"
                           value={headModel}
                           onValueChange={handleHeadChange}
-                          options={MODEL_OPTIONS}
+                          options={roleModelOptions}
                         />
                         <SettingsMenuSelectRow
                           label="Worker"
                           description="Executes individual tasks"
                           value={workerModel}
                           onValueChange={handleWorkerChange}
-                          options={MODEL_OPTIONS}
+                          options={roleModelOptions}
+                        />
+                        <SettingsMenuSelectRow
+                          label="Reviewer"
+                          description="Reviews teammate output in quality gates"
+                          value={reviewerModel}
+                          onValueChange={handleReviewerChange}
+                          options={reviewModelOptions}
                         />
                         <SettingsMenuSelectRow
                           label="Escalation"
                           description="Handles worker failures or review rejections"
                           value={escalationModel}
                           onValueChange={handleEscalationChange}
-                          options={MODEL_OPTIONS}
+                          options={roleModelOptions}
                         />
                       </SettingsCard>
                     </SettingsSection>
+
+                    {(codexSelected && !hasCodexConnection) && (
+                      <SettingsSection
+                        title="Codex Connection Required"
+                        description="One or more roles use Codex models. Connect an OpenAI/Codex account to run those teammates."
+                      >
+                        <SettingsCard>
+                          <SettingsRow
+                            label="OpenAI/Codex not connected"
+                            description="Set up a Codex connection in AI settings to enable Codex models for teams."
+                            action={(
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => navigate(routes.view.settings('ai'))}
+                              >
+                                Open AI Settings
+                              </Button>
+                            )}
+                          />
+                        </SettingsCard>
+                      </SettingsSection>
+                    )}
 
                     {/* Provider API Keys (only shown when non-Claude models selected) */}
                     {(needsMoonshot || needsOpenRouter) && (
@@ -588,13 +744,13 @@ export default function AgentTeamsSettingsPage() {
 
                             {/* Review Model */}
                             <SettingsCard>
-                              <SettingsMenuSelectRow
-                                label="Review Model"
-                                description="AI model used for architecture, simplicity, error, and completeness reviews"
-                                value={qgReviewModel}
-                                onValueChange={handleQgReviewModelChange}
-                                options={MODEL_OPTIONS}
-                              />
+                            <SettingsMenuSelectRow
+                              label="Review Model"
+                              description="AI model used for architecture, simplicity, error, and completeness reviews (synced with Reviewer role)"
+                              value={qgReviewModel}
+                              onValueChange={handleQgReviewModelChange}
+                              options={reviewModelOptions}
+                            />
                             </SettingsCard>
 
                             {/* Stage Toggles */}
@@ -638,6 +794,61 @@ export default function AgentTeamsSettingsPage() {
                                 description="All requirements met, no TODOs or stubs (~$0.005)"
                                 checked={qgCompletenessEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('completeness', v)}
+                              />
+                            </SettingsCard>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </SettingsSection>
+
+                    {/* Spec-Driven Development */}
+                    <SettingsSection
+                      title="Spec-Driven Development"
+                      description="Enable spec-centric planning, coverage, and compliance workflows"
+                    >
+                      <SettingsCard>
+                        <SettingsToggle
+                          label="Enable Spec Mode"
+                          description="Track requirements with traceability and compliance checks"
+                          checked={sddEnabled}
+                          onCheckedChange={handleSddEnabledToggle}
+                        />
+                      </SettingsCard>
+
+                      <AnimatePresence>
+                        {sddEnabled && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                            className="space-y-4 overflow-hidden"
+                          >
+                            <SettingsCard>
+                              <SettingsToggle
+                                label="Require DRI Assignment"
+                                description="Block task acceptance when requirements do not have a DRI owner"
+                                checked={sddRequireDriAssignment}
+                                onCheckedChange={handleSddRequireDriToggle}
+                              />
+                              <SettingsToggle
+                                label="Require Full Coverage Before Completion"
+                                description="Prevent completion until all requirements have linked tasks and tests"
+                                checked={sddRequireFullCoverage}
+                                onCheckedChange={handleSddRequireCoverageToggle}
+                              />
+                              <SettingsToggle
+                                label="Auto-generate Compliance Reports"
+                                description="Generate a requirement compliance report at the end of each spec run"
+                                checked={sddAutoComplianceReports}
+                                onCheckedChange={handleSddAutoComplianceToggle}
+                              />
+                              <SettingsMenuSelectRow
+                                label="Default Spec Template"
+                                description="Template used when creating a new spec in this workspace"
+                                value={sddDefaultTemplate}
+                                onValueChange={handleSddTemplateChange}
+                                options={sddTemplateOptions}
                               />
                             </SettingsCard>
                           </motion.div>

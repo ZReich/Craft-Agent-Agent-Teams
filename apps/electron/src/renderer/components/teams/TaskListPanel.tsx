@@ -20,6 +20,7 @@ export interface TaskListPanelProps {
   isCollapsed: boolean
   onToggleCollapsed: () => void
   onAssignTask?: (taskId: string, teammateId: string) => void
+  highlightedTaskIds?: string[]
 }
 
 const STATUS_CONFIG: Record<TeamTaskStatus, {
@@ -40,6 +41,7 @@ export function TaskListPanel({
   isCollapsed,
   onToggleCollapsed,
   onAssignTask,
+  highlightedTaskIds = [],
 }: TaskListPanelProps) {
   const completedCount = tasks.filter(t => t.status === 'completed').length
   const totalCount = tasks.length
@@ -96,8 +98,10 @@ export function TaskListPanel({
                   <div
                     key={task.id}
                     className={cn(
-                      'flex items-center gap-2.5 px-2.5 py-2 rounded-lg',
+                      'flex items-center gap-2.5 px-2.5 py-2 rounded-lg border border-transparent',
                       'hover:bg-foreground/[0.02] transition-colors'
+                      ,
+                      highlightedTaskIds.includes(task.id) && 'border-blue-500/30 bg-blue-500/5'
                     )}
                   >
                     <StatusIcon

@@ -66,5 +66,9 @@
     "strip-markdown": "^6.0.0",
     "unist-util-visit": "^5.0.0",
     "vaul": "^1.1.2"
+  },
+  "devDependencies": {
+    "tsc": "npm:typescript@^5.9.3",
+    "typescript": "^5.9.3"
   }
 }

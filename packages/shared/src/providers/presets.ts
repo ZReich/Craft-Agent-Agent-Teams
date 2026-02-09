@@ -83,6 +83,36 @@ export const MODEL_PRESETS: ModelPreset[] = [
       },
     },
   },
+  {
+    id: 'codex-balanced',
+    name: 'Codex Balanced',
+    description: 'Codex lead/head, Sonnet workers â€” Codex reasoning with Claude throughput',
+    costIndicator: '$$$',
+    config: {
+      defaults: {
+        lead: { model: 'gpt-5.3-codex', provider: 'openai' },
+        head: { model: 'gpt-5.3-codex', provider: 'openai' },
+        worker: { model: 'claude-sonnet-4-5-20250929', provider: 'anthropic' },
+        reviewer: { model: 'kimi-k2.5', provider: 'moonshot' },
+        escalation: { model: 'claude-sonnet-4-5-20250929', provider: 'anthropic' },
+      },
+    },
+  },
+  {
+    id: 'codex-full',
+    name: 'Codex Full',
+    description: 'Codex everywhere â€” maximum OpenAI reasoning',
+    costIndicator: '$$$$',
+    config: {
+      defaults: {
+        lead: { model: 'gpt-5.3-codex', provider: 'openai' },
+        head: { model: 'gpt-5.3-codex', provider: 'openai' },
+        worker: { model: 'gpt-5.1-codex-mini', provider: 'openai' },
+        reviewer: { model: 'kimi-k2.5', provider: 'moonshot' },
+        escalation: { model: 'claude-opus-4-6', provider: 'anthropic' },
+      },
+    },
+  },
 ];
 
 /** Get a preset by ID */

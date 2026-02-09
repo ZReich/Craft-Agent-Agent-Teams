@@ -45,6 +45,8 @@ const PRESET_OPTIONS: { id: ModelPresetId; name: string; cost: string; descripti
   { id: 'balanced', name: 'Balanced', cost: '$$$', description: 'Opus lead, Sonnet workers' },
   { id: 'max-quality', name: 'Max Quality', cost: '$$$$', description: 'Opus everywhere' },
   { id: 'budget', name: 'Budget', cost: '$', description: 'Sonnet lead, Kimi workers' },
+  { id: 'codex-balanced', name: 'Codex Balanced', cost: '$$$', description: 'Codex lead/head, Sonnet workers' },
+  { id: 'codex-full', name: 'Codex Full', cost: '$$$$', description: 'Codex everywhere' },
 ]
 
 const DEFAULT_TEAMMATES: TeammateConfig[] = [
@@ -85,6 +87,8 @@ export function TeamCreationDialog({
       'balanced': 7.5 + 3.75 * teammates.length,
       'cost-optimized': 7.5 + 1.425 * teammates.length,
       'budget': 2.25 + 1.425 * teammates.length,
+      'codex-balanced': 9.5 + 4.2 * teammates.length,
+      'codex-full': 14 + 6.5 * teammates.length,
       'custom': 3.75 * teammates.length,
     }
     return (costMap[selectedPreset] || 5).toFixed(2)

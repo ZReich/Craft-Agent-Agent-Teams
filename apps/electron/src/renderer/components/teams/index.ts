@@ -42,3 +42,21 @@ export type { UsageStatusBarProps } from './UsageStatusBar'
 
 export { UsageDetailPanel } from './UsageDetailPanel'
 export type { UsageDetailPanelProps } from './UsageDetailPanel'
+
+export { SpecCoveragePanel } from './SpecCoveragePanel'
+export type { SpecCoveragePanelProps } from './SpecCoveragePanel'
+
+export { SpecTraceabilityPanel } from './SpecTraceabilityPanel'
+export type { SpecTraceabilityPanelProps } from './SpecTraceabilityPanel'
+
+export { TeamSidebarCompact } from './TeamSidebarCompact'
+export type { TeamSidebarCompactProps } from './TeamSidebarCompact'
+
+export { SpecChecklistModal } from './SpecChecklistModal'
+export type { SpecChecklistModalProps } from './SpecChecklistModal'
+
+export { QuickFilters } from './QuickFilters'
+export type { QuickFiltersProps, QuickFilterState } from './QuickFilters'
+
+export { ExportPanel } from './ExportPanel'
+export type { ExportPanelProps } from './ExportPanel'

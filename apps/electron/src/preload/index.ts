@@ -537,6 +537,20 @@ const api: ElectronAPI = {
   setAgentTeamsProviderKey: (provider: 'moonshot' | 'openrouter', key: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SET_PROVIDER_KEY, provider, key),
 
+  // SDD
+  getSDDState: (sessionId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_GET_STATE, sessionId),
+  setSDDEnabled: (sessionId: string, enabled: boolean) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_SET_ENABLED, sessionId, enabled),
+  setSDDSpec: (sessionId: string, specId?: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_SET_SPEC, sessionId, specId),
+  getSDDCompliance: (sessionId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_GET_COMPLIANCE, sessionId),
+  validateSDDDRI: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_VALIDATE_DRI, teamId),
+  canCloseSDDPlan: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_CAN_CLOSE, teamId),
+
   // Usage tracking
   getSessionUsage: (sessionId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_SESSION, sessionId),

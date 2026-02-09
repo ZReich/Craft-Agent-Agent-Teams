@@ -17,6 +17,8 @@
     "@modelcontextprotocol/sdk": ">=1.0.0"
   },
   "devDependencies": {
-    "@types/uuid": "^11.0.0"
+    "@types/uuid": "^11.0.0",
+    "tsc": "npm:typescript@^5.9.3",
+    "typescript": "^5.9.3"
   }
 }

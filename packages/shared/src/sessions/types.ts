@@ -12,6 +12,7 @@
 import type { PermissionMode } from '../agent/mode-manager.ts';
 import type { ThinkingLevel } from '../agent/thinking-levels.ts';
 import type { StoredAttachment, MessageRole, ToolStatus, AuthRequestType, AuthStatus, CredentialInputMode, StoredMessage } from '@craft-agent/core/types';
+import type { SpecComplianceReport } from '@craft-agent/core/types';
 
 /**
  * Session fields that persist to disk.
@@ -40,6 +41,8 @@ export const SESSION_PERSISTENT_FIELDS = [
   'sharedUrl', 'sharedId',
   // Plan execution
   'pendingPlanExecution',
+  // SDD
+  'sddEnabled', 'activeSpecId', 'sddComplianceReports',
   // Archive
   'isArchived', 'archivedAt',
   // Hierarchy
@@ -145,6 +148,12 @@ export interface SessionConfig {
     /** Whether we're still waiting for compaction to complete */
     awaitingCompaction: boolean;
   };
+  /** Whether SDD/spec mode is enabled for this session */
+  sddEnabled?: boolean;
+  /** Currently active spec identifier for this session */
+  activeSpecId?: string;
+  /** Generated SDD compliance reports for this session */
+  sddComplianceReports?: SpecComplianceReport[];
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean;
   /** Whether this session is archived */
@@ -239,6 +248,12 @@ export interface SessionHeader {
     /** Whether we're still waiting for compaction to complete */
     awaitingCompaction: boolean;
   };
+  /** Whether SDD/spec mode is enabled for this session */
+  sddEnabled?: boolean;
+  /** Currently active spec identifier for this session */
+  activeSpecId?: string;
+  /** Generated SDD compliance reports for this session */
+  sddComplianceReports?: SpecComplianceReport[];
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean;
   /** Whether this session is archived */
@@ -328,6 +343,12 @@ export interface SessionMetadata {
   hasUnread?: boolean;
   /** Token usage statistics (from JSONL header, available without loading messages) */
   tokenUsage?: SessionTokenUsage;
+  /** Whether SDD/spec mode is enabled for this session */
+  sddEnabled?: boolean;
+  /** Currently active spec identifier for this session */
+  activeSpecId?: string;
+  /** Generated SDD compliance reports for this session */
+  sddComplianceReports?: SpecComplianceReport[];
   /** When true, session is hidden from session list (e.g., mini edit sessions) */
   hidden?: boolean;
   /** Whether this session is archived */

@@ -12,7 +12,7 @@
  * - Format user preferences for prompt injection
  */
 
-import { isLocalMcpEnabled } from '../../workspaces/storage.ts';
+import { isLocalMcpEnabled, isAgentTeamsEnabled } from '../../workspaces/storage.ts';
 import { formatPreferencesForPrompt } from '../../config/preferences.ts';
 import { formatSessionState } from '../mode-manager.ts';
 import { getDateTimeContext, getWorkingDirectoryContext } from '../../prompts/system.ts';
@@ -110,7 +110,31 @@ export class PromptBuilder {
       capabilities.push('local-mcp: disabled (only HTTP/SSE servers)');
     }
 
-    return `<workspace_capabilities>\n${capabilities.join('\n')}\n</workspace_capabilities>`;
+    // Agent teams capability
+    const agentTeamsEnabled = isAgentTeamsEnabled(this.workspaceRootPath);
+    if (agentTeamsEnabled) {
+      capabilities.push('agent-teams: enabled (spawn teammates via Task tool with team_name)');
+    } else {
+      capabilities.push('agent-teams: disabled');
+    }
+
+    const capabilityBlock = `<workspace_capabilities>\n${capabilities.join('\n')}\n</workspace_capabilities>`;
+
+    if (!agentTeamsEnabled) {
+      return capabilityBlock;
+    }
+
+    return `${capabilityBlock}
+
+<agent_teams>
+enabled: true
+To spawn teammates, call the Task tool with:
+- team_name: string (team id/name)
+- name: string (teammate name)
+- prompt: string (task to perform)
+- model: string (optional)
+Use SendMessage to message teammates (type: message | broadcast | shutdown_request).
+</agent_teams>`;
   }
 
   /**

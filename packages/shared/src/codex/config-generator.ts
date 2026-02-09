@@ -11,7 +11,6 @@
 
 import type { LoadedSource } from '../sources/types.ts';
 import type { SdkMcpServerConfig } from '../agent/backend/types.ts';
-import { isSourceUsable } from '../sources/storage.ts';
 import { getDefaultModelForConnection } from '../config/llm-connections.ts';
 
 // ============================================================
@@ -477,7 +476,7 @@ export function generateCodexConfig(options: CodexConfigGeneratorOptions): Codex
 
   // Process each source
   for (const source of sources) {
-    if (!isSourceUsable(source)) continue;
+    if (!source.config.enabled) continue;
 
     const slug = source.config.slug;
 

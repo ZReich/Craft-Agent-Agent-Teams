@@ -27,6 +27,9 @@ const STAGE_META: Record<QualityGateStageName, { label: string; binary?: boolean
   simplicity: { label: 'Simplicity Review' },
   errors: { label: 'Error Analysis' },
   completeness: { label: 'Completeness Check' },
+  spec_compliance: { label: 'Spec Compliance' },
+  traceability: { label: 'Traceability' },
+  rollout_safety: { label: 'Rollout Safety' },
 }
 
 function scoreColor(score: number): string {

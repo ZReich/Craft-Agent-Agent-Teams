@@ -22,6 +22,8 @@ import type {
   TeamActivityType,
   TeamCostSummary,
   TeammateTokenUsage,
+  Spec,
+  DRIAssignment,
 } from '@craft-agent/core/types';
 
 // ============================================================
@@ -56,6 +58,12 @@ export interface TeamManagerEvents {
   'message:sent': (message: TeammateMessage) => void;
   'activity': (event: TeamActivityEvent) => void;
   'cost:updated': (teamId: string, cost: TeamCostSummary) => void;
+  'synthesis:requested': (payload: {
+    teamId: string;
+    completedTasks: TeamTask[];
+    requirementCoverage: number;
+    outstandingItems: string[];
+  }) => void;
 }
 
 // ============================================================
@@ -67,6 +75,9 @@ export class AgentTeamManager extends EventEmitter {
   private tasks = new Map<string, TeamTask[]>();  // teamId → tasks
   private messages = new Map<string, TeammateMessage[]>();  // teamId → messages
   private activityLog = new Map<string, TeamActivityEvent[]>();  // teamId → activity events
+  private teamSpecs = new Map<string, Spec>();  // teamId → active spec
+  private teamDRIAssignments = new Map<string, DRIAssignment[]>();  // teamId → DRI assignments
+  private synthesisRequested = new Set<string>();  // teamIds that already emitted synthesis request
 
   // ============================================================
   // Team Lifecycle
@@ -88,6 +99,7 @@ export class AgentTeamManager extends EventEmitter {
     this.tasks.set(team.id, []);
     this.messages.set(team.id, []);
     this.activityLog.set(team.id, []);
+    this.teamDRIAssignments.set(team.id, []);
 
     this.emit('team:created', team);
     this.addActivity(team.id, 'teammate-spawned', 'Team created', undefined, undefined);
@@ -116,6 +128,9 @@ export class AgentTeamManager extends EventEmitter {
     this.emit('team:updated', team);
     this.emit('team:cleanup', teamId);
     this.addActivity(teamId, 'teammate-shutdown', 'Team cleaned up', undefined, undefined);
+    this.teamSpecs.delete(teamId);
+    this.teamDRIAssignments.delete(teamId);
+    this.synthesisRequested.delete(teamId);
   }
 
   /** Get team status */
@@ -126,6 +141,25 @@ export class AgentTeamManager extends EventEmitter {
   /** Get all active teams */
   getActiveTeams(): AgentTeam[] {
     return Array.from(this.teams.values()).filter(t => t.status === 'active');
+  }
+
+  /** Set active spec for a team (SDD integration) */
+  setTeamSpec(teamId: string, spec?: Spec): void {
+    if (!spec) {
+      this.teamSpecs.delete(teamId);
+      return;
+    }
+    this.teamSpecs.set(teamId, spec);
+  }
+
+  /** Get active spec for a team (SDD integration) */
+  getTeamSpec(teamId: string): Spec | undefined {
+    return this.teamSpecs.get(teamId);
+  }
+
+  /** Set DRI assignments for a team */
+  setTeamDRIAssignments(teamId: string, assignments: DRIAssignment[]): void {
+    this.teamDRIAssignments.set(teamId, assignments);
   }
 
   // ============================================================
@@ -255,6 +289,16 @@ export class AgentTeamManager extends EventEmitter {
       : status === 'failed' ? 'task-failed'
       : 'task-claimed';
     this.addActivity(teamId, activityType, `Task "${task.title}" → ${status}`, undefined, undefined, taskId);
+
+    // Trigger synthesis prompt once when all teammate tasks are completed
+    if (status === 'completed') {
+      const allTeammateTasksComplete = teamTasks
+        .filter(t => t.assignee) // teammate tasks are assigned
+        .every(t => t.status === 'completed');
+      if (allTeammateTasksComplete) {
+        this.autoSynthesize(teamId);
+      }
+    }
   }
 
   /** Get task list for a team */
@@ -374,6 +418,116 @@ export class AgentTeamManager extends EventEmitter {
       perTeammate,
       perModel,
     };
+  }
+
+  /**
+   * Validate DRI coverage for team spec requirements and sections.
+   * Returns missing section/requirement ownership details.
+   */
+  validateDRICoverage(teamId: string): { valid: boolean; missing: string[] } {
+    const missing: string[] = [];
+    const spec = this.teamSpecs.get(teamId);
+    const tasks = this.getTasks(teamId);
+    const assignments = this.teamDRIAssignments.get(teamId) || [];
+
+    if (!spec) {
+      return { valid: true, missing };
+    }
+
+    const requiredSections = [
+      'goals',
+      'nonGoals',
+      'requirements',
+      'risks',
+      'mitigations',
+      'rolloutPlan',
+      'rollbackPlan',
+      'testPlan',
+      'observabilityPlan',
+    ];
+
+    const assignedSections = new Set(assignments.flatMap(a => a.sections));
+    for (const section of requiredSections) {
+      if (!assignedSections.has(section)) {
+        missing.push(`Missing DRI assignment for spec section: ${section}`);
+      }
+    }
+
+    for (const req of spec.requirements) {
+      const hasOwnerInSpec = !!req.assignedDRI;
+      const hasOwnerInAssignments = assignments.some(a => a.sections.includes(req.id));
+      const hasOwnerInTasks = tasks.some(t =>
+        (t.requirementIds || []).includes(req.id) && !!t.driOwner
+      );
+
+      if (!hasOwnerInSpec && !hasOwnerInAssignments && !hasOwnerInTasks) {
+        missing.push(`Missing owner for requirement: ${req.id}`);
+      }
+    }
+
+    return { valid: missing.length === 0, missing };
+  }
+
+  /**
+   * Check whether a team plan can be closed.
+   * Requires DRI coverage and requirement coverage at 100%.
+   */
+  canClosePlan(teamId: string): { canClose: boolean; blockers: string[] } {
+    const blockers: string[] = [];
+    const spec = this.teamSpecs.get(teamId);
+    const tasks = this.getTasks(teamId);
+
+    const driValidation = this.validateDRICoverage(teamId);
+    if (!driValidation.valid) {
+      blockers.push(...driValidation.missing);
+    }
+
+    if (spec) {
+      const uncoveredRequirements = spec.requirements
+        .filter(req => !tasks.some(task => (task.requirementIds || []).includes(req.id)))
+        .map(req => req.id);
+
+      if (uncoveredRequirements.length > 0) {
+        blockers.push(
+          `Requirement coverage below 100% (missing tasks for: ${uncoveredRequirements.join(', ')})`
+        );
+      }
+    }
+
+    return {
+      canClose: blockers.length === 0,
+      blockers,
+    };
+  }
+
+  /**
+   * Emit synthesis request for the lead when all teammate tasks are complete.
+   */
+  autoSynthesize(teamId: string): void {
+    if (this.synthesisRequested.has(teamId)) return;
+
+    const tasks = this.getTasks(teamId);
+    const completedTasks = tasks.filter(t => t.status === 'completed');
+    const outstanding = tasks.filter(t => t.status !== 'completed');
+
+    const spec = this.teamSpecs.get(teamId);
+    let requirementCoverage = 100;
+    if (spec && spec.requirements.length > 0) {
+      const covered = spec.requirements.filter(req =>
+        tasks.some(task => (task.requirementIds || []).includes(req.id))
+      ).length;
+      requirementCoverage = Math.round((covered / spec.requirements.length) * 100);
+    }
+
+    const payload = {
+      teamId,
+      completedTasks,
+      requirementCoverage,
+      outstandingItems: outstanding.map(t => `${t.id}: ${t.title}`),
+    };
+
+    this.synthesisRequested.add(teamId);
+    this.emit('synthesis:requested', payload);
   }
 }
 

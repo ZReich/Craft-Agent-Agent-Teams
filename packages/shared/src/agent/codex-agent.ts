@@ -234,6 +234,12 @@ export class CodexAgent extends BaseAgent {
    */
   onAuthRequest: ((request: AuthRequest) => void) | null = null;
 
+  /** Callback when a teammate spawn is requested (agent teams) */
+  onTeammateSpawnRequested: BackendConfig['onTeammateSpawnRequested'] = undefined;
+
+  /** Callback to send a message to a teammate session (agent teams) */
+  onTeammateMessage: BackendConfig['onTeammateMessage'] = undefined;
+
   /**
    * Resolve the connection slug for credential routing.
    * Uses connectionSlug from config (set by factory), falls back to session's llmConnection.
@@ -259,6 +265,14 @@ export class CodexAgent extends BaseAgent {
 
     // Initialize event adapter
     this.adapter = new EventAdapter();
+
+    // Agent teams callbacks (optional)
+    if (config.onTeammateSpawnRequested) {
+      this.onTeammateSpawnRequested = config.onTeammateSpawnRequested;
+    }
+    if (config.onTeammateMessage) {
+      this.onTeammateMessage = config.onTeammateMessage;
+    }
 
     // Start config watcher for hot-reloading source changes (non-headless only)
     if (!config.isHeadless) {
@@ -1052,9 +1066,143 @@ export class CodexAgent extends BaseAgent {
       }
     }
 
+    // Normalize input for downstream checks
+    const inputObj = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
+
+    // ============================================================
+    // AGENT TEAMS: Intercept teammate spawn and message routing
+    // ============================================================
+    const teamName =
+      typeof inputObj.team_name === 'string'
+        ? inputObj.team_name
+        : typeof inputObj.teamName === 'string'
+          ? inputObj.teamName
+          : undefined;
+
+    const isSpawnTool =
+      sdkToolName === 'Task' ||
+      toolName === 'Task' ||
+      toolName === 'spawnAgent' ||
+      toolName === 'CollabAgent:spawnAgent';
+
+    if (isSpawnTool && teamName && this.onTeammateSpawnRequested) {
+      const teammateName = (inputObj.name as string) || `teammate-${Date.now()}`;
+      const prompt = (inputObj.prompt as string) || '';
+      const model = inputObj.model as string | undefined;
+
+      this.debug(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}"`);
+
+      try {
+        const result = await this.onTeammateSpawnRequested({
+          teamName,
+          teammateName,
+          prompt,
+          model,
+        });
+
+        const outputContent =
+          `Teammate "${teammateName}" spawned successfully as a separate session.\n` +
+          `agent_id: ${result.sessionId}\nname: ${teammateName}\nstatus: running\n\n` +
+          `The teammate is now working independently in its own context window. You will receive their results when they complete.`;
+
+        // Emit team initialization for UI + task list
+        this.enqueueEvent({
+          type: 'team_initialized',
+          teamName,
+          teammateName,
+          teamToolUseId: itemId,
+        });
+
+        // Emit synthetic tool_result for UI continuity
+        this.enqueueEvent({
+          type: 'tool_result',
+          toolUseId: itemId,
+          toolName: 'Task',
+          result: outputContent,
+          isError: false,
+        });
+
+        // Short-circuit actual tool execution
+        await this.safeRespondToPreToolUse(requestId, {
+          type: 'block',
+          reason: outputContent,
+        });
+        return;
+      } catch (err) {
+        const errorMessage = `Failed to spawn teammate "${teammateName}": ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+
+        this.enqueueEvent({
+          type: 'tool_result',
+          toolUseId: itemId,
+          toolName: 'Task',
+          result: errorMessage,
+          isError: true,
+        });
+
+        await this.safeRespondToPreToolUse(requestId, {
+          type: 'block',
+          reason: errorMessage,
+        });
+        return;
+      }
+    }
+
+    const isMessageTool = sdkToolName === 'SendMessage' || toolName === 'SendMessage';
+    if (isMessageTool && this.onTeammateMessage) {
+      const msgType = (inputObj.type as string) || 'message';
+      const targetName = (inputObj.recipient as string) || '';
+      const content = (inputObj.content as string) || '';
+
+      if (msgType === 'message' || msgType === 'broadcast' || msgType === 'shutdown_request') {
+        this.debug(`[AgentTeams] Intercepting SendMessage: type=${msgType}, target=${targetName}`);
+        try {
+          const result = await this.onTeammateMessage({
+            targetName,
+            content,
+            type: msgType as 'message' | 'broadcast' | 'shutdown_request',
+          });
+
+          const messageResult = result.delivered
+            ? (msgType === 'broadcast'
+              ? 'Message broadcast to all teammates successfully.'
+              : `Message delivered to "${targetName}" successfully.`)
+            : `Message delivery failed: ${result.error || 'Unknown error'}`;
+
+          this.enqueueEvent({
+            type: 'tool_result',
+            toolUseId: itemId,
+            toolName: 'SendMessage',
+            result: messageResult,
+            isError: !result.delivered,
+          });
+
+          await this.safeRespondToPreToolUse(requestId, {
+            type: 'block',
+            reason: messageResult,
+          });
+          return;
+        } catch (err) {
+          const messageResult = `Message delivery failed: ${err instanceof Error ? err.message : String(err)}`;
+          this.enqueueEvent({
+            type: 'tool_result',
+            toolUseId: itemId,
+            toolName: 'SendMessage',
+            result: messageResult,
+            isError: true,
+          });
+          await this.safeRespondToPreToolUse(requestId, {
+            type: 'block',
+            reason: messageResult,
+          });
+          return;
+        }
+      }
+    }
+
     // Track modifications to input
     let modifiedInput: Record<string, unknown> | null = null;
-    const inputObj = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
 
     // ============================================================
     // PATH EXPANSION: Expand ~ in file paths for all file tools

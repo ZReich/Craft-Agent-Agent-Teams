@@ -6,7 +6,7 @@
  */
 
 import * as React from 'react'
-import { Users, DollarSign, Shield, ShieldOff } from 'lucide-react'
+import { Users, DollarSign, Shield, ShieldOff, Columns2, PanelLeftClose } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -17,6 +17,9 @@ export interface TeamHeaderProps {
   cost?: TeamCostSummary
   onToggleDelegateMode?: () => void
   onCleanupTeam?: () => void
+  specModeEnabled?: boolean
+  isCompactSidebarMode?: boolean
+  onToggleCompactSidebarMode?: () => void
 }
 
 const STATUS_LABELS: Record<string, { label: string; className: string }> = {
@@ -26,7 +29,15 @@ const STATUS_LABELS: Record<string, { label: string; className: string }> = {
   error: { label: 'Error', className: 'bg-red-500/10 text-red-600 border-red-500/20' },
 }
 
-export function TeamHeader({ team, cost, onToggleDelegateMode, onCleanupTeam }: TeamHeaderProps) {
+export function TeamHeader({
+  team,
+  cost,
+  onToggleDelegateMode,
+  onCleanupTeam,
+  specModeEnabled,
+  isCompactSidebarMode,
+  onToggleCompactSidebarMode,
+}: TeamHeaderProps) {
   const activeCount = team.members.filter(m => m.status === 'working' || m.status === 'idle' || m.status === 'planning').length
   const statusInfo = STATUS_LABELS[team.status] || STATUS_LABELS.active
 
@@ -41,9 +52,27 @@ export function TeamHeader({ team, cost, onToggleDelegateMode, onCleanupTeam }: 
           <Users className="size-3" />
           <span>{activeCount}/{team.members.length}</span>
         </div>
+        {specModeEnabled && (
+          <Badge variant="outline" className="text-[11px] px-1.5 py-0 border-blue-500/30 text-blue-500">
+            Spec Compliance
+          </Badge>
+        )}
       </div>
 
       <div className="flex items-center gap-2 shrink-0">
+        {onToggleCompactSidebarMode && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onToggleCompactSidebarMode}
+            className={cn('h-7 gap-1 text-xs', isCompactSidebarMode && 'text-blue-500')}
+            title={isCompactSidebarMode ? 'Switch to full sidebar' : 'Switch to compact sidebar'}
+          >
+            {isCompactSidebarMode ? <Columns2 className="size-3" /> : <PanelLeftClose className="size-3" />}
+            {isCompactSidebarMode ? 'Full View' : 'Compact'}
+          </Button>
+        )}
+
         {/* Cost */}
         {cost && (
           <div className="flex items-center gap-1 text-xs text-muted-foreground">

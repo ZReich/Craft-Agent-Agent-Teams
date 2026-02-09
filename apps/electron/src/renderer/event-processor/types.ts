@@ -6,6 +6,7 @@
  */
 
 import type { Session, Message, PermissionRequest, CredentialRequest, TypedError, PermissionMode, TodoState, AuthRequest, ToolDisplayMeta } from '../../shared/types'
+import type { SpecComplianceReport } from '../../shared/types'
 
 /**
  * Streaming state for a session - replaces streamingTextRef
@@ -456,6 +457,15 @@ export interface TeamSessionCreatedEvent {
 }
 
 /**
+ * SDD compliance report event.
+ */
+export interface SDDComplianceReportEvent {
+  type: 'sdd_compliance_report'
+  sessionId: string
+  report: SpecComplianceReport
+}
+
+/**
  * Union of all agent events
  */
 export type AgentEvent =
@@ -500,6 +510,7 @@ export type AgentEvent =
   | TodosUpdatedEvent
   | TeamInitializedEvent
   | TeamSessionCreatedEvent
+  | SDDComplianceReportEvent
 
 /**
  * Side effects that need to be handled outside the pure processor

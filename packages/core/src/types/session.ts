@@ -6,6 +6,7 @@
  */
 
 import type { StoredMessage, TokenUsage } from './message.ts';
+import type { SpecComplianceReport } from './sdd.ts';
 
 /**
  * Session status for workflow tracking
@@ -36,6 +37,10 @@ export interface Session {
   teamId?: string;               // If this session is part of a team, the team ID
   isTeamLead?: boolean;          // Whether this session is the team lead
   parentTeamSessionId?: string;  // For teammate sessions: the lead session ID
+  // SDD
+  sddEnabled?: boolean;          // Spec mode toggle per session
+  activeSpecId?: string;         // Currently active spec
+  sddComplianceReports?: SpecComplianceReport[]; // Compliance reports generated
 }
 
 /**
@@ -70,4 +75,8 @@ export interface SessionMetadata {
   // Agent Teams
   teamId?: string;         // If this session is part of a team
   isTeamLead?: boolean;    // Whether this is the team lead session
+  // SDD
+  sddEnabled?: boolean;
+  activeSpecId?: string;
+  sddComplianceReports?: SpecComplianceReport[];
 }

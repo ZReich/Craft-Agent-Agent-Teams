@@ -13,7 +13,7 @@
 
 import type { PermissionMode } from '../agent/mode-manager.ts';
 import type { ThinkingLevel } from '../agent/thinking-levels.ts';
-import type { QualityGateConfig } from '@craft-agent/core/types';
+import type { QualityGateConfig, SpecTemplate } from '@craft-agent/core/types';
 
 /**
  * Local MCP server configuration
@@ -69,6 +69,25 @@ export interface TeamModelDefaults {
 }
 
 /**
+ * Spec-Driven Development (SDD) configuration
+ * Controls the SDD workflow for spec-based implementation tracking.
+ */
+export interface SDDWorkspaceConfig {
+  /** Whether SDD mode is enabled for this workspace (default: false) */
+  sddEnabled?: boolean;
+  /** Reusable spec templates for this workspace */
+  specTemplates?: SpecTemplate[];
+  /** Default template ID for new specs */
+  defaultSpecTemplate?: string;
+  /** Block plan acceptance if no DRI is assigned */
+  requireDRIAssignment?: boolean;
+  /** Block completion if requirement coverage < 100% */
+  requireFullCoverage?: boolean;
+  /** Auto-generate compliance report artifacts on completion */
+  autoGenerateComplianceReports?: boolean;
+}
+
+/**
  * Workspace configuration (stored in config.json)
  */
 export interface WorkspaceConfig {
@@ -97,6 +116,13 @@ export interface WorkspaceConfig {
    * Off by default — when disabled, Craft Agents behaves identically to stock.
    */
   agentTeams?: AgentTeamsConfig;
+
+  /**
+   * Spec-Driven Development configuration.
+   * When enabled, specs drive implementation with requirement tracking,
+   * DRI assignments, and compliance reporting.
+   */
+  sdd?: SDDWorkspaceConfig;
 
   /**
    * Local MCP server configuration.

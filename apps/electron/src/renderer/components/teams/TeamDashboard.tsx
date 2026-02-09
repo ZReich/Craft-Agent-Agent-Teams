@@ -16,7 +16,7 @@
 import * as React from 'react'
 import { useState, useEffect, useMemo } from 'react'
 import { useAtomValue } from 'jotai'
-import { Plus, Activity } from 'lucide-react'
+import { Plus, Activity, FileCheck2, GitBranch } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { sessionMetaMapAtom } from '@/atoms/sessions'
@@ -40,6 +40,10 @@ import { TaskListPanel } from './TaskListPanel'
 import { TeamActivityFeed } from './TeamActivityFeed'
 import { TeamCreationDialog } from './TeamCreationDialog'
 import { QualityGateReport } from './QualityGateReport'
+import { SpecCoveragePanel } from './SpecCoveragePanel'
+import { SpecTraceabilityPanel } from './SpecTraceabilityPanel'
+import { TeamSidebarCompact } from './TeamSidebarCompact'
+import { SpecChecklistModal } from './SpecChecklistModal'
 
 /**
  * Derive an AgentTeammateStatus from a teammate's SessionMeta
@@ -102,6 +106,29 @@ export interface TeamDashboardProps {
   onShutdownTeammate?: (teammateId: string) => void
   /** Called to escalate a teammate */
   onEscalateTeammate?: (teammateId: string) => void
+  /** Whether spec mode is active for this workspace/session */
+  specModeEnabled?: boolean
+  /** Requirement coverage data */
+  specRequirements?: Array<{
+    id: string
+    description: string
+    priority: 'critical' | 'high' | 'medium' | 'low'
+    status: 'pending' | 'in-progress' | 'implemented' | 'verified'
+    linkedTaskIds?: string[]
+    linkedTestPatterns?: string[]
+  }>
+  /** Requirement traceability map */
+  specTraceabilityMap?: Array<{
+    requirementId: string
+    files: string[]
+    tests: string[]
+    tasks: string[]
+    tickets: string[]
+  }>
+  /** Called when a requirement is selected */
+  onSpecRequirementClick?: (requirementId: string) => void
+  /** Called to complete/finalize the team session */
+  onCompleteTeam?: () => void
 }
 
 export function TeamDashboard({
@@ -118,11 +145,20 @@ export function TeamDashboard({
   onSwapModel,
   onShutdownTeammate,
   onEscalateTeammate,
+  specModeEnabled = false,
+  specRequirements = [],
+  specTraceabilityMap = [],
+  onSpecRequirementClick,
+  onCompleteTeam,
 }: TeamDashboardProps) {
   const [selectedTeammateId, setSelectedTeammateId] = useState<string | undefined>()
   const [taskListCollapsed, setTaskListCollapsed] = useState(true)
-  const [activeTab, setActiveTab] = useState<'teammate' | 'activity'>('teammate')
+  const [activeTab, setActiveTab] = useState<'teammate' | 'activity' | 'spec-coverage' | 'traceability'>('teammate')
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [checklistOpen, setChecklistOpen] = useState(false)
+  const [compactSidebarMode, setCompactSidebarMode] = useState(false)
+  const [compactSidebarExpanded, setCompactSidebarExpanded] = useState(false)
+  const [highlightedTaskIds, setHighlightedTaskIds] = useState<string[]>([])
 
   // Read teammate session metadata from Jotai atoms
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
@@ -171,6 +207,21 @@ export function TeamDashboard({
   }, [session.id])
 
   const selectedTeammate = teammates.find(m => m.id === selectedTeammateId)
+  const teammateActiveTaskCount = useMemo(() => {
+    const counts = new Map<string, number>()
+    tasks.forEach((task) => {
+      if (!task.assignee || task.status !== 'in_progress') return
+      counts.set(task.assignee, (counts.get(task.assignee) || 0) + 1)
+    })
+    return counts
+  }, [tasks])
+  const specCoveragePercent = useMemo(() => {
+    if (specRequirements.length === 0) return 0
+    const fullyCovered = specRequirements.filter(r => (r.linkedTaskIds?.length || 0) > 0 && (r.linkedTestPatterns?.length || 0) > 0).length
+    return Math.round((fullyCovered / specRequirements.length) * 100)
+  }, [specRequirements])
+
+  const compactRecentActivity = useMemo(() => activityEvents.slice(-5).reverse(), [activityEvents])
 
   // No team ID on session — show empty state with create button
   if (!session.teamId && !session.isTeamLead) {
@@ -215,16 +266,39 @@ export function TeamDashboard({
         cost={cost}
         onToggleDelegateMode={onToggleDelegateMode}
         onCleanupTeam={onCleanupTeam}
+        specModeEnabled={specModeEnabled}
+        isCompactSidebarMode={compactSidebarMode}
+        onToggleCompactSidebarMode={() => {
+          setCompactSidebarMode(prev => !prev)
+          setCompactSidebarExpanded(false)
+        }}
       />
 
       {/* Main content area */}
       <div className="flex-1 flex min-h-0">
-        {/* Teammate Sidebar */}
-        <TeammateSidebar
-          teammates={teammates}
-          selectedTeammateId={selectedTeammateId}
-          onSelectTeammate={setSelectedTeammateId}
-        />
+        {/* Sidebar */}
+        {compactSidebarMode ? (
+          <TeamSidebarCompact
+            teammates={teammates.map(t => ({
+              id: t.id,
+              name: t.name,
+              status: t.status,
+              currentTask: `${teammateActiveTaskCount.get(t.id) || 0} active`,
+              model: t.model,
+            }))}
+            activeTasks={tasks.filter(task => task.status === 'in_progress').length}
+            specCoverage={specCoveragePercent}
+            recentActivity={compactRecentActivity}
+            isExpanded={compactSidebarExpanded}
+            onToggleExpand={() => setCompactSidebarExpanded(prev => !prev)}
+          />
+        ) : (
+          <TeammateSidebar
+            teammates={teammates}
+            selectedTeammateId={selectedTeammateId}
+            onSelectTeammate={setSelectedTeammateId}
+          />
+        )}
 
         {/* Center panel with tabs */}
         <div className="flex-1 flex flex-col min-w-0">
@@ -260,6 +334,32 @@ export function TeamDashboard({
                 </span>
               )}
             </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('spec-coverage')}
+              className={cn(
+                'px-2.5 py-1 text-xs rounded-md transition-colors flex items-center gap-1',
+                activeTab === 'spec-coverage'
+                  ? 'bg-foreground/5 text-foreground font-medium'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/[0.02]'
+              )}
+            >
+              <FileCheck2 className="size-3" />
+              Spec Coverage
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('traceability')}
+              className={cn(
+                'px-2.5 py-1 text-xs rounded-md transition-colors flex items-center gap-1',
+                activeTab === 'traceability'
+                  ? 'bg-foreground/5 text-foreground font-medium'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/[0.02]'
+              )}
+            >
+              <GitBranch className="size-3" />
+              Traceability
+            </button>
           </div>
 
           {/* Content */}
@@ -288,6 +388,22 @@ export function TeamDashboard({
               </div>
             ) : activeTab === 'activity' ? (
               <TeamActivityFeed events={activityEvents} />
+            ) : activeTab === 'spec-coverage' ? (
+              <SpecCoveragePanel
+                requirements={specRequirements}
+                className="h-full"
+                onRequirementClick={(requirementId) => {
+                  const matchingRequirement = specRequirements.find((req) => req.id === requirementId)
+                  setHighlightedTaskIds(matchingRequirement?.linkedTaskIds || [])
+                  setTaskListCollapsed(false)
+                  onSpecRequirementClick?.(requirementId)
+                }}
+              />
+            ) : activeTab === 'traceability' ? (
+              <SpecTraceabilityPanel
+                traceabilityMap={specTraceabilityMap}
+                className="h-full"
+              />
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
                 <p className="text-sm">Select a teammate</p>
@@ -303,7 +419,23 @@ export function TeamDashboard({
         teammates={teammates}
         isCollapsed={taskListCollapsed}
         onToggleCollapsed={() => setTaskListCollapsed(prev => !prev)}
+        highlightedTaskIds={highlightedTaskIds}
       />
+
+      {/* Spec Checklist Modal (shown before completing with SDD mode) */}
+      {specModeEnabled && (
+        <SpecChecklistModal
+          open={checklistOpen}
+          onOpenChange={setChecklistOpen}
+          requirements={specRequirements}
+          coveragePercent={specCoveragePercent}
+          onConfirmComplete={() => {
+            setChecklistOpen(false)
+            onCompleteTeam?.()
+          }}
+          onGoBack={() => setChecklistOpen(false)}
+        />
+      )}
     </div>
   )
 }

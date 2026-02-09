@@ -356,6 +356,21 @@ export interface BackendConfig {
   /** Callback to get recent messages for recovery context */
   getRecoveryMessages?: () => RecoveryMessage[];
 
+  /** Callback when a teammate spawn is requested (agent teams) */
+  onTeammateSpawnRequested?: (params: {
+    teamName: string;
+    teammateName: string;
+    prompt: string;
+    model?: string;
+  }) => Promise<{ sessionId: string; agentId: string }>;
+
+  /** Callback to send a message to a teammate session (agent teams) */
+  onTeammateMessage?: (params: {
+    targetName: string;
+    content: string;
+    type: 'message' | 'broadcast' | 'shutdown_request';
+  }) => Promise<{ delivered: boolean; error?: string }>;
+
   /**
    * Mini/utility model for summarization, title generation, and mini agent.
    * Resolved from the connection's miniModel field (last model in models array).

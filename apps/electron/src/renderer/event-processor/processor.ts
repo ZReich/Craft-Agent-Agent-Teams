@@ -206,6 +206,17 @@ export function processEvent(
       // This allows reusing existing turn-utils extraction logic for TurnCard todos
       return handleTodosUpdated(state, event)
 
+    case 'sdd_compliance_report': {
+      const updatedSession = {
+        ...state.session,
+        sddComplianceReports: [...(state.session.sddComplianceReports || []), event.report],
+      }
+      return {
+        state: { ...state, session: updatedSession },
+        effects: [],
+      }
+    }
+
     case 'team_initialized': {
       // Set teamId and isTeamLead on the session so UI renders TeamDashboard
       const teamSession = {

@@ -81,6 +81,25 @@ export type {
   TeamCostSummary,
 } from './agent-teams.ts';
 
+// SDD (Spec-Driven Development) types
+export type {
+  Spec,
+  SpecStatus,
+  SpecRequirement,
+  SpecRisk,
+  TicketReference,
+  TicketProviderType,
+  SpecTemplate,
+  SpecTemplateSection,
+  DRIAssignment,
+  SpecComplianceReport,
+  RequirementCoverage,
+  TraceabilityEntry,
+  RolloutSafetyCheck,
+  SDDSessionState,
+  SDDQualityGateStageName,
+} from './sdd.ts';
+
 // Usage tracking types
 export type {
   SessionUsage,

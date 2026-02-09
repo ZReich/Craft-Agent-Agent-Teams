@@ -1668,6 +1668,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const config = loadWorkspaceConfig(workspace.rootPath)
 
     const qg = config?.agentTeams?.qualityGates
+    const sdd = config?.sdd
     return {
       name: config?.name,
       model: config?.defaults?.model,
@@ -1682,6 +1683,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsLeadModel: config?.agentTeams?.leadModel,
       agentTeamsHeadModel: config?.agentTeams?.headModel,
       agentTeamsWorkerModel: config?.agentTeams?.workerModel,
+      agentTeamsReviewerModel: config?.agentTeams?.reviewerModel,
       agentTeamsEscalationModel: config?.agentTeams?.escalationModel,
       agentTeamsCostCapUsd: config?.agentTeams?.costCapUsd,
       // Quality gate settings
@@ -1696,6 +1698,13 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       qualityGatesSimplicityEnabled: qg?.stages?.simplicity?.enabled ?? true,
       qualityGatesErrorsEnabled: qg?.stages?.errors?.enabled ?? true,
       qualityGatesCompletenessEnabled: qg?.stages?.completeness?.enabled ?? true,
+      // SDD settings
+      sddEnabled: sdd?.sddEnabled ?? false,
+      sddRequireDRIAssignment: sdd?.requireDRIAssignment ?? true,
+      sddRequireFullCoverage: sdd?.requireFullCoverage ?? true,
+      sddAutoComplianceReports: sdd?.autoGenerateComplianceReports ?? true,
+      sddDefaultSpecTemplate: sdd?.defaultSpecTemplate,
+      sddSpecTemplates: sdd?.specTemplates ?? [],
     }
   })
 
@@ -1705,7 +1714,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled']
+    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -1724,6 +1733,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsLeadModel: 'leadModel',
       agentTeamsHeadModel: 'headModel',
       agentTeamsWorkerModel: 'workerModel',
+      agentTeamsReviewerModel: 'reviewerModel',
       agentTeamsEscalationModel: 'escalationModel',
       agentTeamsCostCapUsd: 'costCapUsd',
     }
@@ -1784,6 +1794,20 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       }
 
       config.agentTeams.qualityGates = qg as typeof config.agentTeams.qualityGates
+    } else if (key.startsWith('sdd')) {
+      // Store SDD settings in config.sdd
+      config.sdd = config.sdd || {}
+      const sddKeyMap: Record<string, string> = {
+        sddEnabled: 'sddEnabled',
+        sddRequireDRIAssignment: 'requireDRIAssignment',
+        sddRequireFullCoverage: 'requireFullCoverage',
+        sddAutoComplianceReports: 'autoGenerateComplianceReports',
+        sddDefaultSpecTemplate: 'defaultSpecTemplate',
+      }
+      const mappedKey = sddKeyMap[key]
+      if (mappedKey) {
+        ;(config.sdd as Record<string, unknown>)[mappedKey] = value
+      }
     } else {
       // Update the setting in defaults
       config.defaults = config.defaults || {}
@@ -3549,6 +3573,38 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       throw new Error(`Unknown provider: ${provider}`)
     }
     ipcLog.info(`Provider API key saved for: ${provider}`)
+  })
+
+  // ============================================================
+  // SDD (Spec-Driven Development)
+  // ============================================================
+
+  ipcMain.handle(IPC_CHANNELS.SDD_GET_STATE, async (_event, sessionId: string) => {
+    return sessionManager.getSessionSDDState(sessionId)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SDD_SET_ENABLED, async (_event, sessionId: string, enabled: boolean) => {
+    await sessionManager.setSessionSDDEnabled(sessionId, enabled)
+    return { success: true }
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SDD_SET_SPEC, async (_event, sessionId: string, specId?: string) => {
+    await sessionManager.setSessionActiveSpec(sessionId, specId)
+    return { success: true }
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SDD_GET_COMPLIANCE, async (_event, sessionId: string) => {
+    return sessionManager.getSessionComplianceReports(sessionId)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SDD_VALIDATE_DRI, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.validateDRICoverage(teamId)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SDD_CAN_CLOSE, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    return teamManager.canClosePlan(teamId)
   })
 
   // ============================================================
