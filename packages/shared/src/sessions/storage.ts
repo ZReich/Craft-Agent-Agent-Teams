@@ -439,6 +439,12 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
       // Sub-session hierarchy
       parentSessionId: header.parentSessionId,
       siblingOrder: header.siblingOrder,
+      // Agent team fields
+      teamId: header.teamId,
+      isTeamLead: header.isTeamLead,
+      teammateName: header.teammateName,
+      teammateSessionIds: header.teammateSessionIds,
+      teamColor: header.teamColor,
     };
   } catch {
     return null;

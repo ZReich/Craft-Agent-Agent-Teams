@@ -315,14 +315,36 @@ export const initializeSessionsAtom = atom(
     )
     set(loadedSessionsAtom, preservedLoaded)
 
-    // Set individual session atoms
+    // Set individual session atoms.
+    // Preserve already-loaded message arrays when initializeSessions races after
+    // an early ensureSessionMessagesLoadedAtom call. Without this merge, startup
+    // initialization can overwrite loaded messages with the lightweight
+    // getSessions() payload (messages: []), leaving the first chat blank.
+    const hydratedSessions: Session[] = []
     for (const session of sessions) {
-      set(sessionAtomFamily(session.id), session)
+      const existingSession = get(sessionAtomFamily(session.id))
+      const shouldPreserveLoadedMessages =
+        !!existingSession &&
+        preservedLoaded.has(session.id) &&
+        (existingSession.messages?.length ?? 0) > 0 &&
+        (session.messages?.length ?? 0) === 0
+
+      const hydratedSession = shouldPreserveLoadedMessages
+        ? {
+            ...session,
+            messages: existingSession.messages,
+            tokenUsage: existingSession.tokenUsage ?? session.tokenUsage,
+            sessionFolderPath: existingSession.sessionFolderPath ?? session.sessionFolderPath,
+          }
+        : session
+
+      set(sessionAtomFamily(session.id), hydratedSession)
+      hydratedSessions.push(hydratedSession)
     }
 
     // Build metadata map
     const metaMap = new Map<string, SessionMeta>()
-    for (const session of sessions) {
+    for (const session of hydratedSessions) {
       metaMap.set(session.id, extractSessionMeta(session))
     }
     set(sessionMetaMapAtom, metaMap)

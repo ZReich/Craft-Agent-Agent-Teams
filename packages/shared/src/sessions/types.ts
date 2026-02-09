@@ -47,6 +47,8 @@ export const SESSION_PERSISTENT_FIELDS = [
   'isArchived', 'archivedAt',
   // Hierarchy
   'parentSessionId', 'siblingOrder',
+  // Agent teams
+  'teamId', 'isTeamLead', 'teammateName', 'teammateSessionIds', 'teamColor',
 ] as const;
 
 export type SessionPersistentField = typeof SESSION_PERSISTENT_FIELDS[number];
@@ -366,6 +368,8 @@ export interface SessionMetadata {
   isTeamLead?: boolean;
   /** Display name for teammate sessions */
   teammateName?: string;
+  /** IDs of teammate sessions (lead tracks its children) */
+  teammateSessionIds?: string[];
   /** Team accent color (hex) */
   teamColor?: string;
 }

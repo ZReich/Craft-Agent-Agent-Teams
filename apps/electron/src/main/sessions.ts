@@ -1336,7 +1336,7 @@ export class SessionManager {
             isTeamLead: meta.isTeamLead,
             parentSessionId: meta.parentSessionId,
             teammateName: meta.teammateName,
-            teammateSessionIds: (meta as any).teammateSessionIds,
+            teammateSessionIds: meta.teammateSessionIds,
             teamColor: meta.teamColor,
             sddEnabled: meta.sddEnabled,
             activeSpecId: meta.activeSpecId,

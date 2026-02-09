@@ -1398,12 +1398,14 @@ function AppShellContent({
     }
   }, [sessionFilter])
 
-  // Ensure session messages are loaded when selected
+  // Ensure session messages are loaded when selected.
+  // Gate on metadata existence to avoid startup races where message hydration can
+  // run before initializeSessions has populated the atoms.
   React.useEffect(() => {
-    if (session.selected) {
+    if (session.selected && sessionMetaMap.has(session.selected)) {
       ensureMessagesLoaded(session.selected)
     }
-  }, [session.selected, ensureMessagesLoaded])
+  }, [session.selected, sessionMetaMap, ensureMessagesLoaded])
 
   // Wrap delete handler to clear selection when deleting the currently selected session
   // This prevents stale state during re-renders that could cause crashes
