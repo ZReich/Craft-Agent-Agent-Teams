@@ -1023,6 +1023,9 @@ export function SessionList({
 
   // Agent Teams: Track which teams are manually collapsed by the user
   const [collapsedTeams, setCollapsedTeams] = useState<Set<string>>(new Set())
+  // Track known team IDs so we can detect when a new team appears
+  const knownTeamIds = useRef<Set<string>>(new Set())
+
   const handleToggleCollapse = useCallback((teamId: string) => {
     setCollapsedTeams(prev => {
       const next = new Set(prev)
@@ -1034,6 +1037,44 @@ export function SessionList({
       return next
     })
   }, [])
+
+  // Auto-collapse prior teams when a new team is spawned by the lead
+  useEffect(() => {
+    const currentTeamIds = new Set<string>()
+    for (const item of items) {
+      if (item.isTeamLead && item.teamId) {
+        currentTeamIds.add(item.teamId)
+      }
+    }
+
+    // Detect newly added teams
+    const newTeamIds: string[] = []
+    for (const teamId of currentTeamIds) {
+      if (!knownTeamIds.current.has(teamId)) {
+        newTeamIds.push(teamId)
+      }
+    }
+
+    if (newTeamIds.length > 0 && knownTeamIds.current.size > 0) {
+      // A new team appeared while other teams already exist:
+      // collapse all prior teams, expand the new one
+      setCollapsedTeams(prev => {
+        const next = new Set(prev)
+        // Collapse all existing teams
+        for (const existingId of knownTeamIds.current) {
+          next.add(existingId)
+        }
+        // Make sure new teams are expanded
+        for (const newId of newTeamIds) {
+          next.delete(newId)
+        }
+        return next
+      })
+    }
+
+    // Update known set
+    knownTeamIds.current = currentTeamIds
+  }, [items])
 
   // Pre-flatten label tree once for efficient ID lookups in each SessionItem
   const flatLabels = useMemo(() => flattenLabels(labels), [labels])
