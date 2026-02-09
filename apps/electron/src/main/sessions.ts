@@ -106,10 +106,6 @@ function sanitizeForTitle(content: string): string {
  * - Codex session MCP server (nodePath in config.toml)
  */
 function getBundledBunPath(): string | undefined {
-  if (!app.isPackaged) {
-    return undefined // Use system bun in development
-  }
-
   const basePath = app.getAppPath()
   const bunBinary = process.platform === 'win32' ? 'bun.exe' : 'bun'
   // On Windows, bun.exe is in extraResources (process.resourcesPath) to avoid EBUSY errors.
@@ -117,12 +113,31 @@ function getBundledBunPath(): string | undefined {
   const bunBasePath = process.platform === 'win32' ? process.resourcesPath : basePath
   const bunPath = join(bunBasePath, 'vendor', 'bun', bunBinary)
 
-  if (!existsSync(bunPath)) {
-    sessionLog.warn(`Bundled Bun not found at ${bunPath}`)
-    return undefined
+  if (existsSync(bunPath)) {
+    return bunPath
   }
 
-  return bunPath
+  // In dev mode on Windows, the .cmd wrapper from npm can't be spawned directly by
+  // child_process.spawn() (ENOENT). Find the actual bun.exe binary instead.
+  if (!app.isPackaged && process.platform === 'win32') {
+    const { execSync } = require('child_process')
+    try {
+      const result = execSync('where bun.exe', { encoding: 'utf-8', timeout: 5000 }).trim().split('\n')[0]
+      if (result && existsSync(result.trim())) {
+        sessionLog.info(`Using system bun.exe for dev mode: ${result.trim()}`)
+        return result.trim()
+      }
+    } catch { /* bun.exe not on PATH */ }
+    // Try known npm global location
+    const npmBunExe = join(process.env.APPDATA || '', 'npm', 'node_modules', 'bun', 'bin', 'bun.exe')
+    if (existsSync(npmBunExe)) {
+      sessionLog.info(`Using npm-installed bun.exe for dev mode: ${npmBunExe}`)
+      return npmBunExe
+    }
+  }
+
+  sessionLog.warn(`Bundled Bun not found at ${bunPath}`)
+  return undefined
 }
 
 /**
@@ -332,17 +347,27 @@ async function setupCodexSessionConfig(
   // Bridge server path differs between packaged app and development:
   // - Packaged: resources/bridge-mcp-server/index.js (copied during build)
   // - Dev: packages/bridge-mcp-server/dist/index.js (built by electron:build:main)
-  const bridgeServerPath = app.isPackaged
+  //   Fallback: apps/electron/resources/bridge-mcp-server/index.js (pre-built bundle from upstream)
+  let bridgeServerPath = app.isPackaged
     ? join(app.getAppPath(), 'resources', 'bridge-mcp-server', 'index.js')
     : join(process.cwd(), 'packages', 'bridge-mcp-server', 'dist', 'index.js')
+  if (!app.isPackaged && !existsSync(bridgeServerPath)) {
+    const fallback = join(process.cwd(), 'apps', 'electron', 'resources', 'bridge-mcp-server', 'index.js')
+    if (existsSync(fallback)) { bridgeServerPath = fallback }
+  }
   const bridgeConfigPath = join(sessionPath, '.codex-home', 'bridge-config.json')
 
   // Session MCP server path - provides session-scoped tools (SubmitPlan, config_validate, etc.)
   // - Packaged: resources/session-mcp-server/index.js (copied during build)
   // - Dev: packages/session-mcp-server/dist/index.js (built by electron:build:main)
-  const sessionServerPath = app.isPackaged
+  //   Fallback: apps/electron/resources/session-mcp-server/index.js (pre-built bundle from upstream)
+  let sessionServerPath = app.isPackaged
     ? join(app.getAppPath(), 'resources', 'session-mcp-server', 'index.js')
     : join(process.cwd(), 'packages', 'session-mcp-server', 'dist', 'index.js')
+  if (!app.isPackaged && !existsSync(sessionServerPath)) {
+    const fallback = join(process.cwd(), 'apps', 'electron', 'resources', 'session-mcp-server', 'index.js')
+    if (existsSync(fallback)) { sessionServerPath = fallback }
+  }
 
   // Check if bridge server exists - if not, log warning and skip bridge config
   // This enables graceful degradation when bridge isn't built (e.g., fresh clone)
@@ -672,6 +697,9 @@ interface ManagedSession {
   teamColor?: string
   // Token refresh manager for OAuth token refresh with rate limiting
   tokenRefreshManager: TokenRefreshManager
+  // Deduplication: track last sent message content and timestamp to prevent double-sends
+  // (renderer sometimes sends the same message twice within ~100-200ms)
+  lastSendDedup?: { content: string; timestamp: number }
 }
 
 // Convert runtime Message to StoredMessage for persistence
@@ -1194,15 +1222,14 @@ export class SessionManager {
     sessionLog.info('Setting interceptorPath:', interceptorPath)
     setInterceptorPath(interceptorPath)
 
-    // In packaged app: use bundled Bun binary
-    // In development: use system 'bun' command (no need to set executable)
+    // Use bundled Bun binary (packaged app) or system bun.exe (dev mode)
     const bundledBunPath = getBundledBunPath()
-    if (app.isPackaged) {
-      if (!bundledBunPath) {
-        const error = 'Bundled Bun runtime not found. The app package may be corrupted.'
-        sessionLog.error(error)
-        throw new Error(error)
-      }
+    if (app.isPackaged && !bundledBunPath) {
+      const error = 'Bundled Bun runtime not found. The app package may be corrupted.'
+      sessionLog.error(error)
+      throw new Error(error)
+    }
+    if (bundledBunPath) {
       sessionLog.info('Setting executable:', bundledBunPath)
       setExecutable(bundledBunPath)
     }
@@ -2362,6 +2389,12 @@ export class SessionManager {
         })
         sessionLog.info(`Created Codex agent for session ${managed.id} (model: ${codexModel}, codexHome: ${codexHome})${managed.sdkSessionId ? ' (resuming)' : ''}`)
 
+        // Wire up onDebug so Codex/AppServerClient debug messages appear in logs
+        // (BaseAgent.onDebug defaults to null, so without this all debug output is lost)
+        managed.agent.onDebug = (msg: string) => {
+          sessionLog.info(`[CodexDebug:${managed.id}] ${msg}`)
+        }
+
         // CRITICAL: Inject stored credentials into Codex app-server
         // Without this, the app-server spawns but has no authentication, causing silent failures
         const codexAgent = managed.agent as CodexAgent
@@ -2394,12 +2427,14 @@ export class SessionManager {
           }
 
           // Inject stored OAuth tokens (if available) - this is async but we await it
+          sessionLog.info(`[Codex:${managed.id}] Calling tryInjectStoredChatGptTokens (this spawns codex app-server)...`)
           const tokensInjected = await codexAgent.tryInjectStoredChatGptTokens()
           if (tokensInjected) {
             sessionLog.info(`ChatGPT tokens injected for Codex session ${managed.id}`)
           } else {
             sessionLog.warn(`No ChatGPT tokens available for Codex session ${managed.id} - user may need to authenticate`)
           }
+          sessionLog.info(`[Codex:${managed.id}] Token injection complete, proceeding to chat`)
         }
       } else {
         // Claude backend - uses Anthropic SDK
@@ -3540,6 +3575,20 @@ export class SessionManager {
     const managed = this.sessions.get(sessionId)
     if (!managed) {
       throw new Error(`Session ${sessionId} not found`)
+    }
+
+    // Deduplication guard: drop duplicate messages sent within 500ms.
+    // The renderer sometimes sends the same message twice (~100-200ms apart),
+    // which interrupts Codex sessions before they can initialize.
+    // Skip dedup for queue-drain calls (existingMessageId) and auth retries.
+    if (!existingMessageId && !_isAuthRetry) {
+      const now = Date.now()
+      const lastDedup = managed.lastSendDedup
+      if (lastDedup && lastDedup.content === message && (now - lastDedup.timestamp) < 500) {
+        sessionLog.info(`Dedup: dropping duplicate message for session ${sessionId} (${now - lastDedup.timestamp}ms apart)`)
+        return
+      }
+      managed.lastSendDedup = { content: message, timestamp: now }
     }
 
     // Clear any pending plan execution state when a new user message is sent.

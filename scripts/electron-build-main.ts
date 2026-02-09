@@ -4,7 +4,7 @@
  */
 
 import { spawn } from "bun";
-import { existsSync, readFileSync, statSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, statSync, mkdirSync, copyFileSync } from "fs";
 import { join } from "path";
 
 const ROOT_DIR = join(import.meta.dir, "..");
@@ -140,6 +140,19 @@ async function buildBridgeServer(): Promise<void> {
     mkdirSync(distDir, { recursive: true });
   }
 
+  const sourceDir = join(BRIDGE_SERVER_DIR, "src");
+  if (!existsSync(sourceDir)) {
+    // Source not available — copy pre-built bundle from resources
+    const prebuilt = join(ROOT_DIR, "apps/electron/resources/bridge-mcp-server/index.js");
+    if (existsSync(prebuilt)) {
+      copyFileSync(prebuilt, BRIDGE_SERVER_OUTPUT);
+      console.log("✅ Bridge server copied from pre-built resources");
+      return;
+    }
+    console.error("❌ Bridge server source not found and no pre-built bundle available");
+    process.exit(1);
+  }
+
   const proc = spawn({
     cmd: [
       "bun", "build",
@@ -177,6 +190,19 @@ async function buildSessionServer(): Promise<void> {
   const distDir = join(SESSION_SERVER_DIR, "dist");
   if (!existsSync(distDir)) {
     mkdirSync(distDir, { recursive: true });
+  }
+
+  const sourceDir = join(SESSION_SERVER_DIR, "src");
+  if (!existsSync(sourceDir)) {
+    // Source not available — copy pre-built bundle from resources
+    const prebuilt = join(ROOT_DIR, "apps/electron/resources/session-mcp-server/index.js");
+    if (existsSync(prebuilt)) {
+      copyFileSync(prebuilt, SESSION_SERVER_OUTPUT);
+      console.log("✅ Session server copied from pre-built resources");
+      return;
+    }
+    console.error("❌ Session server source not found and no pre-built bundle available");
+    process.exit(1);
   }
 
   const proc = spawn({

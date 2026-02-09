@@ -124,6 +124,24 @@ export function resolveCodexBinary(): { path: string; source: string } {
     }
   }
 
+  // 2b. Check installed app vendor directory (dev mode fallback)
+  // When running from a fork, the fork's vendor dir may not have the binary,
+  // but the installed packaged app does.
+  if (process.platform === 'win32') {
+    const installedAppVendor = join(
+      process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'),
+      'Programs', '@craft-agentelectron', 'resources', 'app', 'vendor', 'codex', getPlatformArch(), binaryName
+    );
+    if (existsSync(installedAppVendor)) {
+      return { path: installedAppVendor, source: 'installed app vendor (dev fallback)' };
+    }
+  } else if (process.platform === 'darwin') {
+    const macAppVendor = join('/Applications', 'Craft Agents.app', 'Contents', 'Resources', 'app', 'vendor', 'codex', getPlatformArch(), binaryName);
+    if (existsSync(macAppVendor)) {
+      return { path: macAppVendor, source: 'installed app vendor (dev fallback)' };
+    }
+  }
+
   // 3. Check local dev fork (development mode)
   // Check CODEX_DEV_PATH env var first, then common dev locations
   const home = homedir();

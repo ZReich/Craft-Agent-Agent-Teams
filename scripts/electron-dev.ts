@@ -12,12 +12,6 @@ const ROOT_DIR = join(import.meta.dir, "..");
 const ELECTRON_DIR = join(ROOT_DIR, "apps/electron");
 const DIST_DIR = join(ELECTRON_DIR, "dist");
 
-// MCP server paths (for Codex sessions)
-const SESSION_SERVER_DIR = join(ROOT_DIR, "packages/session-mcp-server");
-const SESSION_SERVER_OUTPUT = join(SESSION_SERVER_DIR, "dist/index.js");
-const BRIDGE_SERVER_DIR = join(ROOT_DIR, "packages/bridge-mcp-server");
-const BRIDGE_SERVER_OUTPUT = join(BRIDGE_SERVER_DIR, "dist/index.js");
-
 // Platform-specific binary paths (bun creates .exe on Windows, no extension on Unix)
 const IS_WINDOWS = process.platform === "win32";
 const BIN_EXT = IS_WINDOWS ? ".exe" : "";
@@ -127,41 +121,6 @@ function copyResources(): void {
   }
 }
 
-// Build MCP servers for Codex sessions (one-time, no watch needed)
-async function buildMcpServers(): Promise<void> {
-  console.log("🌉 Building MCP servers for Codex sessions...");
-
-  // Ensure dist directories exist
-  const sessionDistDir = join(SESSION_SERVER_DIR, "dist");
-  const bridgeDistDir = join(BRIDGE_SERVER_DIR, "dist");
-  if (!existsSync(sessionDistDir)) mkdirSync(sessionDistDir, { recursive: true });
-  if (!existsSync(bridgeDistDir)) mkdirSync(bridgeDistDir, { recursive: true });
-
-  // Build both servers in parallel
-  const [sessionResult, bridgeResult] = await Promise.all([
-    runEsbuild(
-      "packages/session-mcp-server/src/index.ts",
-      "packages/session-mcp-server/dist/index.js"
-    ),
-    runEsbuild(
-      "packages/bridge-mcp-server/src/index.ts",
-      "packages/bridge-mcp-server/dist/index.js"
-    ),
-  ]);
-
-  if (!sessionResult.success) {
-    console.error("❌ Session MCP server build failed:", sessionResult.error);
-    process.exit(1);
-  }
-  console.log("✅ Session MCP server built");
-
-  if (!bridgeResult.success) {
-    console.error("❌ Bridge MCP server build failed:", bridgeResult.error);
-    process.exit(1);
-  }
-  console.log("✅ Bridge MCP server built");
-}
-
 // Get OAuth defines for esbuild API
 function getOAuthDefines(): Record<string, string> {
   const oauthVars = [
@@ -213,7 +172,6 @@ async function runEsbuild(
       format: "cjs",
       outfile: join(ROOT_DIR, outfile),
       external: ["electron"],
-      packages: "external", // Mark all node_modules as external
       define: defines,
       logLevel: "warning",
     });
@@ -285,9 +243,6 @@ async function main(): Promise<void> {
   }
 
   copyResources();
-
-  // Build MCP servers for Codex sessions
-  await buildMcpServers();
 
   const vitePort = process.env.CRAFT_VITE_PORT || "5173";
   const oauthDefines = getOAuthDefines();
@@ -388,7 +343,6 @@ async function main(): Promise<void> {
     format: "cjs",
     outfile: join(ROOT_DIR, "apps/electron/dist/main.cjs"),
     external: ["electron"],
-    packages: "external",
     define: oauthDefines,
     logLevel: "info",
   });
@@ -404,7 +358,6 @@ async function main(): Promise<void> {
     format: "cjs",
     outfile: join(ROOT_DIR, "apps/electron/dist/preload.cjs"),
     external: ["electron"],
-    packages: "external",
     logLevel: "info",
   });
   await preloadContext.watch();

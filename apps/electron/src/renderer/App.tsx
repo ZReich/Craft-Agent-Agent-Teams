@@ -767,7 +767,19 @@ export default function App() {
     window.electronAPI.sessionCommand(sessionId, { type: 'rename', name })
   }, [updateSessionById])
 
+  // Client-side deduplication ref to prevent double-sends
+  const sendDedupRef = useRef<{ sessionId: string; content: string; timestamp: number } | null>(null)
+
   const handleSendMessage = useCallback(async (sessionId: string, message: string, attachments?: FileAttachment[], skillSlugs?: string[], externalBadges?: ContentBadge[]) => {
+    // Client-side deduplication: drop duplicate sends within 500ms
+    const now = Date.now()
+    const lastSend = sendDedupRef.current
+    if (lastSend && lastSend.sessionId === sessionId && lastSend.content === message && (now - lastSend.timestamp) < 500) {
+      console.warn('[App] Dropping duplicate sendMessage (client-side dedup)')
+      return
+    }
+    sendDedupRef.current = { sessionId, content: message, timestamp: now }
+
     try {
       // Step 1: Store attachments and get persistent metadata
       let storedAttachments: StoredAttachment[] | undefined

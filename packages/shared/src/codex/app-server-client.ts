@@ -519,7 +519,11 @@ export class AppServerClient extends EventEmitter {
 
     // Set up timeout and tracking first
     const timeoutId = setTimeout(() => {
+      const pending = this.pendingRequests.get(id);
       this.pendingRequests.delete(id);
+      if (pending) {
+        pending.reject(new Error(`Request '${method}' (id=${id}) timed out after ${this.options.requestTimeout}ms`));
+      }
     }, this.options.requestTimeout);
 
     const resultPromise = new Promise<T>((resolve, reject) => {

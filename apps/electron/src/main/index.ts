@@ -224,9 +224,10 @@ app.whenReady().then(async () => {
   // (docs, permissions, themes, tool-icons resolve via getBundledAssetsDir)
   setBundledAssetsRoot(__dirname)
 
-  // Register vendor root so the Codex binary resolver can find bundled binaries
-  // (Codex binary resolves via resolveCodexBinary() which checks vendor/codex/)
-  setVendorRoot(__dirname)
+  // Register vendor root so the Codex binary resolver can find bundled binaries.
+  // __dirname points to dist/ (where main.cjs lives), but vendor/ is at the app root (one level up).
+  // Without this fix, resolveCodexBinary() looks at dist/vendor/codex/ which doesn't exist.
+  setVendorRoot(join(__dirname, '..'))
 
   // Register PowerShell validator root so it can find the bundled parser script
   // (Windows only: validates PowerShell commands in Explore mode using AST analysis)
