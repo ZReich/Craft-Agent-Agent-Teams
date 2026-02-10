@@ -62,6 +62,8 @@ import type { SessionMetadata as SharedSessionMetadata } from '@craft-agent/shar
 // Import LLM connection types
 import type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType } from '@craft-agent/shared/config';
 export type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType };
+import type { UsageProvider } from '@craft-agent/shared/usage';
+export type { UsageProvider };
 
 /**
  * Setup data for creating/updating an LLM connection via IPC.
@@ -446,6 +448,8 @@ export interface Session {
   sharedId?: string
   // Model to use for this session (overrides global config if set)
   model?: string
+  // Canonical provider used by this session
+  llmProvider?: UsageProvider
   // LLM connection slug for this session (locked after first message)
   llmConnection?: string
   // Thinking level for this session ('off', 'think', 'max')
@@ -498,6 +502,8 @@ export interface Session {
   isTeamLead?: boolean
   /** Display name for teammate sessions (e.g., "taco-researcher") */
   teammateName?: string
+  /** Role label for teammate sessions (e.g., head, worker, reviewer) */
+  teammateRole?: string
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[]
   /** Team accent color (hex, e.g., "#7c3aed") */
@@ -528,6 +534,8 @@ export interface CreateSessionOptions {
   workingDirectory?: string | 'user_default' | 'none'
   /** Model override for the session (e.g., 'haiku', 'sonnet') */
   model?: string
+  /** Canonical provider metadata override (usually inferred from connection/model) */
+  llmProvider?: UsageProvider
   /** LLM connection slug for the session (locked after first message) */
   llmConnection?: string
   /** System prompt preset for the session ('default' | 'mini' or custom string) */
@@ -551,8 +559,14 @@ export interface CreateSessionOptions {
   parentSessionId?: string
   /** Display name for teammate sessions */
   teammateName?: string
+  /** Role label for teammate sessions (e.g., head, worker, reviewer) */
+  teammateRole?: string
   /** Team accent color */
   teamColor?: string
+  /** Whether SDD/spec mode is enabled for this session */
+  sddEnabled?: boolean
+  /** Active spec identifier for SDD sessions */
+  activeSpecId?: string
 }
 
 // Events sent from main to renderer
@@ -971,9 +985,13 @@ export const IPC_CHANNELS = {
   AGENT_TEAMS_CREATE: 'agentTeams:create',
   AGENT_TEAMS_CLEANUP: 'agentTeams:cleanup',
   AGENT_TEAMS_GET_STATUS: 'agentTeams:getStatus',
+  AGENT_TEAMS_GET_MESSAGES: 'agentTeams:getMessages',
+  AGENT_TEAMS_GET_ACTIVITY: 'agentTeams:getActivity',
+  AGENT_TEAMS_GET_SPEC: 'agentTeams:getSpec',
   AGENT_TEAMS_SPAWN_TEAMMATE: 'agentTeams:spawnTeammate',
   AGENT_TEAMS_SHUTDOWN_TEAMMATE: 'agentTeams:shutdownTeammate',
   AGENT_TEAMS_SEND_MESSAGE: 'agentTeams:sendMessage',
+  AGENT_TEAMS_SEND_EXECUTE: 'agentTeams:sendExecute',
   AGENT_TEAMS_BROADCAST: 'agentTeams:broadcast',
   AGENT_TEAMS_GET_TASKS: 'agentTeams:getTasks',
   AGENT_TEAMS_UPDATE_TASK: 'agentTeams:updateTask',
@@ -989,6 +1007,8 @@ export const IPC_CHANNELS = {
   SDD_SET_ENABLED: 'sdd:setEnabled',
   SDD_SET_SPEC: 'sdd:setSpec',
   SDD_GET_COMPLIANCE: 'sdd:getCompliance',
+  SDD_SYNC_COMPLIANCE: 'sdd:syncCompliance',
+  SDD_UPDATE_REQUIREMENT_STATUS: 'sdd:updateRequirementStatus',
   SDD_VALIDATE_DRI: 'sdd:validateDRI',
   SDD_CAN_CLOSE: 'sdd:canClose',
 
@@ -1334,12 +1354,16 @@ export interface ElectronAPI {
   spawnTeammate(options: { teamId: string; name: string; role: string; model: string; provider: string }): Promise<AgentTeammate>
   shutdownTeammate(teamId: string, teammateId: string): Promise<void>
   sendTeammateMessage(teamId: string, from: string, to: string, content: string): Promise<TeammateMessage>
+  sendTeammateExecute(teamId: string, from: string, to: string, content: string): Promise<TeammateMessage>
   broadcastTeamMessage(teamId: string, from: string, content: string): Promise<TeammateMessage>
   getTeamTasks(teamId: string): Promise<TeamTask[]>
   updateTeamTask(teamId: string, taskId: string, status: string, assignee?: string): Promise<void>
   getTeamCost(teamId: string): Promise<TeamCostSummary>
   swapTeammateModel(teamId: string, teammateId: string, newModel: string, newProvider: string): Promise<AgentTeammate>
   onAgentTeamEvent(callback: (event: TeamActivityEvent) => void): () => void
+  getTeamMessages(teamId: string): Promise<TeammateMessage[]>
+  getTeamActivity(teamId: string): Promise<TeamActivityEvent[]>
+  getTeamSpec(teamId: string): Promise<import('@craft-agent/core/types').Spec | undefined>
   getAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter'): Promise<{ hasKey: boolean; maskedKey?: string }>
   setAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter', key: string): Promise<void>
 
@@ -1348,6 +1372,8 @@ export interface ElectronAPI {
   setSDDEnabled(sessionId: string, enabled: boolean): Promise<{ success: boolean }>
   setSDDSpec(sessionId: string, specId?: string): Promise<{ success: boolean }>
   getSDDCompliance(sessionId: string): Promise<SpecComplianceReport[]>
+  syncSDDCompliance(sessionId: string): Promise<SpecComplianceReport[]>
+  updateSDDRequirementStatus(sessionId: string, requirementId: string, status: 'pending' | 'in-progress' | 'implemented' | 'verified'): Promise<Spec | null>
   validateSDDDRI(teamId: string): Promise<{ valid: boolean; missing: string[] }>
   canCloseSDDPlan(teamId: string): Promise<{ canClose: boolean; blockers: string[] }>
 
@@ -1404,6 +1430,8 @@ export interface WorkspaceSettings {
   /** Default thinking level for new sessions ('off', 'think', 'max'). Defaults to 'think'. */
   thinkingLevel?: ThinkingLevel
   workingDirectory?: string
+  /** Recent working directories for the workspace (most recent first). */
+  recentWorkingDirectories?: string[]
   /** Whether local (stdio) MCP servers are enabled */
   localMcpEnabled?: boolean
   /** Default LLM connection slug for new sessions in this workspace */

@@ -20,5 +20,9 @@
     "@types/uuid": "^11.0.0",
     "tsc": "npm:typescript@^5.9.3",
     "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "test": "vitest run -c vitest.config.ts",
+    "test:watch": "vitest -c vitest.config.ts"
   }
 }

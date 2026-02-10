@@ -105,6 +105,9 @@ export function loadWorkspaceConfig(rootPath: string): WorkspaceConfig | null {
     if (config.defaults?.workingDirectory) {
       config.defaults.workingDirectory = expandPath(config.defaults.workingDirectory);
     }
+    if (config.defaults?.recentWorkingDirectories?.length) {
+      config.defaults.recentWorkingDirectories = config.defaults.recentWorkingDirectories.map((dir) => expandPath(dir));
+    }
 
     return config;
   } catch {
@@ -131,6 +134,12 @@ export function saveWorkspaceConfig(rootPath: string, config: WorkspaceConfig): 
     storageConfig.defaults = {
       ...storageConfig.defaults,
       workingDirectory: toPortablePath(storageConfig.defaults.workingDirectory),
+    };
+  }
+  if (storageConfig.defaults?.recentWorkingDirectories?.length) {
+    storageConfig.defaults = {
+      ...storageConfig.defaults,
+      recentWorkingDirectories: storageConfig.defaults.recentWorkingDirectories.map((dir) => toPortablePath(dir)),
     };
   }
 
@@ -286,6 +295,7 @@ export function createWorkspaceAtPath(
     cyclablePermissionModes: globalDefaults.workspaceDefaults.cyclablePermissionModes,
     enabledSourceSlugs: [],
     workingDirectory: undefined,
+    recentWorkingDirectories: [],
     ...defaults, // User-provided defaults override global defaults
   };
 

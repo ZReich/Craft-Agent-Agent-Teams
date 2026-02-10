@@ -64,7 +64,8 @@ const machineId = createHash('sha256').update(hostname() + homedir()).digest('he
 Sentry.setUser({ id: machineId })
 
 import { join } from 'path'
-import { existsSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
+import { rmSync } from 'fs'
 import { SessionManager } from './sessions'
 import { registerIpcHandlers } from './ipc'
 import { createApplicationMenu } from './menu'
@@ -87,6 +88,52 @@ import { checkForUpdatesOnLaunch, setWindowManager as setAutoUpdateWindowManager
 
 // Initialize electron-log for renderer process support
 log.initialize()
+
+// Increase V8 heap size to reduce OOM risk under heavy sessions
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096')
+
+// Ensure Chromium disk cache uses a writable location (prevents access denied on Windows)
+try {
+  const userDataPath = app.getPath('userData')
+  const cachePath = join(userDataPath, 'cache')
+  const gpuCachePath = join(userDataPath, 'gpu-cache')
+  const tempCachePath = join(app.getPath('temp'), 'craft-agents-cache', String(process.pid))
+
+  // Clean up stale cache dirs on startup (helps resolve access denied on Windows)
+  let shouldFallbackToTemp = false
+  try {
+    if (existsSync(cachePath)) {
+      rmSync(cachePath, { recursive: true, force: true })
+    }
+    if (existsSync(gpuCachePath)) {
+      rmSync(gpuCachePath, { recursive: true, force: true })
+    }
+  } catch (cleanupError) {
+    mainLog.warn('Failed to clean cache dirs:', cleanupError)
+    shouldFallbackToTemp = true
+  }
+
+  const activeCachePath = shouldFallbackToTemp ? tempCachePath : cachePath
+  const activeGpuCachePath = shouldFallbackToTemp ? join(tempCachePath, 'gpu-cache') : gpuCachePath
+
+  if (!existsSync(activeCachePath)) {
+    mkdirSync(activeCachePath, { recursive: true })
+  }
+  if (!existsSync(activeGpuCachePath)) {
+    mkdirSync(activeGpuCachePath, { recursive: true })
+  }
+
+  if (shouldFallbackToTemp) {
+    mainLog.warn('Falling back to temp cache dir:', activeCachePath)
+  }
+
+  app.setPath('cache', activeCachePath)
+  app.commandLine.appendSwitch('disk-cache-dir', activeCachePath)
+  app.commandLine.appendSwitch('gpu-disk-cache-dir', activeGpuCachePath)
+} catch (error) {
+  // Fallback silently - Chromium will use defaults if we fail
+  mainLog.warn('Failed to configure cache paths:', error)
+}
 
 // Enable debug/perf in dev mode (running from source)
 if (isDebugMode) {

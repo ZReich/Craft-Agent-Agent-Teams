@@ -35,11 +35,20 @@ import type {
   SessionHeader,
   TodoState,
 } from './types.ts';
+import type { UsageProvider } from '../usage/pricing.ts';
 import type { Plan } from '../agent/plan-types.ts';
 import { validateSessionStatus } from '../statuses/validation.ts';
 import { getStatusCategory } from '../statuses/storage.ts';
 import { readSessionHeader, readSessionJsonl } from './jsonl.ts';
 import { sessionPersistenceQueue } from './persistence-queue.ts';
+
+// ============================================================
+// Cache (reduce repeated disk reads for hot sessions)
+// ============================================================
+
+const SESSION_CACHE_TTL_MS = 3000;
+const ENABLE_SESSION_LOAD_PERF = process.env.CRAFT_SESSION_LOAD_PERF === '1';
+const sessionCache = new Map<string, { session: StoredSession; timestamp: number }>();
 
 // Re-export types for convenience
 export type { SessionConfig } from './types.ts';
@@ -168,6 +177,7 @@ export async function createSession(
     permissionMode?: SessionConfig['permissionMode'];
     enabledSourceSlugs?: string[];
     model?: string;
+    llmProvider?: UsageProvider;
     hidden?: boolean;
     todoState?: SessionConfig['todoState'];
     labels?: string[];
@@ -177,6 +187,7 @@ export async function createSession(
     isTeamLead?: boolean;
     parentSessionId?: string;
     teammateName?: string;
+    teammateRole?: string;
     teamColor?: string;
   }
 ): Promise<SessionConfig> {
@@ -204,6 +215,7 @@ export async function createSession(
     permissionMode: options?.permissionMode,
     enabledSourceSlugs: options?.enabledSourceSlugs,
     model: options?.model,
+    llmProvider: options?.llmProvider,
     hidden: options?.hidden,
     todoState: options?.todoState,
     labels: options?.labels,
@@ -213,6 +225,7 @@ export async function createSession(
     isTeamLead: options?.isTeamLead,
     parentSessionId: options?.parentSessionId,
     teammateName: options?.teammateName,
+    teammateRole: options?.teammateRole,
     teamColor: options?.teamColor,
   };
 
@@ -301,6 +314,8 @@ export async function getOrCreateSessionById(
 export async function saveSession(session: StoredSession): Promise<void> {
   sessionPersistenceQueue.enqueue(session);
   await sessionPersistenceQueue.flush(session.id);
+  // Update cache with latest data
+  sessionCache.set(session.id, { session, timestamp: Date.now() });
 }
 
 /**
@@ -315,18 +330,24 @@ export { sessionPersistenceQueue } from './persistence-queue.js'
  * Loads session from folder structure in JSONL format.
  */
 export function loadSession(workspaceRootPath: string, sessionId: string): StoredSession | null {
-  const end = perf.start('session.loadSession', { sessionId });
+  const cached = sessionCache.get(sessionId);
+  if (cached && Date.now() - cached.timestamp < SESSION_CACHE_TTL_MS) {
+    return cached.session;
+  }
+
+  const end = ENABLE_SESSION_LOAD_PERF ? perf.start('session.loadSession', { sessionId }) : null;
 
   const jsonlPath = getSessionFilePath(workspaceRootPath, sessionId);
   if (existsSync(jsonlPath)) {
     const session = readSessionJsonl(jsonlPath);
     if (session) {
-      end();
+      sessionCache.set(sessionId, { session, timestamp: Date.now() });
+      end?.();
       return session;
     }
   }
 
-  end();
+  end?.();
   return null;
 }
 
@@ -414,6 +435,7 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
       workingDirectory: workingDir,
       sdkCwd,
       model: header.model,
+      llmProvider: header.llmProvider,
       llmConnection: header.llmConnection,
       connectionLocked: header.connectionLocked,
       thinkingLevel: header.thinkingLevel,
@@ -567,6 +589,7 @@ export async function updateSessionMetadata(
     | 'sharedUrl'
     | 'sharedId'
     | 'model'
+    | 'llmProvider'
     | 'llmConnection'
     | 'sddEnabled'
     | 'activeSpecId'
@@ -591,6 +614,7 @@ export async function updateSessionMetadata(
   if ('sharedUrl' in updates) session.sharedUrl = updates.sharedUrl;
   if ('sharedId' in updates) session.sharedId = updates.sharedId;
   if (updates.model !== undefined) session.model = updates.model;
+  if (updates.llmProvider !== undefined) session.llmProvider = updates.llmProvider;
   if (updates.llmConnection !== undefined) session.llmConnection = updates.llmConnection;
   if (updates.sddEnabled !== undefined) session.sddEnabled = updates.sddEnabled;
   if ('activeSpecId' in updates) session.activeSpecId = updates.activeSpecId;

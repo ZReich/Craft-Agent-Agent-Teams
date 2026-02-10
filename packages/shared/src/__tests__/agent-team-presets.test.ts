@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { MODEL_PRESETS } from '../src/providers/presets';
+import { MODEL_PRESETS } from '../providers/presets';
 
 describe('agent team presets', () => {
   it('includes Codex presets', () => {

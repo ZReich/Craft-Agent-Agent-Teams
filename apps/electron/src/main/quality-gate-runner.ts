@@ -92,23 +92,40 @@ Return a JSON object with this exact structure:
 Score guide: 95-100 = robust, 85-94 = mostly safe, 70-84 = has gaps, below 70 = risky.
 Focus on real risks, not hypothetical scenarios. Trust internal code — only validate at boundaries.`,
 
-  completeness: `You are a QA engineer checking if the implementation is complete. Analyze the following diff against the task description for:
+  completeness: `You are a QA engineer checking if the implementation is complete AND fully integrated. Analyze the following diff against the task description.
+
+## CRITICAL — Integration Verification
+
+This is the MOST IMPORTANT part of your review. Building code that is never used is a critical defect. You MUST verify:
+
+1. **New components are imported and rendered** — Every new React component must be imported and mounted in a parent. Dead components are a FAIL.
+2. **New functions are called** — Every new function/method must have at least one call site in the codebase. Orphan functions are a FAIL.
+3. **New IPC handlers have listeners** — Every new IPC handler registered in main process must be exposed in preload and called from renderer. Disconnected IPC is a FAIL.
+4. **New types are used at runtime** — Type definitions that are never referenced by runtime code suggest incomplete integration.
+5. **New event emitters have subscribers** — Events that are emitted but never listened to indicate missing integration.
+6. **New CSS/styles are applied** — Stylesheets or class definitions that are never used in markup are dead code.
+
+If ANY of the above checks fail, set "integrationVerified" to false. This is an automatic FAIL regardless of other scores.
+
+## Standard Completeness Checks
+
 - All requirements addressed (nothing missing from the task description)
 - No TODO/FIXME/HACK comments left in code
 - No half-implemented features (stubs, placeholder values, commented-out code)
 - No missing exports, imports, or type definitions needed by consumers
-- Integration points properly connected (not just isolated code)
 
 Task description: {taskDescription}
 
 Return a JSON object with this exact structure:
 {
   "score": <number 0-100>,
+  "integrationVerified": <boolean — false if ANY new code is not connected to existing code>,
   "issues": [<string descriptions of missing or incomplete items>],
   "suggestions": [<string suggestions for completing the work>]
 }
 
-Score guide: 95-100 = fully complete, 85-94 = nearly done, 70-84 = gaps remain, below 70 = substantially incomplete.`,
+Score guide: 95-100 = fully complete and integrated, 85-94 = nearly done, 70-84 = gaps remain, below 70 = substantially incomplete.
+CRITICAL: If integrationVerified is false, score MUST be below 70 regardless of other factors. Dead code is never acceptable.`,
 };
 
 // ============================================================
@@ -259,7 +276,7 @@ export class QualityGateRunner {
   /**
    * Run TypeScript compilation check.
    */
-  async runSyntaxCheck(workingDir: string): Promise<QualityGateStageResult> {
+  async runSyntaxCheck(workingDir: string, allowInstall = true): Promise<QualityGateStageResult> {
     try {
       await execAsync('npx tsc --noEmit --pretty false 2>&1', {
         cwd: workingDir,
@@ -269,13 +286,11 @@ export class QualityGateRunner {
     } catch (err: unknown) {
       const error = err as { stdout?: string; stderr?: string };
       const output = this.normalizeOutput(error.stdout || error.stderr || 'Unknown compilation error');
-      if (this.isInfraTypeFailure(output)) {
-        return {
-          score: 100,
-          passed: true,
-          issues: [],
-          suggestions: ['TypeScript check failed due to missing dependencies — install dependencies and re-run typecheck'],
-        };
+      if (this.isInfraTypeFailure(output) && allowInstall) {
+        const installed = await this.ensureDependenciesInstalled(workingDir);
+        if (installed) {
+          return this.runSyntaxCheck(workingDir, false);
+        }
       }
       if (this.isMissingTypeScript(output)) {
         try {
@@ -287,13 +302,11 @@ export class QualityGateRunner {
         } catch (bunErr: unknown) {
           const bunError = bunErr as { stdout?: string; stderr?: string };
           const bunOutput = (bunError.stdout || bunError.stderr || 'Unknown compilation error').trim();
-          if (this.isInfraTypeFailure(bunOutput)) {
-            return {
-              score: 100,
-              passed: true,
-              issues: [],
-              suggestions: ['TypeScript check failed due to missing dependencies — install dependencies and re-run typecheck'],
-            };
+          if (this.isInfraTypeFailure(bunOutput) && allowInstall) {
+            const installed = await this.ensureDependenciesInstalled(workingDir);
+            if (installed) {
+              return this.runSyntaxCheck(workingDir, false);
+            }
           }
           const bunErrors = bunOutput.split('\n').filter(l => l.includes('error TS'));
           if (!bunOutput || bunErrors.length === 0 && /unknown compilation error/i.test(bunOutput)) {
@@ -321,13 +334,11 @@ export class QualityGateRunner {
           suggestions: ['TypeScript check failed with an unknown error — install dependencies and re-run typecheck'],
         };
       }
-      if (this.isInfraTypeFailure(output)) {
-        return {
-          score: 100,
-          passed: true,
-          issues: [],
-          suggestions: ['TypeScript check failed due to missing dependencies — install dependencies and re-run typecheck'],
-        };
+      if (this.isInfraTypeFailure(output) && allowInstall) {
+        const installed = await this.ensureDependenciesInstalled(workingDir);
+        if (installed) {
+          return this.runSyntaxCheck(workingDir, false);
+        }
       }
       return {
         score: 0,
@@ -341,11 +352,14 @@ export class QualityGateRunner {
   /**
    * Run test suite and parse results.
    */
-  async runTestExecution(workingDir: string): Promise<TestStageResult> {
+  async runTestExecution(workingDir: string, allowInstall = true): Promise<TestStageResult> {
     try {
-      const { stdout } = await execAsync('npx vitest run --reporter=json 2>&1', {
+      // Implements REQ-005: Don't redirect stderr to stdout to keep JSON output clean
+      // ConfigWatcher logs go to stderr, vitest JSON goes to stdout - keep them separate!
+      const { stdout } = await execAsync('npx vitest run --reporter=json -c vitest.config.ts', {
         cwd: workingDir,
         timeout: 120000,
+        env: { ...process.env, CRAFT_DEBUG: '0' },
       });
 
       try {
@@ -356,18 +370,25 @@ export class QualityGateRunner {
           const failed = results.numFailedTests || 0;
           const skipped = results.numPendingTests || 0;
           const total = passed + failed + skipped;
-          const infraDetails = JSON.stringify(results.testResults || []);
-          if (failed > 0 && this.isInfraTestFailure(infraDetails)) {
+          // Implements REQ-005: Fail when no test files are found
+          if (total === 0) {
             return {
-              score: 100,
-              passed: true,
-              issues: [],
-              suggestions: ['Test runner failed due to missing dependencies — install dependencies and re-run tests'],
-              totalTests: total,
-              passedTests: passed,
-              failedTests: failed,
-              skippedTests: skipped,
+              score: 0,
+              passed: false,
+              issues: ['No test files found — tests are required for all feature work'],
+              suggestions: ['Add unit tests for this change and re-run the quality gate'],
+              totalTests: 0,
+              passedTests: 0,
+              failedTests: 0,
+              skippedTests: 0,
             };
+          }
+          const infraDetails = JSON.stringify(results.testResults || []);
+          if (failed > 0 && this.isInfraTestFailure(infraDetails) && allowInstall) {
+            const installed = await this.ensureDependenciesInstalled(workingDir);
+            if (installed) {
+              return this.runTestExecution(workingDir, false);
+            }
           }
 
           return {
@@ -392,6 +413,18 @@ export class QualityGateRunner {
 
       // Fallback: try to detect pass/fail from text output
       const hasFailure = /FAIL|failed/i.test(stdout);
+      if (/no test files found/i.test(stdout)) {
+        return {
+          score: 0,
+          passed: false,
+          issues: ['No test files found — tests are required for all feature work'],
+          suggestions: ['Add unit tests for this change and re-run the quality gate'],
+          totalTests: 0,
+          passedTests: 0,
+          failedTests: 0,
+          skippedTests: 0,
+        };
+      }
       return {
         score: hasFailure ? 0 : 100,
         passed: !hasFailure,
@@ -405,21 +438,18 @@ export class QualityGateRunner {
     } catch (err: unknown) {
       const error = err as { stdout?: string; stderr?: string; code?: number };
       const output = this.normalizeOutput(error.stdout || error.stderr || '');
-      if (this.isMissingVitest(output)) {
-        return this.runBunVitest(workingDir);
+      if (this.isMissingVitest(output) && allowInstall) {
+        const installed = await this.ensureDependenciesInstalled(workingDir);
+        if (installed) {
+          return this.runTestExecution(workingDir, false);
+        }
       }
       // Exit code 1 usually means test failures
-      if (this.isInfraTestFailure(output)) {
-        return {
-          score: 100,
-          passed: true,
-          issues: [],
-          suggestions: ['Test runner failed due to missing dependencies — install dependencies and re-run tests'],
-          totalTests: 0,
-          passedTests: 0,
-          failedTests: 0,
-          skippedTests: 0,
-        };
+      if (this.isInfraTestFailure(output) && allowInstall) {
+        const installed = await this.ensureDependenciesInstalled(workingDir);
+        if (installed) {
+          return this.runTestExecution(workingDir, false);
+        }
       }
       if (error.code === 1) {
         return {
@@ -434,22 +464,22 @@ export class QualityGateRunner {
         };
       }
       // Other errors (e.g., no test runner found)
-      qgLog.warn('[QualityGates] Test execution error (non-fatal):', error);
+      qgLog.warn('[QualityGates] Test execution error:', error);
       return {
-        score: 100,
-        passed: true,
-        issues: [],
-        suggestions: ['No test runner detected — consider adding tests'],
+        score: 0,
+        passed: false,
+        issues: ['Test runner failed to execute — ensure dependencies are installed'],
+        suggestions: ['Install dependencies and rerun tests'],
         totalTests: 0,
         passedTests: 0,
-        failedTests: 0,
+        failedTests: 1,
         skippedTests: 0,
       };
     }
   }
 
   private isInfraTypeFailure(output: string): boolean {
-    return /(cannot find type definition|cannot find module|err_module_not_found|missing dependency|missing peer dependency|node_modules|please run (npm|pnpm|yarn|bun) install)/i.test(output);
+    return /(cannot find type definition|cannot find module|err_module_not_found|missing dependency|missing peer dependency|node_modules|please run (npm|pnpm|yarn|bun) install|no inputs were found in config file|ts18003|ts5058|cannot find a tsconfig\.json)/i.test(output);
   }
 
   private normalizeOutput(output: string): string {
@@ -463,6 +493,7 @@ export class QualityGateRunner {
   private isMissingTypeScript(output: string): boolean {
     const normalized = this.normalizeOutput(output);
     return /not the tsc command/i.test(normalized)
+      || /not the tsc command you are looking for/i.test(normalized)
       || (/typescript/i.test(normalized) && /not installed|missing|cannot find/i.test(normalized));
   }
 
@@ -471,9 +502,10 @@ export class QualityGateRunner {
     return /vitest/i.test(normalized) && (/not found|missing|cannot find|not installed/i.test(normalized) || /not the vitest command/i.test(normalized));
   }
 
-  private async runBunVitest(workingDir: string): Promise<TestStageResult> {
+  private async runBunVitest(workingDir: string, allowInstall = true): Promise<TestStageResult> {
     try {
-      const { stdout } = await execAsync('bunx vitest run --reporter=json 2>&1', {
+      // Implements REQ-005: Don't redirect stderr to stdout to keep JSON output clean
+      const { stdout } = await execAsync('bunx vitest run --reporter=json -c vitest.config.ts', {
         cwd: workingDir,
         timeout: 120000,
       });
@@ -485,18 +517,25 @@ export class QualityGateRunner {
         const failed = results.numFailedTests || 0;
         const skipped = results.numPendingTests || 0;
         const total = passed + failed + skipped;
-        const infraDetails = JSON.stringify(results.testResults || []);
-        if (failed > 0 && this.isInfraTestFailure(infraDetails)) {
+        // Implements REQ-005: Fail when no test files are found
+        if (total === 0) {
           return {
-            score: 100,
-            passed: true,
-            issues: [],
-            suggestions: ['Test runner failed due to missing dependencies — install dependencies and re-run tests'],
-            totalTests: total,
-            passedTests: passed,
-            failedTests: failed,
-            skippedTests: skipped,
+            score: 0,
+            passed: false,
+            issues: ['No test files found — tests are required for all feature work'],
+            suggestions: ['Add unit tests for this change and re-run the quality gate'],
+            totalTests: 0,
+            passedTests: 0,
+            failedTests: 0,
+            skippedTests: 0,
           };
+        }
+        const infraDetails = JSON.stringify(results.testResults || []);
+        if (failed > 0 && this.isInfraTestFailure(infraDetails) && allowInstall) {
+          const installed = await this.ensureDependenciesInstalled(workingDir);
+          if (installed) {
+            return this.runBunVitest(workingDir, false);
+          }
         }
 
         return {
@@ -517,6 +556,18 @@ export class QualityGateRunner {
       }
 
       const hasFailure = /FAIL|failed/i.test(stdout);
+      if (/no test files found/i.test(stdout)) {
+        return {
+          score: 0,
+          passed: false,
+          issues: ['No test files found — tests are required for all feature work'],
+          suggestions: ['Add unit tests for this change and re-run the quality gate'],
+          totalTests: 0,
+          passedTests: 0,
+          failedTests: 0,
+          skippedTests: 0,
+        };
+      }
       return {
         score: hasFailure ? 0 : 100,
         passed: !hasFailure,
@@ -530,17 +581,11 @@ export class QualityGateRunner {
     } catch (err: unknown) {
       const error = err as { stdout?: string; stderr?: string; code?: number };
       const output = this.normalizeOutput(error.stdout || error.stderr || '');
-      if (this.isInfraTestFailure(output)) {
-        return {
-          score: 100,
-          passed: true,
-          issues: [],
-          suggestions: ['Test runner failed due to missing dependencies — install dependencies and re-run tests'],
-          totalTests: 0,
-          passedTests: 0,
-          failedTests: 0,
-          skippedTests: 0,
-        };
+      if (this.isInfraTestFailure(output) && allowInstall) {
+        const installed = await this.ensureDependenciesInstalled(workingDir);
+        if (installed) {
+          return this.runBunVitest(workingDir, false);
+        }
       }
       if (error.code === 1) {
         return {
@@ -555,19 +600,35 @@ export class QualityGateRunner {
         };
       }
 
-      qgLog.warn('[QualityGates] Bun vitest error (non-fatal):', error);
+      qgLog.warn('[QualityGates] Bun vitest error:', error);
       return {
-        score: 100,
-        passed: true,
-        issues: [],
-        suggestions: ['No test runner detected — consider adding tests'],
+        score: 0,
+        passed: false,
+        issues: ['Test runner failed to execute — ensure dependencies are installed'],
+        suggestions: ['Install dependencies and rerun tests'],
         totalTests: 0,
         passedTests: 0,
-        failedTests: 0,
+        failedTests: 1,
         skippedTests: 0,
       };
     }
   }
+
+  private async ensureDependenciesInstalled(workingDir: string): Promise<boolean> {
+    try {
+      qgLog.info('[QualityGates] Installing dependencies (bun install)');
+      await execAsync('bun install', {
+        cwd: workingDir,
+        timeout: 300000,
+      });
+      return true;
+    } catch (err) {
+      qgLog.error('[QualityGates] Dependency install failed:', err);
+      return false;
+    }
+  }
+
+  // Implements REQ-001: Root config scopes to core/shared/electron tests
 
   /**
    * Run a single AI review stage using the configured review model.
@@ -596,7 +657,7 @@ export class QualityGateRunner {
       if (!jsonMatch) {
         qgLog.warn(`[QualityGates] AI review "${stage}" returned non-JSON response`);
         return {
-          score: 75,
+          score: 100,
           passed: true,
           issues: ['AI review returned an unexpected format — manual review recommended'],
           suggestions: [],
@@ -604,7 +665,24 @@ export class QualityGateRunner {
       }
 
       const parsed = JSON.parse(jsonMatch[0]);
-      const score = Math.max(0, Math.min(100, Number(parsed.score) || 75));
+      let score = Math.max(0, Math.min(100, Number(parsed.score) || 100));
+
+      // Completeness stage: enforce integration verification auto-fail
+      // Implements REQ-006: Fail when new code is not integrated
+      if (stage === 'completeness' && parsed.integrationVerified === false) {
+        score = Math.min(score, 65); // Cap below passing threshold
+        const integrationIssue = 'INTEGRATION FAILURE: New code is not connected to existing code — components, functions, or handlers are dead code';
+        const issues = Array.isArray(parsed.issues) ? parsed.issues : [];
+        if (!issues.some((i: string) => i.includes('INTEGRATION FAILURE'))) {
+          issues.unshift(integrationIssue);
+        }
+        return {
+          score,
+          passed: false,
+          issues,
+          suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
+        };
+      }
 
       return {
         score,

@@ -6,7 +6,7 @@
  *
  * Tests are skipped if servers are unreachable (network tolerance for CI).
  */
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from 'vitest';
 import { discoverOAuthMetadata, getMcpBaseUrl } from '../oauth';
 
 // Helper to check if a URL is reachable

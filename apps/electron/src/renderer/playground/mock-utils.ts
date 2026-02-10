@@ -56,6 +56,11 @@ export const mockElectronAPI = {
 
   getSendMessageKey: async () => 'enter',
   getSpellCheck: async () => true,
+
+  syncSDDCompliance: async (sessionId: string) => {
+    console.log('[Playground] syncSDDCompliance called:', sessionId)
+    return []
+  },
 }
 
 /**

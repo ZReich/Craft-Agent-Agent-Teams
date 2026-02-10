@@ -6,10 +6,11 @@
  */
 
 import * as React from 'react'
-import { useAtomValue, useSetAtom } from 'jotai'
+import { atom, useAtomValue, useSetAtom } from 'jotai'
 import { AlertCircle, Globe, Copy, RefreshCw, Link2Off, Info } from 'lucide-react'
 import { ChatDisplay, type ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
 import { TeamStatusBar } from '@/components/teams/TeamStatusBar'
+import { TeamDashboard } from '@/components/teams/TeamDashboard'
 import { PanelHeader } from '@/components/app-shell/PanelHeader'
 import { SessionMenu } from '@/components/app-shell/SessionMenu'
 import { RenameDialog } from '@/components/ui/rename-dialog'
@@ -20,8 +21,11 @@ import { StyledDropdownMenuContent, StyledDropdownMenuItem, StyledDropdownMenuSe
 import { useAppShellContext, usePendingPermission, usePendingCredential, useSessionOptionsFor, useSession as useSessionData } from '@/context/AppShellContext'
 import { rendererPerf } from '@/lib/perf'
 import { routes } from '@/lib/navigate'
-import { ensureSessionMessagesLoadedAtom, loadedSessionsAtom, sessionMetaMapAtom, updateSessionMetaAtom, updateSessionAtom } from '@/atoms/sessions'
+import { getPathBasename } from '@/lib/platform'
+import { ensureSessionMessagesLoadedAtom, loadedSessionsAtom, sessionAtomFamily, sessionMetaMapAtom, updateSessionMetaAtom, updateSessionAtom } from '@/atoms/sessions'
 import { getSessionTitle } from '@/utils/session'
+import type { AgentTeam, Session, TeamActivityEvent, TeamCostSummary, TeamTask, TeammateMessage } from '../../shared/types'
+import type { Spec, SpecComplianceReport } from '@craft-agent/core/types'
 // Model resolution: connection.defaultModel (no hardcoded defaults)
 import { resolveEffectiveConnectionSlug, isSessionConnectionUnavailable } from '@config/llm-connections'
 
@@ -69,6 +73,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     isSearchModeActive,
     chatDisplayRef,
     onChatMatchInfoChange,
+    isFocusModeActive,
+    onToggleFocusMode,
   } = useAppShellContext()
 
   // Use the unified session options hook for clean access
@@ -271,6 +277,202 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   // Use isAsyncOperationOngoing for shimmer effect (sharing, updating share, revoking, title regeneration)
   const isAsyncOperationOngoing = session?.isAsyncOperationOngoing || sessionMeta?.isAsyncOperationOngoing || false
 
+  // Team dashboard toggle state
+  const [showTeamDashboard, setShowTeamDashboard] = React.useState(false)
+  const [teamTasks, setTeamTasks] = React.useState<TeamTask[]>([])
+  const [teamActivityEvents, setTeamActivityEvents] = React.useState<TeamActivityEvent[]>([])
+  const [teamCost, setTeamCost] = React.useState<TeamCostSummary | undefined>(undefined)
+  const [teamMailboxMessages, setTeamMailboxMessages] = React.useState<TeammateMessage[]>([])
+  const [teamStatus, setTeamStatus] = React.useState<AgentTeam | undefined>(undefined)
+  const [teamSpec, setTeamSpec] = React.useState<Spec | undefined>(undefined)
+  const [specRequirements, setSpecRequirements] = React.useState<Array<{
+    id: string
+    description: string
+    priority: 'critical' | 'high' | 'medium' | 'low'
+    status: 'pending' | 'in-progress' | 'implemented' | 'verified'
+    linkedTaskIds?: string[]
+    linkedTestPatterns?: string[]
+  }>>([])
+  const [specTraceabilityMap, setSpecTraceabilityMap] = React.useState<Array<{
+    requirementId: string
+    files: string[]
+    tests: string[]
+    tasks: string[]
+    tickets: string[]
+  }>>([])
+
+  const specLabel = React.useMemo(() => {
+    if (!teamSpec) return undefined
+    const title = teamSpec.title?.trim()
+    const specPath = teamSpec.specId
+    if (title) return title
+    if (specPath) return getPathBasename(specPath)
+    return undefined
+  }, [teamSpec])
+
+  // Auto-enable dashboard when session is a team lead
+  React.useEffect(() => {
+    if (session?.isTeamLead && session?.teamId) {
+      setShowTeamDashboard(true)
+    } else {
+      setShowTeamDashboard(false)
+    }
+  }, [session?.id, session?.isTeamLead, session?.teamId])
+
+  const teamSessionIds = React.useMemo(() => {
+    if (!session?.teamId) return []
+    const ids = new Set<string>([session.id, ...(session.teammateSessionIds ?? [])])
+    return Array.from(ids)
+  }, [session?.teamId, session?.id, session?.teammateSessionIds])
+
+  const teamSessionsAtom = React.useMemo(
+    () => atom((get) => teamSessionIds
+      .map((id) => get(sessionAtomFamily(id)))
+      .filter(Boolean) as Session[]
+    ),
+    [teamSessionIds]
+  )
+  const teamSessions = useAtomValue(teamSessionsAtom)
+
+  const teamMessages = React.useMemo<TeammateMessage[]>(() => {
+    const sessionMessages = teamSessions.flatMap((teamSession) => (
+      (teamSession.messages ?? [])
+        .filter((msg) => msg.role !== 'tool' && msg.role !== 'system')
+        .map((msg) => ({
+          id: msg.id,
+          from: teamSession.id,
+          to: teamSession.id,
+          content: msg.content,
+          timestamp: new Date(msg.timestamp).toISOString(),
+          type: msg.role === 'plan' ? 'plan-submission' : 'message',
+        }))
+    ))
+
+    const combined = [...teamMailboxMessages, ...sessionMessages]
+    combined.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+    return combined
+  }, [teamSessions, teamMailboxMessages])
+
+  const deriveSpecData = React.useCallback((spec: Spec | undefined, reports: SpecComplianceReport[]) => {
+    const latestReport = reports.at(-1)
+    const traceability = latestReport?.traceabilityMap ?? []
+    const coverage = latestReport?.requirementsCoverage ?? []
+
+    const requirementMap = new Map<string, typeof coverage[number]>()
+    coverage.forEach((entry) => {
+      requirementMap.set(entry.requirementId, entry)
+    })
+
+    const requirements = (spec?.requirements?.length
+      ? spec.requirements.map((req) => {
+        const coverageEntry = requirementMap.get(req.id)
+        const trace = traceability.find(t => t.requirementId === req.id)
+        return {
+          id: req.id,
+          description: req.description,
+          priority: req.priority,
+          status: req.status,
+          linkedTaskIds: trace?.tasks ?? req.linkedTaskIds,
+          linkedTestPatterns: trace?.tests ?? req.linkedTestPatterns,
+        }
+      })
+      : coverage.map((entry) => ({
+        id: entry.requirementId,
+        description: entry.notes || `Requirement ${entry.requirementId}`,
+        priority: 'medium' as const,
+        status: entry.coverage === 'full' ? 'verified' : entry.coverage === 'partial' ? 'in-progress' : 'pending',
+        linkedTaskIds: traceability.find(t => t.requirementId === entry.requirementId)?.tasks ?? [],
+        linkedTestPatterns: entry.referencedInTests ?? [],
+      }))
+    )
+
+    const traceabilityMap = traceability.length > 0
+      ? traceability
+      : (spec?.requirements ?? []).map((req) => ({
+        requirementId: req.id,
+        files: req.linkedFilePatterns ?? [],
+        tests: req.linkedTestPatterns ?? [],
+        tasks: req.linkedTaskIds ?? [],
+        tickets: [],
+      }))
+
+    setSpecRequirements(requirements)
+    setSpecTraceabilityMap(traceabilityMap)
+  }, [])
+
+  const loadTeamData = React.useCallback(async () => {
+    if (!session?.teamId) return
+    try {
+      const [
+        tasks,
+        cost,
+        status,
+        mailboxMessages,
+        activity,
+        spec,
+      ] = await Promise.all([
+        window.electronAPI.getTeamTasks(session.teamId),
+        window.electronAPI.getTeamCost(session.teamId),
+        window.electronAPI.getAgentTeamStatus(session.teamId),
+        window.electronAPI.getTeamMessages(session.teamId),
+        window.electronAPI.getTeamActivity(session.teamId),
+        window.electronAPI.getTeamSpec(session.teamId),
+      ])
+      setTeamTasks(tasks ?? [])
+      setTeamCost(cost)
+      setTeamStatus(status)
+      setTeamMailboxMessages(mailboxMessages ?? [])
+      setTeamActivityEvents(activity ?? [])
+      setTeamSpec(spec)
+      deriveSpecData(spec, session?.sddComplianceReports ?? [])
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to load team data:', error)
+    }
+  }, [session?.teamId, session?.sddComplianceReports, deriveSpecData])
+
+  React.useEffect(() => {
+    if (!showTeamDashboard || !session?.teamId) return
+    setTeamActivityEvents([])
+    void loadTeamData()
+    teamSessionIds.forEach((id) => {
+      ensureMessagesLoaded(id)
+    })
+
+    let isActive = true
+    const refreshInterval = window.setInterval(() => {
+      if (isActive) void loadTeamData()
+    }, 15000)
+
+    const cleanup = window.electronAPI.onAgentTeamEvent?.((event) => {
+      if (!isActive) return
+      if (event.teamId && event.teamId !== session.teamId) return
+      setTeamActivityEvents((prev) => [...prev, event])
+      if (event.type.startsWith('task-')) {
+        void loadTeamData()
+      }
+      if (event.type === 'message-sent') {
+        void window.electronAPI.getTeamMessages(session.teamId).then(setTeamMailboxMessages)
+      }
+    })
+
+    return () => {
+      isActive = false
+      window.clearInterval(refreshInterval)
+      cleanup?.()
+    }
+  }, [showTeamDashboard, session?.teamId, teamSessionIds, ensureMessagesLoaded, loadTeamData])
+
+  React.useEffect(() => {
+    if (!showTeamDashboard) return
+    deriveSpecData(teamSpec, session?.sddComplianceReports ?? [])
+  }, [showTeamDashboard, teamSpec, session?.sddComplianceReports, deriveSpecData])
+
+  React.useEffect(() => {
+    if (!session?.sddEnabled) return
+    if (!window.electronAPI?.syncSDDCompliance) return
+    void window.electronAPI.syncSDDCompliance(sessionId)
+  }, [sessionId, session?.sddEnabled])
+
   // Rename dialog state
   const [renameDialogOpen, setRenameDialogOpen] = React.useState(false)
   const [renameName, setRenameName] = React.useState('')
@@ -330,6 +532,33 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       console.error('[ChatPage] openUrl failed:', error)
     }
   }, [sessionId])
+
+  const handleSendTeamMessage = React.useCallback(async (teammateId: string, content: string) => {
+    if (!session?.teamId) return
+    try {
+      // Implements REQ-001: route dashboard sends to teammate execution + mailbox
+      const message = await window.electronAPI.sendTeammateExecute(session.teamId, 'user', teammateId, content)
+      setTeamMailboxMessages((prev) => [...prev, message])
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to send teammate message:', error)
+      toast.error('Failed to send teammate message', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId])
+
+  const handleRequirementStatusChange = React.useCallback(async (requirementId: string, status: 'pending' | 'in-progress' | 'implemented' | 'verified') => {
+    if (!session?.id || !window.electronAPI?.updateSDDRequirementStatus) return
+    try {
+      await window.electronAPI.updateSDDRequirementStatus(session.id, requirementId, status)
+      await loadTeamData()
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to update requirement status:', error)
+      toast.error('Failed to update requirement status', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.id, loadTeamData])
 
   // Share action handlers
   const handleShare = React.useCallback(async () => {
@@ -583,8 +812,31 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         {session?.teamId && (
           <TeamStatusBar
             session={session}
+            isDashboardOpen={showTeamDashboard}
+            onToggleDashboard={() => setShowTeamDashboard(prev => !prev)}
+            isFocusModeActive={isFocusModeActive}
+            onToggleFocusMode={onToggleFocusMode}
           />
         )}
+        {/* Team Dashboard (replaces chat when active) */}
+        {showTeamDashboard && session?.isTeamLead && session?.teamId ? (
+          <div className="flex-1 flex flex-col min-h-0">
+            <TeamDashboard
+              session={session}
+              specModeEnabled={session.sddEnabled}
+              specLabel={specLabel}
+              teamStatus={teamStatus}
+              tasks={teamTasks}
+              messages={teamMessages}
+              activityEvents={teamActivityEvents}
+              cost={teamCost}
+              onSendMessage={handleSendTeamMessage}
+              specRequirements={specRequirements}
+              specTraceabilityMap={specTraceabilityMap}
+              onSpecRequirementStatusChange={handleRequirementStatusChange}
+            />
+          </div>
+        ) : (
         <div className="flex-1 flex flex-col min-h-0">
           <ChatDisplay
             ref={chatDisplayRef}
@@ -631,6 +883,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             connectionUnavailable={connectionUnavailable}
           />
         </div>
+        )}
       </div>
       <RenameDialog
         open={renameDialogOpen}

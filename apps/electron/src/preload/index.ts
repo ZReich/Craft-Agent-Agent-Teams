@@ -511,12 +511,20 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_CLEANUP, teamId),
   getAgentTeamStatus: (teamId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_STATUS, teamId),
+  getTeamMessages: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_MESSAGES, teamId),
+  getTeamActivity: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_ACTIVITY, teamId),
+  getTeamSpec: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_SPEC, teamId),
   spawnTeammate: (options: { teamId: string; name: string; role: string; model: string; provider: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SPAWN_TEAMMATE, options),
   shutdownTeammate: (teamId: string, teammateId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SHUTDOWN_TEAMMATE, teamId, teammateId),
   sendTeammateMessage: (teamId: string, from: string, to: string, content: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SEND_MESSAGE, teamId, from, to, content),
+  sendTeammateExecute: (teamId: string, from: string, to: string, content: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SEND_EXECUTE, teamId, from, to, content),
   broadcastTeamMessage: (teamId: string, from: string, content: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_BROADCAST, teamId, from, content),
   getTeamTasks: (teamId: string) =>
@@ -546,6 +554,10 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.SDD_SET_SPEC, sessionId, specId),
   getSDDCompliance: (sessionId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.SDD_GET_COMPLIANCE, sessionId),
+  syncSDDCompliance: (sessionId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_SYNC_COMPLIANCE, sessionId),
+  updateSDDRequirementStatus: (sessionId: string, requirementId: string, status: 'pending' | 'in-progress' | 'implemented' | 'verified') =>
+    ipcRenderer.invoke(IPC_CHANNELS.SDD_UPDATE_REQUIREMENT_STATUS, sessionId, requirementId, status),
   validateSDDDRI: (teamId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.SDD_VALIDATE_DRI, teamId),
   canCloseSDDPlan: (teamId: string) =>
@@ -560,17 +572,17 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_RECENT_WEEKS, count),
   getUsageThresholds: () =>
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_GET_THRESHOLDS),
-  setUsageThresholds: (thresholds: any) =>
+  setUsageThresholds: (thresholds: import('../shared/types').UsageAlertThresholds) =>
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_SET_THRESHOLDS, thresholds),
   exportUsageCSV: (csv: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.USAGE_EXPORT_CSV, csv),
-  onUsageCostUpdate: (callback: (data: any) => void) => {
-    const handler = (_event: any, data: any) => callback(data)
+  onUsageCostUpdate: (callback: (data: import('../shared/types').SessionUsage) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: import('../shared/types').SessionUsage) => callback(data)
     ipcRenderer.on(IPC_CHANNELS.USAGE_COST_UPDATE, handler)
     return () => ipcRenderer.removeListener(IPC_CHANNELS.USAGE_COST_UPDATE, handler)
   },
-  onUsageAlert: (callback: (data: any) => void) => {
-    const handler = (_event: any, data: any) => callback(data)
+  onUsageAlert: (callback: (data: import('../shared/types').UsageAlert) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: import('../shared/types').UsageAlert) => callback(data)
     ipcRenderer.on(IPC_CHANNELS.USAGE_ALERT, handler)
     return () => ipcRenderer.removeListener(IPC_CHANNELS.USAGE_ALERT, handler)
   },

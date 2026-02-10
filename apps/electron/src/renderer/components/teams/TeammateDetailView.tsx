@@ -45,7 +45,11 @@ export function TeammateDetailView({
   onEscalate,
 }: TeammateDetailViewProps) {
   const [inputValue, setInputValue] = useState('')
-  const scrollRef = React.useRef<HTMLDivElement>(null)
+  // Implements REQ-003, REQ-004: auto-scroll when at bottom
+  const viewportRef = React.useRef<HTMLDivElement>(null)
+  const endRef = React.useRef<HTMLDivElement>(null)
+  const isStickToBottomRef = React.useRef(true)
+  const skipSmoothUntilRef = React.useRef(0)
   const modelName = MODEL_NAMES[teammate.model] || teammate.model
 
   const handleSend = useCallback(() => {
@@ -69,6 +73,37 @@ export function TeammateDetailView({
   const relevantMessages = messages.filter(
     m => m.from === teammate.id || m.to === teammate.id || m.to === 'all'
   )
+
+  const scrollToBottom = React.useCallback((behavior: ScrollBehavior) => {
+    endRef.current?.scrollIntoView({ behavior, block: 'end' })
+  }, [])
+
+  // Scroll to bottom on teammate switch (instant to avoid visible jump)
+  React.useLayoutEffect(() => {
+    scrollToBottom('instant')
+    isStickToBottomRef.current = true
+    skipSmoothUntilRef.current = Date.now() + 400
+  }, [teammate.id, scrollToBottom])
+
+  // Track scroll position to toggle sticky behavior
+  React.useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const handleScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = viewport
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
+      isStickToBottomRef.current = distanceFromBottom < 20
+    }
+    viewport.addEventListener('scroll', handleScroll)
+    return () => viewport.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  // Auto-scroll on new messages only when user is at bottom
+  React.useEffect(() => {
+    if (!isStickToBottomRef.current) return
+    if (Date.now() < skipSmoothUntilRef.current) return
+    scrollToBottom('smooth')
+  }, [relevantMessages.length, scrollToBottom])
 
   return (
     <div className="flex-1 flex flex-col h-full min-w-0">
@@ -104,6 +139,7 @@ export function TeammateDetailView({
               onClick={() => onSwapModel(teammate.id)}
               className="size-7"
               title="Swap model"
+              aria-label="Swap model"
             >
               <RefreshCw className="size-3.5" />
             </Button>
@@ -115,6 +151,7 @@ export function TeammateDetailView({
               onClick={() => onEscalate(teammate.id)}
               className="size-7"
               title="Escalate to higher-tier model"
+              aria-label="Escalate model"
             >
               <ArrowUpCircle className="size-3.5" />
             </Button>
@@ -126,6 +163,7 @@ export function TeammateDetailView({
               onClick={() => onShutdown(teammate.id)}
               className="size-7 text-muted-foreground hover:text-destructive"
               title="Shutdown teammate"
+              aria-label="Shutdown teammate"
             >
               <Power className="size-3.5" />
             </Button>
@@ -134,7 +172,7 @@ export function TeammateDetailView({
       </div>
 
       {/* Message/output area */}
-      <ScrollArea className="flex-1 min-h-0" ref={scrollRef}>
+      <ScrollArea className="flex-1 min-h-0" viewportRef={viewportRef}>
         <div className="p-4 space-y-3">
           {relevantMessages.length === 0 ? (
             <div className="flex items-center justify-center h-32 text-muted-foreground">
@@ -171,9 +209,10 @@ export function TeammateDetailView({
                   )}
                 </div>
                 <p className="whitespace-pre-wrap text-foreground/80">{msg.content}</p>
-              </div>
+                </div>
             ))
           )}
+          <div ref={endRef} />
         </div>
       </ScrollArea>
 
@@ -185,6 +224,7 @@ export function TeammateDetailView({
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={`Message ${teammate.name}...`}
+            aria-label={`Message ${teammate.name}`}
             className="flex-1"
           />
           <Button
@@ -192,6 +232,7 @@ export function TeammateDetailView({
             onClick={handleSend}
             disabled={!inputValue.trim()}
             className="shrink-0 size-8"
+            aria-label="Send message"
           >
             <Send className="size-3.5" />
           </Button>

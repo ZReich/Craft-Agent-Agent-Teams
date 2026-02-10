@@ -1,4 +1,4 @@
-import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { getMcpBaseUrl, discoverOAuthMetadata } from '../oauth';
 
 describe('getMcpBaseUrl', () => {
@@ -45,10 +45,10 @@ describe('getMcpBaseUrl', () => {
 
 describe('discoverOAuthMetadata', () => {
   const originalFetch = globalThis.fetch;
-  let mockFetch: ReturnType<typeof mock>;
+  let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    mockFetch = mock(() => Promise.resolve(new Response('Not Found', { status: 404 })));
+    mockFetch = vi.fn(() => Promise.resolve(new Response('Not Found', { status: 404 })));
     globalThis.fetch = mockFetch as unknown as typeof fetch;
   });
 

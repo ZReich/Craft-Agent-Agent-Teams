@@ -10,7 +10,8 @@
     "!apps/online-docs"
   ],
   "scripts": {
-    "test": "bun test",
+    "test": "vitest run -c vitest.config.ts",
+    "test:watch": "vitest -c vitest.config.ts",
     "typecheck": "cd packages/shared && bun run tsc --noEmit",
     "typecheck:all": "cd packages/core && bun run tsc --noEmit && cd ../shared && bun run tsc --noEmit",
     "lint:electron": "cd apps/electron && bun run lint",

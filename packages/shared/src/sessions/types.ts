@@ -11,6 +11,7 @@
 
 import type { PermissionMode } from '../agent/mode-manager.ts';
 import type { ThinkingLevel } from '../agent/thinking-levels.ts';
+import type { UsageProvider } from '../usage/pricing.ts';
 import type { StoredAttachment, MessageRole, ToolStatus, AuthRequestType, AuthStatus, CredentialInputMode, StoredMessage } from '@craft-agent/core/types';
 import type { SpecComplianceReport } from '@craft-agent/core/types';
 
@@ -36,7 +37,7 @@ export const SESSION_PERSISTENT_FIELDS = [
   // Config
   'enabledSourceSlugs', 'permissionMode', 'workingDirectory',
   // Model/Connection
-  'model', 'llmConnection', 'connectionLocked', 'thinkingLevel',
+  'model', 'llmProvider', 'llmConnection', 'connectionLocked', 'thinkingLevel',
   // Sharing
   'sharedUrl', 'sharedId',
   // Plan execution
@@ -48,7 +49,7 @@ export const SESSION_PERSISTENT_FIELDS = [
   // Hierarchy
   'parentSessionId', 'siblingOrder',
   // Agent teams
-  'teamId', 'isTeamLead', 'teammateName', 'teammateSessionIds', 'teamColor',
+  'teamId', 'isTeamLead', 'teammateName', 'teammateRole', 'teammateSessionIds', 'teamColor',
 ] as const;
 
 export type SessionPersistentField = typeof SESSION_PERSISTENT_FIELDS[number];
@@ -133,6 +134,8 @@ export interface SessionConfig {
   sharedId?: string;
   /** Model to use for this session (overrides global config if set) */
   model?: string;
+  /** Canonical provider used for this session */
+  llmProvider?: UsageProvider;
   /** LLM connection slug for this session (locked after first message) */
   llmConnection?: string;
   /** Whether the connection is locked (cannot be changed after first agent creation) */
@@ -173,6 +176,8 @@ export interface SessionConfig {
   isTeamLead?: boolean;
   /** Display name for teammate sessions */
   teammateName?: string;
+  /** Role label for teammate sessions (e.g., head, worker, reviewer) */
+  teammateRole?: string;
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
@@ -233,6 +238,8 @@ export interface SessionHeader {
   sharedId?: string;
   /** Model to use for this session (overrides global config if set) */
   model?: string;
+  /** Canonical provider used for this session */
+  llmProvider?: UsageProvider;
   /** LLM connection slug for this session (locked after first message) */
   llmConnection?: string;
   /** Whether the connection is locked (cannot be changed after first agent creation) */
@@ -273,6 +280,8 @@ export interface SessionHeader {
   isTeamLead?: boolean;
   /** Display name for teammate sessions */
   teammateName?: string;
+  /** Role label for teammate sessions (e.g., head, worker, reviewer) */
+  teammateRole?: string;
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
@@ -327,6 +336,8 @@ export interface SessionMetadata {
   lastMessageRole?: 'user' | 'assistant' | 'plan' | 'tool' | 'error';
   /** Model to use for this session (overrides global config if set) */
   model?: string;
+  /** Canonical provider used for this session */
+  llmProvider?: UsageProvider;
   /** LLM connection slug for this session (locked after first message) */
   llmConnection?: string;
   /** Whether the connection is locked (cannot be changed after first agent creation) */

@@ -14,7 +14,7 @@
  * for UI events and server requests for approval prompts.
  */
 
-import type { AgentEvent } from '@craft-agent/core/types';
+import type { AgentEvent, AgentEventUsage } from '@craft-agent/core/types';
 import type { FileAttachment } from '../utils/files.ts';
 import type { ThinkingLevel } from './thinking-levels.ts';
 import type { AuthRequest } from '@craft-agent/session-tools-core';
@@ -34,6 +34,7 @@ import { DEFAULT_CODEX_MODEL, getModelById, getModelIdByShortName } from '../con
 
 // BaseAgent provides common functionality
 import { BaseAgent } from './base-agent.ts';
+import { PromptBuilder } from './core/prompt-builder.ts';
 
 // App-server client
 import {
@@ -99,6 +100,7 @@ import type {
   FileChangeApprovalDecision,
   ThreadTokenUsageUpdatedNotification,
 } from '@craft-agent/codex-types/v2';
+import { calculateTokenCostUsd, inferProviderFromModel, type UsageProvider } from '../usage/pricing.ts';
 
 // ============================================================
 // Constants
@@ -205,6 +207,14 @@ export class CodexAgent extends BaseAgent {
   // Mutex for token refresh to prevent race conditions with concurrent refresh requests
   private tokenRefreshInProgress: Promise<void> | null = null;
 
+  // Track most recent token usage notification per turn (for completion usage summary)
+  private turnTokenUsage: Map<string, ThreadTokenUsageUpdatedNotification['tokenUsage']> = new Map();
+
+  // Agent teams: Track when this agent is acting as a team lead with active teammates
+  // Implements REQ-001/REQ-002/REQ-003: Lead completion behavior with active teams
+  private activeTeamName: string | undefined;
+  private activeTeammateCount: number = 0;
+
   // ============================================================
   // Codex-specific Callbacks
   // ============================================================
@@ -258,6 +268,16 @@ export class CodexAgent extends BaseAgent {
 
     // Call BaseAgent constructor - handles all core module initialization (model from connection)
     super(config, DEFAULT_CODEX_MODEL, modelDef?.contextWindow);
+
+    // Override prompt builder with Codex backend type for agent teams prompt customization
+    this.promptBuilder = new PromptBuilder({
+      workspace: config.workspace,
+      session: config.session,
+      debugMode: config.debugMode,
+      systemPromptPreset: config.systemPromptPreset,
+      isHeadless: config.isHeadless,
+      agentBackend: 'codex',
+    });
 
     // Codex-specific initialization
     // Restore thread ID from previous session (for resume)
@@ -411,9 +431,32 @@ export class CodexAgent extends BaseAgent {
 
     // Turn completed
     this.client.on('turn/completed', (notification) => {
+      const turnId = notification.turn?.id;
+      const usage = turnId ? this.buildTurnUsage(turnId) : undefined;
       for (const event of this.adapter.adaptTurnCompleted(notification)) {
-        this.enqueueEvent(event);
+        if (event.type === 'complete') {
+          // Implements REQ-001/REQ-002: Don't complete if team is active, send usage_update instead
+          if (this.activeTeamName && this.activeTeammateCount > 0) {
+            // Team is active - send usage_update but keep session running
+            this.debug(`[AgentTeams] Team "${this.activeTeamName}" active with ${this.activeTeammateCount} teammates - keeping session alive`);
+            if (usage) {
+              this.enqueueEvent({
+                type: 'usage_update',
+                usage: {
+                  inputTokens: usage.inputTokens,
+                  contextWindow: usage.contextWindow,
+                },
+              });
+            }
+          } else {
+            // Implements REQ-003: Normal completion when no team is active
+            this.enqueueEvent({ type: 'complete', usage });
+          }
+        } else {
+          this.enqueueEvent(event);
+        }
       }
+      if (turnId) this.turnTokenUsage.delete(turnId);
       this.turnComplete = true;
       this.signalEventAvailable(true);
     });
@@ -609,12 +652,28 @@ export class CodexAgent extends BaseAgent {
     this.client.on('thread/tokenUsage/updated', (notification: ThreadTokenUsageUpdatedNotification) => {
       const usage = notification.tokenUsage;
       if (usage) {
+        this.turnTokenUsage.set(notification.turnId, usage);
         // Use latest-turn usage for context size; include cached tokens to match OpenAI convention
         const inputTokens = usage.last.inputTokens + usage.last.cachedInputTokens;
+        const outputTokens = usage.last.outputTokens + usage.last.reasoningOutputTokens;
+        const model = this.getModel();
+        const provider = inferProviderFromModel(model);
+        const costUsd = calculateTokenCostUsd({
+          model,
+          provider,
+          inputTokens,
+          outputTokens,
+          cachedInputTokens: usage.last.cachedInputTokens,
+        });
         this.enqueueEvent({
           type: 'usage_update',
           usage: {
             inputTokens,
+            outputTokens,
+            cacheReadTokens: usage.last.cachedInputTokens,
+            costUsd,
+            provider,
+            model,
             contextWindow: usage.modelContextWindow ?? undefined,
           },
         });
@@ -687,6 +746,36 @@ export class CodexAgent extends BaseAgent {
       this.debug(`[codex] Session configured`);
     });
 
+  }
+
+  /**
+   * Build per-turn usage for completion events from latest thread token usage notification.
+   */
+  private buildTurnUsage(turnId: string): AgentEventUsage | undefined {
+    const tokenUsage = this.turnTokenUsage.get(turnId);
+    if (!tokenUsage) return undefined;
+
+    const inputTokens = tokenUsage.last.inputTokens + tokenUsage.last.cachedInputTokens;
+    const outputTokens = tokenUsage.last.outputTokens + tokenUsage.last.reasoningOutputTokens;
+    const model = this.getModel();
+    const provider: UsageProvider = inferProviderFromModel(model);
+    const costUsd = calculateTokenCostUsd({
+      model,
+      provider,
+      inputTokens,
+      outputTokens,
+      cachedInputTokens: tokenUsage.last.cachedInputTokens,
+    });
+
+    return {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens: tokenUsage.last.cachedInputTokens,
+      costUsd,
+      contextWindow: tokenUsage.modelContextWindow ?? undefined,
+      provider,
+      model,
+    };
   }
 
   // ============================================================
@@ -1070,27 +1159,35 @@ export class CodexAgent extends BaseAgent {
     const inputObj = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
 
     // ============================================================
-    // AGENT TEAMS: Intercept teammate spawn and message routing
+    // AGENT TEAMS: Intercept MCP tools from session server
+    // Tools arrive as toolType='mcp', mcpServer='session', toolName='Task'|'SendMessage'|'TeamCreate'.
+    // sdkToolName for MCP tools = 'mcp__session__Task', so we match both patterns.
     // ============================================================
-    const teamName =
+    const explicitTeamName =
       typeof inputObj.team_name === 'string'
         ? inputObj.team_name
         : typeof inputObj.teamName === 'string'
           ? inputObj.teamName
           : undefined;
+    // Implements REQ-001: default team name to active team/session to avoid missed spawns
+    const fallbackTeamName = this.activeTeamName || this.config.session?.teamId || this.config.session?.id;
+    const teamName = explicitTeamName || fallbackTeamName;
 
     const isSpawnTool =
-      sdkToolName === 'Task' ||
       toolName === 'Task' ||
-      toolName === 'spawnAgent' ||
-      toolName === 'CollabAgent:spawnAgent';
+      sdkToolName === 'Task' ||
+      sdkToolName.endsWith('__Task');
 
     if (isSpawnTool && teamName && this.onTeammateSpawnRequested) {
       const teammateName = (inputObj.name as string) || `teammate-${Date.now()}`;
-      const prompt = (inputObj.prompt as string) || '';
+      const prompt = (inputObj.prompt as string) || (inputObj.input as string) || '';
       const model = inputObj.model as string | undefined;
 
-      this.debug(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}"`);
+      if (!explicitTeamName) {
+        this.debug(`[AgentTeams] No team_name provided; defaulting to "${teamName}"`);
+      }
+
+      this.debug(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}" via MCP`);
 
       try {
         const result = await this.onTeammateSpawnRequested({
@@ -1099,6 +1196,11 @@ export class CodexAgent extends BaseAgent {
           prompt,
           model,
         });
+
+        // Implements REQ-001: Track active team to prevent premature completion
+        this.activeTeamName = teamName;
+        this.activeTeammateCount++;
+        this.debug(`[AgentTeams] Team "${teamName}" now has ${this.activeTeammateCount} active teammates`);
 
         const outputContent =
           `Teammate "${teammateName}" spawned successfully as a separate session.\n` +
@@ -1149,7 +1251,10 @@ export class CodexAgent extends BaseAgent {
       }
     }
 
-    const isMessageTool = sdkToolName === 'SendMessage' || toolName === 'SendMessage';
+    const isMessageTool =
+      toolName === 'SendMessage' ||
+      sdkToolName === 'SendMessage' ||
+      sdkToolName.endsWith('__SendMessage');
     if (isMessageTool && this.onTeammateMessage) {
       const msgType = (inputObj.type as string) || 'message';
       const targetName = (inputObj.recipient as string) || '';
@@ -1199,6 +1304,30 @@ export class CodexAgent extends BaseAgent {
           return;
         }
       }
+    }
+
+    // AGENT TEAMS: Intercept TeamCreate (no-op — teams are created implicitly on first Task call)
+    const isTeamCreateTool =
+      toolName === 'TeamCreate' ||
+      sdkToolName === 'TeamCreate' ||
+      sdkToolName.endsWith('__TeamCreate');
+    if (isTeamCreateTool && this.onTeammateSpawnRequested) {
+      const teamCreateName = (inputObj.team_name as string) || (inputObj.teamName as string) || 'default-team';
+      const outputContent = `Team "${teamCreateName}" created successfully. You can now spawn teammates using the Task tool with team_name="${teamCreateName}".`;
+
+      this.enqueueEvent({
+        type: 'tool_result',
+        toolUseId: itemId,
+        toolName: 'TeamCreate',
+        result: outputContent,
+        isError: false,
+      });
+
+      await this.safeRespondToPreToolUse(requestId, {
+        type: 'block',
+        reason: outputContent,
+      });
+      return;
     }
 
     // Track modifications to input
@@ -1637,6 +1766,17 @@ export class CodexAgent extends BaseAgent {
    * Add an event to the queue and signal waiters.
    */
   private enqueueEvent(event: AgentEvent): void {
+    const maxQueueSize = 2000;
+    if (this.eventQueue.length >= maxQueueSize) {
+      // Drop low-priority high-frequency events to avoid OOM
+      if (event.type === 'text_delta' || event.type === 'usage_update' || event.type === 'status') {
+        return;
+      }
+      // For higher priority events, drop oldest low-priority items
+      this.eventQueue = this.eventQueue.filter(
+        (queued) => queued.type !== 'text_delta' && queued.type !== 'usage_update' && queued.type !== 'status'
+      );
+    }
     this.eventQueue.push(event);
     this.signalEventAvailable(false);
   }
@@ -1835,8 +1975,17 @@ export class CodexAgent extends BaseAgent {
       }
 
       // Emit complete if not already emitted
+      // REQ-001/REQ-002/REQ-003: Check team state before completion
       if (!this.turnComplete) {
-        yield { type: 'complete' };
+        if (this.activeTeamName && this.activeTeammateCount > 0) {
+          // Team is active - emit usage_update instead (REQ-002)
+          // Don't emit complete - keep session alive for team coordination
+          this.debug(`[AgentTeams] Team active - skipping completion to keep session alive`);
+          // No event emitted - session stays open
+        } else {
+          // Normal completion (REQ-003)
+          yield { type: 'complete' };
+        }
       }
 
     } catch (error) {
@@ -1866,7 +2015,13 @@ export class CodexAgent extends BaseAgent {
         };
       }
 
-      // Emit complete even on error so application knows we're done
+      // REQ-001/REQ-002/REQ-003: Check team state even on error path
+      // Errors should still emit complete to avoid hanging the session
+      if (this.activeTeamName && this.activeTeammateCount > 0) {
+        // Team is active but we hit an error - still emit complete on errors (REQ-003)
+        // to prevent the session from hanging indefinitely
+        this.debug(`[AgentTeams] Error occurred with active team - completing session`);
+      }
       yield { type: 'complete' };
     } finally {
       this._isProcessing = false;
@@ -2144,6 +2299,7 @@ export class CodexAgent extends BaseAgent {
     }
     this.pendingPermissions.clear();
     this.pendingApprovals.clear();
+    this.turnTokenUsage.clear();
 
     // For PlanSubmitted and AuthRequest, just interrupt the turn - don't disconnect
     // The user will respond (approve plan, complete auth) and we need to continue in the same session
@@ -2395,6 +2551,7 @@ export class CodexAgent extends BaseAgent {
   override clearHistory(): void {
     this.codexThreadId = null;
     this.currentTurnId = null;
+    this.turnTokenUsage.clear();
     super.clearHistory();
     this.debug('History cleared - next chat will start new thread');
   }

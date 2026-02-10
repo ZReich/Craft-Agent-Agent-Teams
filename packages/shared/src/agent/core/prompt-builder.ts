@@ -17,6 +17,7 @@ import { formatPreferencesForPrompt } from '../../config/preferences.ts';
 import { formatSessionState } from '../mode-manager.ts';
 import { getDateTimeContext, getWorkingDirectoryContext } from '../../prompts/system.ts';
 import { getSessionPlansPath, getSessionPath } from '../../sessions/storage.ts';
+import type { Spec } from '@craft-agent/core/types';
 import type {
   PromptBuilderConfig,
   ContextBlockOptions,
@@ -45,6 +46,8 @@ export class PromptBuilder {
   private config: PromptBuilderConfig;
   private workspaceRootPath: string;
   private pinnedPreferencesPrompt: string | null = null;
+  /** Active spec for SDD context (set at runtime via setSDDSpec) */
+  private sddActiveSpec: Spec | null = null;
 
   constructor(config: PromptBuilderConfig) {
     this.config = config;
@@ -86,6 +89,12 @@ export class PromptBuilder {
     // Add workspace capabilities
     parts.push(this.formatWorkspaceCapabilities());
 
+    // Add SDD context if enabled
+    const sddContext = this.formatSDDContext();
+    if (sddContext) {
+      parts.push(sddContext);
+    }
+
     // Add working directory context
     const workingDirContext = this.getWorkingDirectoryContext();
     if (workingDirContext) {
@@ -124,6 +133,51 @@ export class PromptBuilder {
       return capabilityBlock;
     }
 
+    const isCodex = this.config.agentBackend === 'codex';
+
+    if (isCodex) {
+      // Implements REQ-005: reinforce that workspace settings control teammate models
+      // Codex agent teams use MCP tools from the session server.
+      // These tools are intercepted via PreToolUse (toolType='mcp') and routed
+      // to our agent teams system, which spawns real teammate sessions.
+      return `${capabilityBlock}
+
+<agent_teams>
+enabled: true
+You have MCP tools available from the "session" server for managing agent teams.
+
+## Spawning Teammates
+Use the **Task** MCP tool to spawn a teammate agent:
+- team_name: string (required — team identifier, e.g. "my-team")
+- name: string (required — teammate name, e.g. "researcher")
+- prompt: string (required — task instructions for the teammate)
+- model: string (optional — model override)
+
+If agent teams are enabled and you create a plan/spec, you MUST either:
+- Spawn appropriate teammates for work that benefits from parallel execution, OR
+- Explicitly state in the chat that no team is needed and why.
+
+Example: To spawn a researcher teammate, call the Task tool with:
+  team_name: "project-team", name: "researcher", prompt: "Research the API docs and summarize the endpoints"
+
+## Model Selection Note
+Workspace settings control teammate models. Do not override the \`model\` field unless the user explicitly requests a different model.
+Model overrides that conflict with workspace settings may be ignored.
+
+## Sending Messages
+Use the **SendMessage** MCP tool to communicate with teammates:
+- type: "message" | "broadcast" | "shutdown_request"
+- recipient: string (teammate name — required for "message" and "shutdown_request")
+- content: string (message text)
+
+## Creating Teams
+Use the **TeamCreate** MCP tool to explicitly create a team (optional — teams are also created implicitly on first Task call):
+- team_name: string (required)
+
+Each teammate runs independently in its own session. Results are delivered automatically when they complete.
+</agent_teams>`;
+    }
+
     return `${capabilityBlock}
 
 <agent_teams>
@@ -134,6 +188,7 @@ To spawn teammates, call the Task tool with:
 - prompt: string (task to perform)
 - model: string (optional)
 Use SendMessage to message teammates (type: message | broadcast | shutdown_request).
+If agent teams are enabled and you create a plan/spec, you MUST either spawn teammates or explicitly say no team is needed and why.
 </agent_teams>`;
   }
 
@@ -151,6 +206,114 @@ Use SendMessage to message teammates (type: message | broadcast | shutdown_reque
       isSessionRoot,
       this.config.session?.sdkCwd
     );
+  }
+
+  // ============================================================
+  // Spec-Driven Development (SDD) Context
+  // ============================================================
+
+  /**
+   * Format SDD context for prompt injection.
+   * Returns null if SDD is not enabled for this session.
+   */
+  private formatSDDContext(): string | null {
+    if (!this.config.session?.sddEnabled) {
+      return null;
+    }
+
+    const parts: string[] = [];
+    parts.push(`<sdd_mode>`);
+    parts.push(`This session is operating in **Spec-Driven Development (SDD)** mode.`);
+    parts.push(``);
+    parts.push(`## SDD Principles`);
+    parts.push(``);
+    parts.push(`All work in this session must be guided by structured specifications:`);
+    parts.push(``);
+    parts.push(`1. **Requirement Traceability** - Reference requirement IDs (e.g., \`REQ-001\`) in code comments, commit messages, and task descriptions. Every code change should trace back to a spec requirement.`);
+    parts.push(`2. **DRI (Directly Responsible Individual)** - Each requirement and spec section should have a clear owner. When working in a team, assign DRI to teammates. In solo mode, you are the DRI.`);
+    parts.push(`3. **Coverage Tracking** - Track which requirements are implemented, partially implemented, or not yet started. Aim for 100% requirement coverage before marking work complete.`);
+    parts.push(`4. **Acceptance Tests** - Each requirement has acceptance tests. Verify these pass before marking a requirement as implemented.`);
+    parts.push(`5. **Rollout Safety** - Consider rollback plans, monitoring, and feature flags for changes. Document these in the spec.`);
+    parts.push(``);
+    parts.push(`## SDD Workflow`);
+    parts.push(``);
+    parts.push(`- Before starting work, review the active spec and its requirements`);
+    parts.push(`- When creating tasks (especially in agent teams), link them to requirement IDs via \`requirementIds\``);
+    parts.push(`- Reference requirement IDs in code: \`// Implements REQ-001: User authentication\``);
+    parts.push(`- When completing work, verify coverage against spec requirements`);
+    parts.push(`- Generate a traceability report linking requirements → code → tests when asked`);
+
+    if (this.sddActiveSpec) {
+      const spec = this.sddActiveSpec;
+      parts.push(``);
+      parts.push(`## Active Spec: ${spec.title}`);
+      parts.push(``);
+      parts.push(`- **Status:** ${spec.status}`);
+      parts.push(`- **Owner DRI:** ${spec.ownerDRI}`);
+      if (spec.goals.length > 0) {
+        parts.push(`- **Goals:** ${spec.goals.join('; ')}`);
+      }
+      if (spec.nonGoals.length > 0) {
+        parts.push(`- **Non-Goals:** ${spec.nonGoals.join('; ')}`);
+      }
+      parts.push(``);
+      parts.push(`### Requirements (${spec.requirements.length})`);
+      parts.push(``);
+      for (const req of spec.requirements) {
+        const statusIcon = req.status === 'verified' ? '[x]' :
+                          req.status === 'implemented' ? '[~]' :
+                          req.status === 'in-progress' ? '[>]' : '[ ]';
+        parts.push(`- ${statusIcon} **${req.id}** (${req.priority}): ${req.description}`);
+        if (req.assignedDRI) {
+          parts.push(`  - DRI: ${req.assignedDRI}`);
+        }
+      }
+
+      if (spec.risks.length > 0) {
+        parts.push(``);
+        parts.push(`### Risks`);
+        parts.push(``);
+        for (const risk of spec.risks) {
+          parts.push(`- **${risk.id}** (${risk.severity}): ${risk.description} → Mitigation: ${risk.mitigation}`);
+        }
+      }
+
+      if (spec.rolloutPlan) {
+        parts.push(``);
+        parts.push(`### Rollout Plan`);
+        parts.push(spec.rolloutPlan);
+      }
+
+      if (spec.rollbackPlan) {
+        parts.push(``);
+        parts.push(`### Rollback Plan`);
+        parts.push(spec.rollbackPlan);
+      }
+    } else if (this.config.session?.activeSpecId) {
+      parts.push(``);
+      parts.push(`**Active Spec ID:** ${this.config.session.activeSpecId} (spec details not loaded — ask the user for the spec document or create one)`);
+    } else {
+      parts.push(``);
+      parts.push(`**No active spec loaded.** Ask the user to provide or create a specification document to guide the work. A spec should include: title, goals, non-goals, requirements (with IDs and priorities), risks, and rollout/rollback plans.`);
+    }
+
+    parts.push(`</sdd_mode>`);
+    return parts.join('\n');
+  }
+
+  /**
+   * Set the active spec for SDD context injection.
+   * Called at runtime when a spec is loaded or updated.
+   */
+  setSDDSpec(spec: Spec | null): void {
+    this.sddActiveSpec = spec;
+  }
+
+  /**
+   * Get the current active spec (if any).
+   */
+  getSDDSpec(): Spec | null {
+    return this.sddActiveSpec;
   }
 
   // ============================================================
@@ -236,6 +399,13 @@ Please continue the conversation naturally from where we left off.
    */
   setSession(session: PromptBuilderConfig['session']): void {
     this.config.session = session;
+  }
+
+  /**
+   * Get the current session configuration.
+   */
+  getSession(): PromptBuilderConfig['session'] {
+    return this.config.session;
   }
 
   /**

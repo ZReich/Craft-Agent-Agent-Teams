@@ -11,7 +11,7 @@
 
 import * as React from 'react'
 import { useAtomValue } from 'jotai'
-import { Users, ChevronDown, ChevronUp, Loader2, ArrowUpLeft } from 'lucide-react'
+import { Users, ChevronDown, ChevronUp, Loader2, ArrowUpLeft, LayoutDashboard, MessageSquare, Maximize2, Minimize2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { sessionMetaMapAtom, type SessionMeta } from '@/atoms/sessions'
 import { navigate, routes } from '@/lib/navigate'
@@ -27,6 +27,14 @@ const UsageDetailPanel = React.lazy(() =>
 
 export interface TeamStatusBarProps {
   session: Session
+  /** Whether the team dashboard view is currently open */
+  isDashboardOpen?: boolean
+  /** Called to toggle between dashboard and chat views */
+  onToggleDashboard?: () => void
+  /** Whether focus mode is active (fullscreen chat) */
+  isFocusModeActive?: boolean
+  /** Called to toggle focus mode */
+  onToggleFocusMode?: () => void
 }
 
 /**
@@ -60,7 +68,13 @@ function statusLabel(status: 'working' | 'idle' | 'done'): string {
   }
 }
 
-export function TeamStatusBar({ session }: TeamStatusBarProps) {
+export function TeamStatusBar({
+  session,
+  isDashboardOpen,
+  onToggleDashboard,
+  isFocusModeActive,
+  onToggleFocusMode,
+}: TeamStatusBarProps) {
   const [expanded, setExpanded] = React.useState(false)
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
 
@@ -89,6 +103,7 @@ export function TeamStatusBar({ session }: TeamStatusBarProps) {
 
   const workingCount = teammates.filter(t => t.status === 'working').length
   const doneCount = teammates.filter(t => t.status === 'done').length
+  const showSpawnWarning = isLead && session.sddEnabled && teammates.length === 0
 
   // ----- Teammate session view (not the lead) -----
   if (!isLead && parentSessionId) {
@@ -172,6 +187,66 @@ export function TeamStatusBar({ session }: TeamStatusBarProps) {
           )}
         </span>
       </button>
+
+      {/* Dashboard toggle button (lead sessions only) */}
+      {isLead && (onToggleDashboard || onToggleFocusMode) && (
+        <div className="flex items-center gap-2 px-4 py-1 border-t border-border/50">
+          {onToggleDashboard && (
+            <button
+              type="button"
+              onClick={onToggleDashboard}
+              className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors',
+                isDashboardOpen
+                  ? 'bg-foreground/10 text-foreground font-medium'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5'
+              )}
+            >
+              {isDashboardOpen ? (
+                <>
+                  <MessageSquare className="h-3 w-3" />
+                  Back to Chat
+                </>
+              ) : (
+                <>
+                  <LayoutDashboard className="h-3 w-3" />
+                  Open Dashboard
+                </>
+              )}
+            </button>
+          )}
+          {onToggleFocusMode && (
+            <button
+              type="button"
+              onClick={onToggleFocusMode}
+              className={cn(
+                'inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors',
+                isFocusModeActive
+                  ? 'bg-foreground/10 text-foreground font-medium'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5'
+              )}
+            >
+              {isFocusModeActive ? (
+                <>
+                  <Minimize2 className="h-3 w-3" />
+                  Exit Fullscreen
+                </>
+              ) : (
+                <>
+                  <Maximize2 className="h-3 w-3" />
+                  Team Fullscreen
+                </>
+              )}
+            </button>
+          )}
+        </div>
+      )}
+
+      {showSpawnWarning && (
+        <div className="px-4 py-2 border-t border-border/50 text-xs text-amber-700 dark:text-amber-300 bg-amber-500/10">
+          No teammates have spawned yet. If delegation is expected, ensure the lead agent calls Task (team_name optional).
+        </div>
+      )}
 
       {/* Usage tracking bar - rendered outside button to avoid DOM nesting issues */}
       <React.Suspense fallback={null}>

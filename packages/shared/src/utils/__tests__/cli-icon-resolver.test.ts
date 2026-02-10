@@ -8,7 +8,7 @@
  * - resolveToolIcon: end-to-end resolution with config and icon files
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll } from 'vitest';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -334,7 +334,7 @@ describe('resolveToolIcon', () => {
     const result = resolveToolIcon('git status', testDir);
     expect(result).toBeDefined();
     expect(result!.displayName).toBe('Git');
-    expect(result!.iconDataUrl).toStartWith('data:image/png;base64,');
+    expect(result!.iconDataUrl).toMatch(/^data:image\/png;base64,/);
   });
 
   test('resolves npm command', () => {
@@ -401,7 +401,7 @@ describe('resolveToolIcon', () => {
     expect(result).toBeDefined();
     expect(result!.displayName).toBe('Git');
     expect(result!.id).toBe('git');
-    expect(result!.iconDataUrl).toStartWith('data:image/');
+    expect(result!.iconDataUrl).toMatch(/^data:image\//);
   });
 
   test('resolves git from zsh -lc wrapper', () => {

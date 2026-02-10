@@ -31,6 +31,8 @@ import type {
   TeamActivityEvent,
   TeamCostSummary,
   QualityGateResult,
+  WorkspaceSettings,
+  ModelPresetId,
 } from '../../../shared/types'
 
 import { TeamHeader } from './TeamHeader'
@@ -62,7 +64,7 @@ function sessionMetaToTeammate(meta: SessionMeta, isLead: boolean): AgentTeammat
   return {
     id: meta.id,
     name: meta.teammateName || meta.name || meta.id,
-    role: isLead ? 'lead' : 'worker',
+    role: isLead ? 'lead' : (meta.teammateRole || 'worker'),
     agentId: meta.id,
     sessionId: meta.id,
     status: deriveTeammateStatus(meta),
@@ -82,6 +84,8 @@ function sessionMetaToTeammate(meta: SessionMeta, isLead: boolean): AgentTeammat
 export interface TeamDashboardProps {
   /** The lead session for this team */
   session: Session
+  /** Live team status from team manager */
+  teamStatus?: AgentTeam
   /** All tasks for the active team */
   tasks?: TeamTask[]
   /** All messages for the active team */
@@ -99,7 +103,7 @@ export interface TeamDashboardProps {
   /** Called to toggle delegate mode */
   onToggleDelegateMode?: () => void
   /** Called to send a message to a teammate */
-  onSendMessage?: (teammateId: string, content: string) => void
+  onSendMessage: (teammateId: string, content: string) => void
   /** Called to swap a teammate's model */
   onSwapModel?: (teammateId: string) => void
   /** Called to shut down a teammate */
@@ -108,6 +112,8 @@ export interface TeamDashboardProps {
   onEscalateTeammate?: (teammateId: string) => void
   /** Whether spec mode is active for this workspace/session */
   specModeEnabled?: boolean
+  /** Active spec label (title/path) */
+  specLabel?: string
   /** Requirement coverage data */
   specRequirements?: Array<{
     id: string
@@ -127,12 +133,15 @@ export interface TeamDashboardProps {
   }>
   /** Called when a requirement is selected */
   onSpecRequirementClick?: (requirementId: string) => void
+  /** Called when a requirement status changes */
+  onSpecRequirementStatusChange?: (requirementId: string, status: 'pending' | 'in-progress' | 'implemented' | 'verified') => void
   /** Called to complete/finalize the team session */
   onCompleteTeam?: () => void
 }
 
 export function TeamDashboard({
   session,
+  teamStatus,
   tasks = [],
   messages = [],
   activityEvents = [],
@@ -146,9 +155,11 @@ export function TeamDashboard({
   onShutdownTeammate,
   onEscalateTeammate,
   specModeEnabled = false,
+  specLabel,
   specRequirements = [],
   specTraceabilityMap = [],
   onSpecRequirementClick,
+  onSpecRequirementStatusChange,
   onCompleteTeam,
 }: TeamDashboardProps) {
   const [selectedTeammateId, setSelectedTeammateId] = useState<string | undefined>()
@@ -159,9 +170,31 @@ export function TeamDashboard({
   const [compactSidebarMode, setCompactSidebarMode] = useState(false)
   const [compactSidebarExpanded, setCompactSidebarExpanded] = useState(false)
   const [highlightedTaskIds, setHighlightedTaskIds] = useState<string[]>([])
+  const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null)
 
   // Read teammate session metadata from Jotai atoms
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
+
+  useEffect(() => {
+    let cancelled = false
+    if (!window.electronAPI || !session.workspaceId) return
+    window.electronAPI.getWorkspaceSettings(session.workspaceId)
+      .then((settings) => {
+        if (!cancelled) setWorkspaceSettings(settings ?? null)
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaceSettings(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [session.workspaceId])
+
+  // Implements REQ-004: gate team creation when SDD is enabled without an active spec
+  const sddBlocked = specModeEnabled && !session.activeSpecId
+  // Implements REQ-001: default preset to workspace settings
+  const presetFromSettings = (workspaceSettings?.agentTeamsModelPreset as ModelPresetId | undefined) ?? 'cost-optimized'
+  const lockPresetSelection = !!workspaceSettings?.agentTeamsModelPreset
 
   // Build the teammates list from real session metadata
   const teammates: AgentTeammate[] = useMemo(() => {
@@ -185,16 +218,35 @@ export function TeamDashboard({
     return result
   }, [session.id, session.teammateSessionIds, sessionMetaMap])
 
+  const teammatesWithTasks = useMemo(() => {
+    const taskByAssignee = new Map<string, TeamTask[]>()
+    tasks.forEach((task) => {
+      if (!task.assignee) return
+      const existing = taskByAssignee.get(task.assignee) ?? []
+      existing.push(task)
+      taskByAssignee.set(task.assignee, existing)
+    })
+
+    return teammates.map((teammate) => {
+      const assigned = taskByAssignee.get(teammate.id) ?? []
+      const activeTask = assigned.find(t => t.status === 'in_progress') ?? assigned[0]
+      return {
+        ...teammate,
+        currentTask: activeTask?.title ?? teammate.currentTask,
+      }
+    })
+  }, [teammates, tasks])
+
   // Derive the AgentTeam object for sub-components (TeamHeader, etc.)
   const team: AgentTeam = useMemo(() => ({
-    id: session.teamId || session.id,
-    name: session.name || 'Agent Team',
-    leadSessionId: session.id,
-    status: session.isProcessing ? 'active' : 'active',
-    createdAt: session.createdAt ? new Date(session.createdAt).toISOString() : new Date().toISOString(),
-    members: teammates,
-    delegateMode: false,
-  }), [session.id, session.teamId, session.name, session.isProcessing, session.createdAt, teammates])
+    id: teamStatus?.id ?? session.teamId ?? session.id,
+    name: teamStatus?.name ?? (session.name || 'Agent Team'),
+    leadSessionId: teamStatus?.leadSessionId ?? session.id,
+    status: teamStatus?.status ?? (session.isProcessing ? 'active' : 'active'),
+    createdAt: teamStatus?.createdAt ?? (session.createdAt ? new Date(session.createdAt).toISOString() : new Date().toISOString()),
+    members: teammatesWithTasks,
+    delegateMode: teamStatus?.delegateMode ?? false,
+  }), [teamStatus, session.id, session.teamId, session.name, session.isProcessing, session.createdAt, teammatesWithTasks])
 
   // Auto-select the lead teammate when team changes
   useEffect(() => {
@@ -206,7 +258,7 @@ export function TeamDashboard({
     }
   }, [session.id])
 
-  const selectedTeammate = teammates.find(m => m.id === selectedTeammateId)
+  const selectedTeammate = teammatesWithTasks.find(m => m.id === selectedTeammateId)
   const teammateActiveTaskCount = useMemo(() => {
     const counts = new Map<string, number>()
     tasks.forEach((task) => {
@@ -238,9 +290,19 @@ export function TeamDashboard({
             </p>
           </div>
           {onCreateTeam && (
-            <Button onClick={() => setCreateDialogOpen(true)} size="sm">
+            <Button
+              onClick={() => setCreateDialogOpen(true)}
+              size="sm"
+              disabled={sddBlocked}
+              title={sddBlocked ? 'SDD is enabled: choose an active spec before creating a team' : undefined}
+            >
               Create Team
             </Button>
+          )}
+          {sddBlocked && (
+            <p className="text-xs text-muted-foreground">
+              Spec-Driven Development is enabled. Select an active spec before creating a team.
+            </p>
           )}
         </div>
 
@@ -248,6 +310,8 @@ export function TeamDashboard({
           <TeamCreationDialog
             open={createDialogOpen}
             onOpenChange={setCreateDialogOpen}
+            defaultPreset={presetFromSettings}
+            lockPresetSelection={lockPresetSelection}
             onCreateTeam={(config) => {
               onCreateTeam(config)
               setCreateDialogOpen(false)
@@ -267,6 +331,7 @@ export function TeamDashboard({
         onToggleDelegateMode={onToggleDelegateMode}
         onCleanupTeam={onCleanupTeam}
         specModeEnabled={specModeEnabled}
+        specLabel={specLabel}
         isCompactSidebarMode={compactSidebarMode}
         onToggleCompactSidebarMode={() => {
           setCompactSidebarMode(prev => !prev)
@@ -279,7 +344,7 @@ export function TeamDashboard({
         {/* Sidebar */}
         {compactSidebarMode ? (
           <TeamSidebarCompact
-            teammates={teammates.map(t => ({
+            teammates={teammatesWithTasks.map(t => ({
               id: t.id,
               name: t.name,
               status: t.status,
@@ -294,7 +359,7 @@ export function TeamDashboard({
           />
         ) : (
           <TeammateSidebar
-            teammates={teammates}
+            teammates={teammatesWithTasks}
             selectedTeammateId={selectedTeammateId}
             onSelectTeammate={setSelectedTeammateId}
           />
@@ -379,7 +444,7 @@ export function TeamDashboard({
                   <TeammateDetailView
                     teammate={selectedTeammate}
                     messages={messages}
-                    onSendMessage={onSendMessage || (() => {})}
+                    onSendMessage={onSendMessage}
                     onSwapModel={onSwapModel}
                     onShutdown={onShutdownTeammate}
                     onEscalate={onEscalateTeammate}
@@ -392,6 +457,7 @@ export function TeamDashboard({
               <SpecCoveragePanel
                 requirements={specRequirements}
                 className="h-full"
+                onRequirementStatusChange={onSpecRequirementStatusChange}
                 onRequirementClick={(requirementId) => {
                   const matchingRequirement = specRequirements.find((req) => req.id === requirementId)
                   setHighlightedTaskIds(matchingRequirement?.linkedTaskIds || [])
@@ -416,7 +482,7 @@ export function TeamDashboard({
       {/* Task List Panel (collapsible bottom) */}
       <TaskListPanel
         tasks={tasks}
-        teammates={teammates}
+        teammates={teammatesWithTasks}
         isCollapsed={taskListCollapsed}
         onToggleCollapsed={() => setTaskListCollapsed(prev => !prev)}
         highlightedTaskIds={highlightedTaskIds}

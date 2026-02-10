@@ -5,8 +5,22 @@
  * the mention menu vs when it's part of an email address or other text.
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, vi } from 'vitest';
 import { isValidMentionTrigger } from '../mention-menu';
+
+// Implements REQ-004: stabilize renderer unit tests in Vitest by mocking PDF deps.
+// Prevent react-pdf/pdfjs from loading in this unit test
+vi.mock('react-pdf', () => ({
+  Document: () => null,
+  Page: () => null,
+  pdfjs: { GlobalWorkerOptions: {} },
+}));
+vi.mock('pdfjs-dist/build/pdf.mjs', () => ({}));
+
+// Some dependencies expect DOMMatrix to exist
+if (!globalThis.DOMMatrix) {
+  globalThis.DOMMatrix = class {} as unknown as typeof DOMMatrix;
+}
 
 describe('isValidMentionTrigger', () => {
   describe('valid triggers (should open menu)', () => {

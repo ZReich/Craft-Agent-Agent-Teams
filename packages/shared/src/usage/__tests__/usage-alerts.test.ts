@@ -26,6 +26,7 @@ function createMockSession(overrides: Partial<SessionUsage> = {}): SessionUsage 
         outputTokens: 500,
         estimatedCostUsd: 0.15,
       },
+      openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
       moonshot: {
         callCount: 0,
         inputTokens: 0,
@@ -184,7 +185,8 @@ describe('UsageAlertChecker', () => {
         totalCalls: 0,
         providers: {
           anthropic: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
-          moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
           openrouter: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
         },
       });

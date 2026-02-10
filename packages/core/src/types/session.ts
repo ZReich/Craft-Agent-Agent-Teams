@@ -13,6 +13,7 @@ import type { SpecComplianceReport } from './sdd.ts';
  * Agents can update this to reflect the current state of the conversation
  */
 export type SessionStatus = 'todo' | 'in_progress' | 'needs_review' | 'done' | 'cancelled';
+export type SessionLlmProvider = 'anthropic' | 'openai' | 'moonshot' | 'openrouter';
 
 /**
  * Session represents a conversation scope (SDK session = our scope boundary)
@@ -37,6 +38,9 @@ export interface Session {
   teamId?: string;               // If this session is part of a team, the team ID
   isTeamLead?: boolean;          // Whether this session is the team lead
   parentTeamSessionId?: string;  // For teammate sessions: the lead session ID
+  // LLM metadata
+  llmProvider?: SessionLlmProvider; // Canonical provider used by this session
+  model?: string;                // Concrete model ID used by this session
   // SDD
   sddEnabled?: boolean;          // Spec mode toggle per session
   activeSpecId?: string;         // Currently active spec
@@ -75,6 +79,9 @@ export interface SessionMetadata {
   // Agent Teams
   teamId?: string;         // If this session is part of a team
   isTeamLead?: boolean;    // Whether this is the team lead session
+  // LLM metadata
+  llmProvider?: SessionLlmProvider;
+  model?: string;
   // SDD
   sddEnabled?: boolean;
   activeSpecId?: string;

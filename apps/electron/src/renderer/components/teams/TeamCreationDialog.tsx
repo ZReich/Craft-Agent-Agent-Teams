@@ -7,7 +7,7 @@
  */
 
 import * as React from 'react'
-import { useState, useCallback, useMemo } from 'react'
+import { useState, useCallback, useMemo, useEffect } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import {
   Dialog,
@@ -33,6 +33,8 @@ interface TeammateConfig {
 export interface TeamCreationDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  defaultPreset?: ModelPresetId
+  lockPresetSelection?: boolean
   onCreateTeam: (config: {
     name: string
     teammates: TeammateConfig[]
@@ -50,19 +52,26 @@ const PRESET_OPTIONS: { id: ModelPresetId; name: string; cost: string; descripti
 ]
 
 const DEFAULT_TEAMMATES: TeammateConfig[] = [
-  { name: 'Frontend', role: 'frontend-specialist', model: 'auto' },
-  { name: 'Backend', role: 'backend-specialist', model: 'auto' },
-  { name: 'Tests', role: 'test-engineer', model: 'auto' },
+  { name: 'Head', role: 'head', model: 'auto' },
+  { name: 'Worker A', role: 'worker', model: 'auto' },
+  { name: 'Worker B', role: 'worker', model: 'auto' },
 ]
 
 export function TeamCreationDialog({
   open,
   onOpenChange,
+  defaultPreset = 'cost-optimized',
+  lockPresetSelection = false,
   onCreateTeam,
 }: TeamCreationDialogProps) {
   const [teamName, setTeamName] = useState('')
-  const [selectedPreset, setSelectedPreset] = useState<ModelPresetId>('cost-optimized')
+  const [selectedPreset, setSelectedPreset] = useState<ModelPresetId>(defaultPreset)
   const [teammates, setTeammates] = useState<TeammateConfig[]>(DEFAULT_TEAMMATES)
+
+  // Implements REQ-001: default preset to workspace settings when provided
+  useEffect(() => {
+    setSelectedPreset(defaultPreset)
+  }, [defaultPreset])
 
   const handleAddTeammate = useCallback(() => {
     setTeammates(prev => [...prev, { name: '', role: '', model: 'auto' }])
@@ -139,11 +148,14 @@ export function TeamCreationDialog({
                   key={preset.id}
                   type="button"
                   onClick={() => setSelectedPreset(preset.id)}
+                  disabled={lockPresetSelection}
+                  title={lockPresetSelection ? 'Preset is managed by workspace settings' : undefined}
                   className={cn(
                     'flex flex-col items-start rounded-lg border p-3 text-left transition-colors',
                     selectedPreset === preset.id
                       ? 'border-foreground/30 bg-foreground/5'
-                      : 'border-border hover:border-foreground/20 hover:bg-foreground/[0.02]'
+                      : 'border-border hover:border-foreground/20 hover:bg-foreground/[0.02]',
+                    lockPresetSelection && 'opacity-60 cursor-not-allowed'
                   )}
                 >
                   <div className="flex items-center gap-2">

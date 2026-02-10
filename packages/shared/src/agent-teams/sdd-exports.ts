@@ -116,6 +116,54 @@ export function exportSpecSummary(spec: Spec): string {
   return lines.join('\n');
 }
 
+/**
+ * Generate a compact, token-efficient spec summary for agent teammates.
+ * Focuses on goals, requirements, and risks only.
+ */
+export function exportCompactSpec(spec: Spec): string {
+  const lines: string[] = [];
+
+  lines.push(`# Spec (Compact): ${spec.title}`);
+  lines.push(`Owner: ${spec.ownerDRI} | Status: ${spec.status}`);
+  lines.push('');
+
+  if (spec.goals.length > 0) {
+    lines.push('Goals:');
+    for (const goal of spec.goals) {
+      lines.push(`- ${goal}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(`Requirements (${spec.requirements.length}):`);
+  if (spec.requirements.length > 0) {
+    for (const req of spec.requirements) {
+      lines.push(`- ${req.id} [${req.priority}] ${req.description}`);
+    }
+  } else {
+    lines.push('- None defined');
+  }
+  lines.push('');
+
+  if (spec.risks.length > 0) {
+    lines.push('Risks:');
+    for (const risk of spec.risks) {
+      lines.push(`- ${risk.id} [${risk.severity}] ${risk.description}`);
+    }
+    lines.push('');
+  }
+
+  if (spec.nonGoals.length > 0) {
+    lines.push('Out of Scope:');
+    for (const nonGoal of spec.nonGoals) {
+      lines.push(`- ${nonGoal}`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n').trim();
+}
+
 // ============================================================
 // Coverage Report Export
 // ============================================================

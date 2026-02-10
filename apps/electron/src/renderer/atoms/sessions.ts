@@ -83,6 +83,8 @@ export interface SessionMeta {
   isTeamLead?: boolean
   /** Display name for teammate sessions */
   teammateName?: string
+  /** Role label for teammate sessions */
+  teammateRole?: string
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[]
   /** Team accent color (hex) */
@@ -150,6 +152,7 @@ export function extractSessionMeta(session: Session): SessionMeta {
     isTeamLead: session.isTeamLead,
     parentSessionId: session.parentSessionId,
     teammateName: session.teammateName,
+    teammateRole: session.teammateRole,
     teammateSessionIds: session.teammateSessionIds,
     teamColor: session.teamColor,
   }

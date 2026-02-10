@@ -15,6 +15,7 @@ import type {
   QualityGateStageName,
   QualityGateStageConfig,
 } from '@craft-agent/core/types';
+import { resolveReviewProvider } from './review-provider';
 
 // ============================================================
 // Default Configuration
@@ -33,9 +34,9 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
     syntax: { enabled: true, weight: 0, binary: true },
     tests: { enabled: true, weight: 20, binary: true },
     architecture: { enabled: true, weight: 25 },
-    simplicity: { enabled: true, weight: 15 },
+    simplicity: { enabled: true, weight: 10 },
     errors: { enabled: true, weight: 25 },
-    completeness: { enabled: true, weight: 15 },
+    completeness: { enabled: true, weight: 25 },
     // SDD stages — only scored when a spec is provided at pipeline runtime
     spec_compliance: { enabled: true, weight: 20 },
     traceability: { enabled: true, weight: 15 },
@@ -256,6 +257,16 @@ export function mergeQualityGateConfig(
         };
       }
     }
+  }
+
+  // Clamp pass threshold to avoid impossible settings
+  if (typeof merged.passThreshold === 'number') {
+    merged.passThreshold = Math.min(95, Math.max(70, merged.passThreshold));
+  }
+
+  // If a review model was set without an explicit provider, infer it
+  if (!userConfig.reviewProvider && merged.reviewModel) {
+    merged.reviewProvider = resolveReviewProvider(merged.reviewModel, merged.reviewProvider);
   }
 
   return merged;

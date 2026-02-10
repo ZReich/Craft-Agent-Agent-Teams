@@ -138,6 +138,18 @@ export class AgentTeamManager extends EventEmitter {
     return this.teams.get(teamId);
   }
 
+  /** Find a team by name */
+  getTeamByName(name: string): AgentTeam | undefined {
+    return Array.from(this.teams.values()).find(team => team.name === name);
+  }
+
+  /** Resolve team identifier (id or name) to a known team id */
+  resolveTeamId(teamIdOrName: string): string {
+    if (this.teams.has(teamIdOrName)) return teamIdOrName;
+    const byName = this.getTeamByName(teamIdOrName);
+    return byName?.id ?? teamIdOrName;
+  }
+
   /** Get all active teams */
   getActiveTeams(): AgentTeam[] {
     return Array.from(this.teams.values()).filter(t => t.status === 'active');
@@ -253,12 +265,31 @@ export class AgentTeamManager extends EventEmitter {
   // ============================================================
 
   /** Create a new task */
-  createTask(teamId: string, title: string, description?: string, createdBy?: string): TeamTask {
+  createTask(
+    teamId: string,
+    title: string,
+    description?: string,
+    createdBy?: string,
+    options?: {
+      requirementIds?: string[];
+      driOwner?: string;
+      driReviewer?: string;
+      ticketLinks?: TeamTask['ticketLinks'];
+      assignee?: string;
+      dependencies?: string[];
+    }
+  ): TeamTask {
     const task: TeamTask = {
       id: `task-${randomUUID().slice(0, 8)}`,
       title,
       description,
       status: 'pending',
+      requirementIds: options?.requirementIds,
+      driOwner: options?.driOwner,
+      driReviewer: options?.driReviewer,
+      ticketLinks: options?.ticketLinks,
+      assignee: options?.assignee,
+      dependencies: options?.dependencies,
       createdAt: new Date().toISOString(),
       createdBy,
     };
@@ -361,6 +392,7 @@ export class AgentTeamManager extends EventEmitter {
       id: `act-${randomUUID().slice(0, 8)}`,
       timestamp: new Date().toISOString(),
       type,
+      teamId,
       details,
       teammateId,
       teammateName,
@@ -372,6 +404,18 @@ export class AgentTeamManager extends EventEmitter {
     this.activityLog.set(teamId, log);
 
     this.emit('activity', event);
+  }
+
+  /** Public wrapper for emitting activity events (used by session manager) */
+  logActivity(
+    teamId: string,
+    type: TeamActivityType,
+    details: string,
+    teammateId?: string,
+    teammateName?: string,
+    taskId?: string
+  ): void {
+    this.addActivity(teamId, type, details, teammateId, teammateName, taskId);
   }
 
   /** Get activity log for a team */

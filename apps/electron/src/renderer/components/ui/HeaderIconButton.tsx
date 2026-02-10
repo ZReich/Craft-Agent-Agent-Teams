@@ -19,10 +19,12 @@ interface HeaderIconButtonProps extends React.ButtonHTMLAttributes<HTMLButtonEle
 
 export const HeaderIconButton = forwardRef<HTMLButtonElement, HeaderIconButtonProps>(
   ({ icon, tooltip, className, ...props }, ref) => {
+    const ariaLabel = props['aria-label'] ?? tooltip
     const button = (
       <button
         ref={ref}
         type="button"
+        aria-label={ariaLabel}
         className={cn(
           "inline-flex items-center justify-center",
           "h-7 w-7 shrink-0 rounded-[4px] titlebar-no-drag",

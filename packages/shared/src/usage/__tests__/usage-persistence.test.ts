@@ -26,6 +26,7 @@ function createMockSessionUsage(overrides: Partial<SessionUsage> = {}): SessionU
         outputTokens: 500,
         estimatedCostUsd: 0.15,
       },
+      openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
       moonshot: {
         callCount: 0,
         inputTokens: 0,
@@ -196,7 +197,8 @@ describe('UsagePersistence', () => {
             outputTokens: 250,
             estimatedCostUsd: 0.08,
           },
-          moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
           openrouter: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
         },
         totalCalls: 3,
@@ -291,7 +293,8 @@ describe('UsagePersistence', () => {
             outputTokens: 500,
             estimatedCostUsd: 0.15,
           },
-          moonshot: {
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: {
             callCount: 3,
             inputTokens: 800,
             outputTokens: 400,
@@ -346,7 +349,8 @@ describe('UsagePersistence', () => {
             outputTokens: 300,
             estimatedCostUsd: 0.09,
           },
-          moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
           openrouter: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
         },
       });
@@ -362,7 +366,8 @@ describe('UsagePersistence', () => {
             outputTokens: 500,
             estimatedCostUsd: 0.15,
           },
-          moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
           openrouter: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
         },
       });
@@ -506,7 +511,8 @@ describe('UsagePersistence', () => {
       const usage = createMockSessionUsage({
         providers: {
           anthropic: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
-          moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
           openrouter: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
         },
         totalCalls: 0,
@@ -529,7 +535,8 @@ describe('UsagePersistence', () => {
       const usage = createMockSessionUsage({
         providers: {
           anthropic: { callCount: 5, inputTokens: 1000, outputTokens: 500, estimatedCostUsd: 0.15 },
-          moonshot: { callCount: 10, inputTokens: 2000, outputTokens: 1000, estimatedCostUsd: 0.20 },
+          openai: { callCount: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      moonshot: { callCount: 10, inputTokens: 2000, outputTokens: 1000, estimatedCostUsd: 0.20 },
           openrouter: { callCount: 3, inputTokens: 500, outputTokens: 250, estimatedCostUsd: 0.08 },
         },
         totalCalls: 18,

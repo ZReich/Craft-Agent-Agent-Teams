@@ -8,14 +8,14 @@
  * - IPC now returns null for missing files instead of throwing
  * - All consumers must handle null gracefully without crashing
  */
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 // ============================================================================
 // Mock Setup
 // ============================================================================
 
 // Mock window.electronAPI
-const mockReadWorkspaceImage = mock((workspaceId: string, path: string) => Promise.resolve(null as string | null))
+const mockReadWorkspaceImage = vi.fn((workspaceId: string, path: string) => Promise.resolve(null as string | null))
 
 // We need to mock the window object before importing the module
 const originalWindow = globalThis.window

@@ -514,6 +514,9 @@ function AppShellContent({
   })
   // Effective focus mode combines prop-based (immutable) and state-based (toggleable)
   const effectiveFocusMode = isFocusedMode || isFocusModeActive
+  const handleToggleFocusMode = useCallback(() => {
+    setIsFocusModeActive((prev) => !prev)
+  }, [])
 
   // Window width tracking for responsive behavior
   const [windowWidth, setWindowWidth] = React.useState(window.innerWidth)
@@ -1020,7 +1023,7 @@ function AppShellContent({
   useAction('view.toggleSidebar', () => setIsSidebarVisible(v => !v))
 
   // Focus mode toggle (CMD+.) - hides both sidebars
-  useAction('view.toggleFocusMode', () => setIsFocusModeActive(v => !v))
+  useAction('view.toggleFocusMode', handleToggleFocusMode)
 
   // New chat
   useAction('app.newChat', () => handleNewChat(true))
@@ -1470,7 +1473,10 @@ function AppShellContent({
     isSearchModeActive: searchActive,
     chatDisplayRef,
     onChatMatchInfoChange: handleChatMatchInfoChange,
-  }), [contextValue, handleDeleteSession, sources, skills, labelConfigs, handleSessionLabelsChange, enabledModes, effectiveTodoStates, handleSessionSourcesChange, rightSidebarOpenButton, searchActive, searchQuery, handleChatMatchInfoChange])
+    isFocusModeActive: effectiveFocusMode,
+    onToggleFocusMode: handleToggleFocusMode,
+    onSetFocusMode: setIsFocusModeActive,
+  }), [contextValue, handleDeleteSession, sources, skills, labelConfigs, handleSessionLabelsChange, enabledModes, effectiveTodoStates, handleSessionSourcesChange, rightSidebarOpenButton, searchActive, searchQuery, handleChatMatchInfoChange, effectiveFocusMode, handleToggleFocusMode])
 
   // Persist expanded folders to localStorage (workspace-scoped)
   React.useEffect(() => {
@@ -1496,10 +1502,10 @@ function AppShellContent({
   // Listen for focus mode toggle from menu (View → Focus Mode)
   React.useEffect(() => {
     const cleanup = window.electronAPI.onMenuToggleFocusMode?.(() => {
-      setIsFocusModeActive(v => !v)
+      handleToggleFocusMode()
     })
     return cleanup
-  }, [])
+  }, [handleToggleFocusMode])
 
   // Listen for sidebar toggle from menu (View → Toggle Sidebar)
   React.useEffect(() => {
@@ -2030,7 +2036,7 @@ function AppShellContent({
               canGoBack={canGoBack}
               canGoForward={canGoForward}
               onToggleSidebar={() => setIsSidebarVisible(prev => !prev)}
-              onToggleFocusMode={() => setIsFocusModeActive(prev => !prev)}
+              onToggleFocusMode={handleToggleFocusMode}
             />
           </motion.div>
         )

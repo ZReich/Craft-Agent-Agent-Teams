@@ -467,6 +467,12 @@ export function generateCodexConfig(options: CodexConfigGeneratorOptions): Codex
   sections.push(generateSandboxSection());
   sections.push('');
 
+  // NOTE: Do NOT enable [features] collab = true here.
+  // Codex native collab tools (spawnAgent/sendInput/wait/closeAgent) bypass PreToolUse entirely —
+  // there is no 'collab' ToolCallType, so we cannot intercept them.
+  // Agent teams work through MCP tools (Task/SendMessage/TeamCreate) from the session MCP server,
+  // which arrive as toolType='mcp' and ARE intercepted by handleToolCallPreExecute.
+
   // Add custom model provider if configured (OpenRouter, Vercel AI Gateway, etc.)
   if (modelProvider) {
     sections.push('# Custom Model Provider');

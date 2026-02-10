@@ -2,7 +2,7 @@ import { app } from 'electron'
 import * as Sentry from '@sentry/electron/main'
 import { basename, join } from 'path'
 import { homedir } from 'os'
-import { existsSync } from 'fs'
+import { existsSync, watch } from 'fs'
 import { rm, readFile, mkdir, writeFile, rename, open } from 'fs/promises'
 import { CraftAgent, type AgentEvent, setPermissionMode, type PermissionMode, unregisterSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest } from '@craft-agent/shared/agent'
 import {
@@ -21,6 +21,7 @@ import {
   type CredentialCacheEntry,
 } from '@craft-agent/shared/codex'
 import { getLlmConnection, getDefaultLlmConnection } from '@craft-agent/shared/config'
+import type { LlmConnection } from '@craft-agent/shared/config/llm-connections'
 import { sessionLog, isDebugMode, getLogFilePath } from './logger'
 import { createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import type { WindowManager } from './window-manager'
@@ -76,15 +77,21 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { generateSessionTitle, regenerateSessionTitle, formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon, type TitleGeneratorOptions } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta, QualityGateConfig, SpecComplianceReport } from '@craft-agent/core/types'
+import type { ToolDisplayMeta, QualityGateConfig, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
 import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
+import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
+import { resolveTeamModelForRole } from '@craft-agent/shared/agent-teams/model-resolution'
 import { DEFAULT_MODEL, getToolIconsDir, isCodexModel, getMiniModel, getSummarizationModel } from '@craft-agent/shared/config'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
 import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
 import { listLabels } from '@craft-agent/shared/labels/storage'
 import { extractLabelId } from '@craft-agent/shared/labels'
 import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
+import { calculateTokenCostUsd, inferProviderFromModel, type UsageProvider } from '@craft-agent/shared/usage'
+import { UsagePersistence, UsageAlertChecker } from '@craft-agent/shared/usage'
+import type { SessionUsage as PersistedSessionUsage, UsageAlert, UsageAlertThresholds } from '@craft-agent/core'
+import type { FSWatcher } from 'fs'
 
 /**
  * Sanitize message content for use as session title.
@@ -142,6 +149,62 @@ function getBundledBunPath(): string | undefined {
   return undefined
 }
 
+function normalizeModelList(models?: Array<{ id: string } | string>): string[] {
+  if (!models) return []
+  return models
+    .map(model => (typeof model === 'string' ? model : model.id))
+    .filter(Boolean)
+}
+
+function connectionSupportsModel(connection: LlmConnection, model: string): boolean {
+  if (connection.defaultModel === model) return true
+  const normalizedModels = normalizeModelList(connection.models)
+  return normalizedModels.includes(model)
+}
+
+function isMoonshotConnection(connection: LlmConnection): boolean {
+  const name = connection.name?.toLowerCase?.() ?? ''
+  const baseUrl = connection.baseUrl?.toLowerCase?.() ?? ''
+  return name.includes('moonshot') || name.includes('kimi') || baseUrl.includes('moonshot')
+}
+
+function resolveConnectionForModel(options: {
+  model: string
+  parentConnectionSlug?: string
+  workspaceDefaultSlug?: string
+}): string | undefined {
+  const { model, parentConnectionSlug, workspaceDefaultSlug } = options
+  const connections = getLlmConnections()
+
+  const parent = parentConnectionSlug ? getLlmConnection(parentConnectionSlug) : null
+  if (parent && connectionSupportsModel(parent, model)) return parent.slug
+
+  const workspaceDefault = workspaceDefaultSlug ? getLlmConnection(workspaceDefaultSlug) : null
+  if (workspaceDefault && connectionSupportsModel(workspaceDefault, model)) return workspaceDefault.slug
+
+  const provider = inferProviderFromModel(model)
+  const providerOrder: Array<LlmConnection['providerType']> = provider === 'openai'
+    ? ['openai']
+    : provider === 'anthropic'
+      ? ['anthropic', 'anthropic_compat', 'bedrock', 'vertex']
+      : ['openai_compat', 'anthropic_compat']
+
+  const supported = connections.filter(conn => connectionSupportsModel(conn, model))
+  for (const providerType of providerOrder) {
+    const match = supported.find(conn => conn.providerType === providerType)
+    if (match) return match.slug
+  }
+
+  if (provider === 'moonshot') {
+    const moonshotConn = connections.find(conn =>
+      conn.providerType === 'openai_compat' && isMoonshotConnection(conn)
+    )
+    if (moonshotConn) return moonshotConn.slug
+  }
+
+  return undefined
+}
+
 /**
  * Feature flags for agent behavior
  */
@@ -163,6 +226,262 @@ const TEAM_COLORS = [
   '#0f766e', // teal
   '#be185d', // pink
 ] as const
+
+function extractSectionLines(lines: string[], heading: string): string[] {
+  const startIndex = lines.findIndex(line => line.trim().toLowerCase() === heading.toLowerCase())
+  if (startIndex === -1) return []
+  const sectionLines: string[] = []
+  for (let i = startIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (line.trim().startsWith('## ')) break
+    sectionLines.push(line)
+  }
+  return sectionLines
+}
+
+function parsePriority(raw?: string): SpecRequirement['priority'] {
+  switch ((raw ?? '').toLowerCase()) {
+    case 'critical':
+      return 'critical'
+    case 'high':
+      return 'high'
+    case 'low':
+      return 'low'
+    default:
+      return 'medium'
+  }
+}
+
+function parseStatus(raw?: string): SpecRequirement['status'] {
+  switch ((raw ?? '').trim().toLowerCase()) {
+    case 'in-progress':
+      return 'in-progress'
+    case 'implemented':
+      return 'implemented'
+    case 'verified':
+      return 'verified'
+    default:
+      return 'pending'
+  }
+}
+
+export function parseSpecMarkdown(markdown: string, specId: string): Spec {
+  const lines = markdown.split(/\r?\n/)
+  const titleLine = lines.find(line => line.trim().startsWith('# ')) ?? '# Untitled Spec'
+  const title = titleLine.replace(/^#\s*/, '').trim()
+  const ownerMatch = lines.find(line => /DRI:/i.test(line))?.match(/DRI:\s*([^<]+)$/i)
+  const ownerDRI = ownerMatch?.[1]?.trim() ?? 'Unassigned'
+
+  const goals = extractSectionLines(lines, '## Goals')
+    .map(line => line.replace(/^[\s*-]+/, '').trim())
+    .filter(Boolean)
+  const nonGoals = extractSectionLines(lines, '## Non-Goals')
+    .map(line => line.replace(/^[\s*-]+/, '').trim())
+    .filter(Boolean)
+  const acceptanceTests = extractSectionLines(lines, '## Acceptance Tests')
+    .map(line => line.replace(/^[\s*-]+/, '').trim())
+    .filter(Boolean)
+  const riskLines = extractSectionLines(lines, '## Risks')
+    .map(line => line.replace(/^[\s*-]+/, '').trim())
+    .filter(Boolean)
+
+  const requirementLines = extractSectionLines(lines, '## Requirements')
+    .map(line => line.trim())
+    .filter(line => line.startsWith('-'))
+  const requirements: SpecRequirement[] = requirementLines.map((line, index) => {
+    const match = line.match(/\*\*(REQ-[0-9]+)\s*\(([^)]+)\):\*\*\s*(.+)$/i)
+    if (match) {
+      const metaParts = match[2].split(',').map(part => part.trim()).filter(Boolean)
+      const priorityToken = metaParts.find(part => ['critical', 'high', 'medium', 'low'].includes(part.toLowerCase()))
+      const statusToken = metaParts.find(part => part.toLowerCase().startsWith('status:'))
+      const statusValue = statusToken ? statusToken.split(':').slice(1).join(':').trim() : undefined
+      return {
+        id: match[1].trim(),
+        description: match[3].trim(),
+        priority: parsePriority(priorityToken ?? match[2]),
+        acceptanceTests,
+        assignedDRI: ownerDRI,
+        status: parseStatus(statusValue),
+      }
+    }
+    return {
+      id: `REQ-${String(index + 1).padStart(3, '0')}`,
+      description: line.replace(/^[\s*-]+/, ''),
+      priority: 'medium',
+      acceptanceTests,
+      assignedDRI: ownerDRI,
+      status: 'pending',
+    }
+  })
+
+  const risks: SpecRisk[] = riskLines.map((risk, index) => ({
+    id: `RISK-${String(index + 1).padStart(3, '0')}`,
+    description: risk,
+    severity: 'medium',
+    mitigation: '',
+    status: 'identified',
+  }))
+
+  const rolloutPlan = extractSectionLines(lines, '## Rollout Plan').join('\n').trim() || undefined
+  const rollbackPlan = extractSectionLines(lines, '## Rollback Plan').join('\n').trim() || undefined
+  const observabilityPlan = extractSectionLines(lines, '## Observability Plan').join('\n').trim() || undefined
+
+  const timestamp = new Date().toISOString()
+  return {
+    specId,
+    title,
+    ownerDRI,
+    reviewers: [],
+    status: 'in-progress',
+    goals,
+    nonGoals,
+    requirements,
+    risks,
+    mitigations: [],
+    rolloutPlan,
+    rollbackPlan,
+    testPlan: acceptanceTests.join('\n') || undefined,
+    observabilityPlan,
+    relatedTickets: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }
+}
+
+function updateRequirementStatusInMarkdown(
+  markdown: string,
+  requirementId: string,
+  status: 'pending' | 'in-progress' | 'implemented' | 'verified'
+): string {
+  const lines = markdown.split(/\r?\n/)
+  const requirementPattern = new RegExp(`^\\s*-\\s*\\*\\*(${requirementId})\\s*\\(([^)]*)\\):\\*\\*\\s*(.+)$`, 'i')
+  const updatedLines = lines.map((line) => {
+    const match = line.match(requirementPattern)
+    if (!match) return line
+    const metaParts = match[2].split(',').map((part) => part.trim()).filter(Boolean)
+    const statusIndex = metaParts.findIndex((part) => part.toLowerCase().startsWith('status:'))
+    if (statusIndex >= 0) {
+      metaParts[statusIndex] = `status: ${status}`
+    } else {
+      metaParts.push(`status: ${status}`)
+    }
+    const meta = metaParts.join(', ')
+    return `- **${match[1]} (${meta}):** ${match[3]}`
+  })
+  return updatedLines.join('\n')
+}
+
+const DEFAULT_SPEC_REQUIREMENTS = [
+  'Define the primary user flow and key success criteria.',
+  'Document data inputs/outputs and persistence needs.',
+  'Outline performance, reliability, and security expectations.',
+]
+
+const DEFAULT_SPEC_SECTIONS = [
+  'Overview',
+  'Objective',
+  'Success Metrics',
+  'Assumptions',
+  'Options / Decisions',
+  'Requirements',
+  'Acceptance Tests',
+  'Risks',
+  'Supporting Docs',
+  'Open Questions',
+  'Out of Scope',
+  'Rollout Plan',
+  'Rollback Plan',
+  'Observability Plan',
+]
+
+export function buildSpecMarkdown(options: {
+  title: string
+  ownerDRI: string
+  template?: SpecTemplate
+}): string {
+  const { title, ownerDRI, template } = options
+  const lines: string[] = []
+  lines.push(`# ${title}`)
+  lines.push('')
+  lines.push(`**DRI:** ${ownerDRI}`)
+  lines.push('')
+  lines.push('> Auto-generated spec template. Fill in the details before executing work.')
+  lines.push('')
+
+  const sections = template?.sections?.length
+    ? template.sections.map(section => section.label)
+    : DEFAULT_SPEC_SECTIONS
+
+  const requirementPriority = template?.defaultRequirementPriority ?? 'medium'
+  let requirementIndex = 1
+  let riskIndex = 1
+
+  for (const sectionLabel of sections) {
+    lines.push(`## ${sectionLabel}`)
+    lines.push('')
+
+    const normalized = sectionLabel.trim().toLowerCase()
+    if (normalized.includes('overview')) {
+      lines.push('| Field | Value |')
+      lines.push('| --- | --- |')
+      lines.push('| Status | Draft |')
+      lines.push(`| Owner DRI | ${ownerDRI} |`)
+      lines.push('| Reviewers | TBD |')
+      lines.push('| Target Release | TBD |')
+      lines.push(`| Last Updated | ${new Date().toISOString().split('T')[0]} |`)
+    } else if (normalized.includes('objective')) {
+      lines.push('Describe the primary objective and expected impact.')
+    } else if (normalized.includes('success metrics') || normalized.includes('success')) {
+      lines.push('| Metric | Target | Owner |')
+      lines.push('| --- | --- | --- |')
+      lines.push('| TBD | TBD | TBD |')
+    } else if (normalized.includes('assumption')) {
+      lines.push('- List assumptions that must hold true.')
+    } else if (normalized.includes('options')) {
+      lines.push('| Option | Decision | Notes |')
+      lines.push('| --- | --- | --- |')
+      lines.push('| TBD | TBD | TBD |')
+    } else if (normalized.includes('requirement')) {
+      DEFAULT_SPEC_REQUIREMENTS.forEach((req) => {
+        lines.push(`- **REQ-${String(requirementIndex).padStart(3, '0')} (${requirementPriority}):** ${req}`)
+        requirementIndex += 1
+      })
+    } else if (normalized.includes('risk')) {
+      lines.push(`- **RISK-${String(riskIndex).padStart(3, '0')} (medium):** Describe the risk and mitigation.`)
+      riskIndex += 1
+    } else if (normalized.includes('acceptance')) {
+      lines.push('- Define clear acceptance tests or success metrics.')
+    } else if (normalized.includes('supporting') || normalized.includes('docs')) {
+      lines.push('- Link to designs, diagrams, or reference docs.')
+    } else if (normalized.includes('open question')) {
+      lines.push('- List unanswered questions or dependencies.')
+    } else if (normalized.includes('out of scope')) {
+      lines.push('- Explicitly list non-goals or exclusions.')
+    } else if (normalized.includes('rollout')) {
+      lines.push('Describe rollout steps, feature flags, and monitoring.')
+    } else if (normalized.includes('rollback')) {
+      lines.push('Describe rollback steps and fallback behavior.')
+    } else if (normalized.includes('observability') || normalized.includes('monitoring')) {
+      lines.push('List logs, metrics, and alerts needed to validate success.')
+    } else {
+      lines.push('- TODO')
+    }
+
+    lines.push('')
+  }
+
+  return lines.join('\n').trim() + '\n'
+}
+
+export function buildTeammatePromptWithCompactSpec(
+  prompt: string,
+  compactSpecContext?: string | null
+): string {
+  if (compactSpecContext && compactSpecContext.trim().length > 0) {
+    return `${prompt}\n\n<compact_spec>\n${compactSpecContext}\n</compact_spec>`
+  }
+  return prompt
+}
 
 /**
  * Build MCP and API servers from sources using the new unified modules.
@@ -638,6 +957,8 @@ interface ManagedSession {
   sharedId?: string
   // Model to use for this session (overrides global config if set)
   model?: string
+  // Canonical provider used for usage tracking and pricing
+  llmProvider?: UsageProvider
   // LLM connection slug for this session (locked after first message)
   llmConnection?: string
   // Whether the connection is locked (cannot be changed after first agent creation)
@@ -703,10 +1024,52 @@ interface ManagedSession {
   sddComplianceReports?: SpecComplianceReport[]
   // Token refresh manager for OAuth token refresh with rate limiting
   tokenRefreshManager: TokenRefreshManager
+  // Multi-provider usage tracking summary for this session
+  usageSummary?: SessionUsage
   // Deduplication: track last sent message content and timestamp to prevent double-sends
   // (renderer sometimes sends the same message twice within ~100-200ms)
   lastSendDedup?: { content: string; timestamp: number }
 }
+
+function createEmptyProviderUsage(): ProviderUsage {
+  return {
+    callCount: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+  }
+}
+
+function getISOWeekNumber(date: Date): number {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+  const dayNum = d.getUTCDay() || 7
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum)
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
+  return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+}
+
+function createEmptySessionUsage(sessionId: string, startedAtMs: number): SessionUsage {
+  const nowIso = new Date().toISOString()
+  const date = new Date(startedAtMs || Date.now())
+  const weekNumber = getISOWeekNumber(date)
+
+  return {
+    sessionId,
+    startedAt: new Date(startedAtMs || Date.now()).toISOString(),
+    lastUpdatedAt: nowIso,
+    weekIdentifier: `${date.getFullYear()}-W${String(weekNumber).padStart(2, '0')}`,
+    providers: {
+      anthropic: createEmptyProviderUsage(),
+      openai: createEmptyProviderUsage(),
+      moonshot: createEmptyProviderUsage(),
+      openrouter: createEmptyProviderUsage(),
+    },
+    totalCalls: 0,
+    totalDurationMs: 0,
+  }
+}
+
+type UsageProviderKey = 'anthropic' | 'openai' | 'moonshot' | 'openrouter'
 
 // Convert runtime Message to StoredMessage for persistence
 // Only excludes transient field: isStreaming
@@ -829,6 +1192,9 @@ export class SessionManager {
   private deltaFlushTimers: Map<string, NodeJS.Timeout> = new Map()
   // Config watchers for live updates (sources, etc.) - one per workspace
   private configWatchers: Map<string, ConfigWatcher> = new Map()
+  // SDD compliance report watchers - one per session
+  private complianceWatchers: Map<string, FSWatcher> = new Map()
+  private complianceSyncTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
   // Pending credential request resolvers (keyed by requestId)
   private pendingCredentialResolvers: Map<string, (response: import('../shared/types').CredentialResponse) => void> = new Map()
   // Promise deduplication for lazy-loading messages (prevents race conditions)
@@ -843,6 +1209,9 @@ export class SessionManager {
   // Quality gate runner (lazy-initialized) and cycle tracking
   private qualityGateRunner: QualityGateRunner | null = null
   private qualityGateCycles: Map<string, number> = new Map()
+  private usagePersistenceByWorkspace: Map<string, UsagePersistence> = new Map()
+  private usageAlertCheckerByWorkspace: Map<string, UsageAlertChecker> = new Map()
+  private emittedUsageAlertKeys: Set<string> = new Set()
 
   private getQualityGateRunner(): QualityGateRunner {
     if (!this.qualityGateRunner) {
@@ -874,6 +1243,216 @@ export class SessionManager {
 
   setWindowManager(wm: WindowManager): void {
     this.windowManager = wm
+  }
+
+  getWorkspaceIdForSession(sessionId: string): string | null {
+    return this.sessions.get(sessionId)?.workspace.id ?? null
+  }
+
+  getUsageThresholds(workspaceId: string): UsageAlertThresholds {
+    return this.getUsageAlertChecker(workspaceId).getThresholds()
+  }
+
+  setUsageThresholds(workspaceId: string, thresholds: Partial<UsageAlertThresholds>): UsageAlertThresholds {
+    const checker = this.getUsageAlertChecker(workspaceId)
+    checker.updateThresholds(thresholds)
+    return checker.getThresholds()
+  }
+
+  private getUsagePersistence(workspaceId: string): UsagePersistence {
+    let persistence = this.usagePersistenceByWorkspace.get(workspaceId)
+    if (!persistence) {
+      persistence = new UsagePersistence(workspaceId)
+      this.usagePersistenceByWorkspace.set(workspaceId, persistence)
+    }
+    return persistence
+  }
+
+  private getUsageAlertChecker(workspaceId: string): UsageAlertChecker {
+    let checker = this.usageAlertCheckerByWorkspace.get(workspaceId)
+    if (!checker) {
+      checker = new UsageAlertChecker()
+      this.usageAlertCheckerByWorkspace.set(workspaceId, checker)
+    }
+    return checker
+  }
+
+  private resolvePrimaryUsageProvider(managed: ManagedSession): UsageProviderKey {
+    if (managed.llmProvider) return managed.llmProvider
+    const connection = managed.llmConnection ? getLlmConnection(managed.llmConnection) : null
+    if (connection?.providerType === 'openai') {
+      return 'openai'
+    }
+    if (connection?.providerType === 'openai_compat') {
+      return inferProviderFromModel(managed.model || connection.defaultModel)
+    }
+    if (connection) return 'anthropic'
+    return inferProviderFromModel(managed.model)
+  }
+
+  private mapTeammateProvider(provider?: string): UsageProviderKey {
+    if (provider === 'openai') return 'openai'
+    if (provider === 'moonshot') return 'moonshot'
+    if (provider === 'openrouter') return 'openrouter'
+    if (provider === 'anthropic') return 'anthropic'
+    return 'anthropic'
+  }
+
+  private buildSessionUsageSnapshot(managed: ManagedSession): PersistedSessionUsage {
+    const now = new Date()
+    const persistence = this.getUsagePersistence(managed.workspace.id)
+    const weekIdentifier = persistence.getWeekIdentifier(now)
+    const startedAtMs = managed.createdAt ?? managed.lastMessageAt ?? now.getTime()
+    const base = managed.usageSummary
+      ? JSON.parse(JSON.stringify(managed.usageSummary)) as PersistedSessionUsage
+      : createEmptySessionUsage(managed.id, startedAtMs)
+
+    base.weekIdentifier = weekIdentifier
+    base.lastUpdatedAt = now.toISOString()
+    base.totalDurationMs = Math.max(0, now.getTime() - startedAtMs)
+
+    // Backfill legacy sessions from tokenUsage if no turn-level usage has been captured yet.
+    const hasProviderCalls = Object.values(base.providers).some(p => p.callCount > 0)
+    if (!hasProviderCalls && managed.tokenUsage) {
+      const provider = this.resolvePrimaryUsageProvider(managed)
+      const inputTokens = managed.tokenUsage.inputTokens ?? 0
+      const outputTokens = managed.tokenUsage.outputTokens ?? 0
+      const costUsd = managed.tokenUsage.costUsd ?? calculateTokenCostUsd({
+        model: managed.model,
+        provider,
+        inputTokens,
+        outputTokens,
+        cachedInputTokens: managed.tokenUsage.cacheReadTokens,
+      })
+      base.providers[provider].inputTokens += inputTokens
+      base.providers[provider].outputTokens += outputTokens
+      base.providers[provider].estimatedCostUsd += costUsd
+      if (inputTokens > 0 || outputTokens > 0 || costUsd > 0) {
+        base.providers[provider].callCount += 1
+      }
+      base.totalCalls = Object.values(base.providers).reduce((sum, p) => sum + p.callCount, 0)
+    }
+
+    if (managed.isTeamLead && managed.teammateSessionIds?.length) {
+      this.updateLeadTeamUsageFromTeammate(managed)
+      if (managed.usageSummary?.teamUsage) {
+        base.teamUsage = JSON.parse(JSON.stringify(managed.usageSummary.teamUsage)) as PersistedSessionUsage['teamUsage']
+      }
+    } else if (managed.teamId && !base.teamUsage) {
+      // Fallback to in-memory team manager state if available
+      const team = teamManager.getTeam(teamManager.resolveTeamId(managed.teamId))
+      if (team) {
+        const perTeammate: NonNullable<PersistedSessionUsage['teamUsage']>['perTeammate'] = {}
+        const perModel: NonNullable<PersistedSessionUsage['teamUsage']>['perModel'] = {}
+        let totalTeamCostUsd = 0
+
+        for (const member of team.members) {
+          const usage = member.tokenUsage ?? { inputTokens: 0, outputTokens: 0, costUsd: 0 }
+          const providerKey = this.mapTeammateProvider(member.provider)
+          base.providers[providerKey].inputTokens += usage.inputTokens
+          base.providers[providerKey].outputTokens += usage.outputTokens
+          base.providers[providerKey].estimatedCostUsd += usage.costUsd
+          totalTeamCostUsd += usage.costUsd
+
+          perTeammate[member.id] = {
+            name: member.name,
+            model: member.model,
+            provider: member.provider,
+            role: member.role,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            costUsd: usage.costUsd,
+            callCount: 0,
+          }
+
+          if (!perModel[member.model]) {
+            perModel[member.model] = { inputTokens: 0, outputTokens: 0, costUsd: 0, callCount: 0 }
+          }
+          perModel[member.model].inputTokens += usage.inputTokens
+          perModel[member.model].outputTokens += usage.outputTokens
+          perModel[member.model].costUsd += usage.costUsd
+        }
+
+        base.teamUsage = {
+          teamId: team.id,
+          teammateCount: team.members.length,
+          totalTeamCostUsd,
+          perTeammate,
+          perModel,
+        }
+      }
+    }
+
+    return base
+  }
+
+  private async rebuildWeeklyUsageFromSnapshots(workspaceId: string, weekIdentifier: string): Promise<void> {
+    const persistence = this.getUsagePersistence(workspaceId)
+    const weeklyPath = join(
+      homedir(),
+      '.craft-agent',
+      'workspaces',
+      workspaceId,
+      'usage',
+      `weekly-${weekIdentifier}.json`
+    )
+
+    // Rebuild from scratch to avoid duplicate session entries when saving periodic snapshots.
+    await rm(weeklyPath, { force: true }).catch(() => undefined)
+
+    const workspaceSessions = Array.from(this.sessions.values()).filter(s => s.workspace.id === workspaceId)
+    for (const session of workspaceSessions) {
+      const usage = await persistence.loadSessionUsage(session.id)
+      if (usage && usage.weekIdentifier === weekIdentifier) {
+        await persistence.recordSessionEnd(session.id, usage)
+      }
+    }
+  }
+
+  private emitUsageCostUpdate(workspaceId: string, usage: PersistedSessionUsage): void {
+    if (!this.windowManager) return
+
+    for (const window of this.windowManager.getAllWindowsForWorkspace(workspaceId)) {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed() && window.webContents.mainFrame) {
+        window.webContents.send(IPC_CHANNELS.USAGE_COST_UPDATE, usage)
+      }
+    }
+  }
+
+  private emitUsageAlert(workspaceId: string, alert: UsageAlert): void {
+    if (!this.windowManager) return
+
+    const alertKey = `${workspaceId}:${alert.type}:${alert.message}`
+    if (this.emittedUsageAlertKeys.has(alertKey)) {
+      return
+    }
+    this.emittedUsageAlertKeys.add(alertKey)
+
+    for (const window of this.windowManager.getAllWindowsForWorkspace(workspaceId)) {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed() && window.webContents.mainFrame) {
+        window.webContents.send(IPC_CHANNELS.USAGE_ALERT, alert)
+      }
+    }
+  }
+
+  private async persistAndBroadcastUsage(managed: ManagedSession): Promise<void> {
+    try {
+      const persistence = this.getUsagePersistence(managed.workspace.id)
+      const usage = this.buildSessionUsageSnapshot(managed)
+      await persistence.saveSessionUsage(managed.id, usage)
+      await this.rebuildWeeklyUsageFromSnapshots(managed.workspace.id, usage.weekIdentifier)
+
+      this.emitUsageCostUpdate(managed.workspace.id, usage)
+
+      const weekly = await persistence.getCurrentWeekUsage()
+      const checker = this.getUsageAlertChecker(managed.workspace.id)
+      const alerts = checker.checkAlerts(usage, weekly)
+      for (const alert of alerts) {
+        this.emitUsageAlert(managed.workspace.id, alert)
+      }
+    } catch (error) {
+      sessionLog.error(`Failed to persist usage snapshot for session ${managed.id}:`, error)
+    }
   }
 
   /**
@@ -1320,6 +1899,7 @@ export class SessionManager {
             workingDirectory: meta.workingDirectory ?? wsDefaultWorkingDir,
             sdkCwd: meta.sdkCwd,
             model: meta.model,
+            llmProvider: meta.llmProvider,
             llmConnection: meta.llmConnection,
             connectionLocked: meta.connectionLocked,
             thinkingLevel: meta.thinkingLevel,
@@ -1388,6 +1968,7 @@ export class SessionManager {
         workingDirectory: managed.workingDirectory,
         sdkCwd: managed.sdkCwd,
         model: managed.model,
+        llmProvider: managed.llmProvider,
         llmConnection: managed.llmConnection,
         connectionLocked: managed.connectionLocked,
         // Agent team fields
@@ -1775,6 +2356,45 @@ export class SessionManager {
   }
 
   /**
+   * Get unified usage summary for a session.
+   * Falls back to persisted tokenUsage when per-turn usage summary hasn't been built yet.
+   */
+  getSessionUsage(sessionId: string): SessionUsage | null {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) return null
+
+    const summary = this.ensureUsageSummary(managed)
+
+    // Backfill from persisted tokenUsage for sessions loaded from disk before provider-aware tracking existed.
+    if (summary.totalCalls === 0 && managed.tokenUsage) {
+      const provider = this.resolveSessionProvider(managed)
+      const inputTokens = managed.tokenUsage.inputTokens || 0
+      const outputTokens = managed.tokenUsage.outputTokens || 0
+      const costUsd = managed.tokenUsage.costUsd || calculateTokenCostUsd({
+        model: managed.model,
+        provider,
+        inputTokens,
+        outputTokens,
+        cachedInputTokens: managed.tokenUsage.cacheReadTokens,
+      })
+
+      summary.providers[provider].callCount = Math.max(summary.providers[provider].callCount, outputTokens > 0 || inputTokens > 0 ? 1 : 0)
+      summary.providers[provider].inputTokens = Math.max(summary.providers[provider].inputTokens, inputTokens)
+      summary.providers[provider].outputTokens = Math.max(summary.providers[provider].outputTokens, outputTokens)
+      summary.providers[provider].estimatedCostUsd = Math.max(summary.providers[provider].estimatedCostUsd, costUsd)
+      summary.totalCalls = Object.values(summary.providers).reduce((sum, p) => sum + p.callCount, 0)
+      summary.lastUpdatedAt = new Date().toISOString()
+    }
+
+    // Refresh team rollup for lead sessions
+    if (managed.isTeamLead && managed.teammateSessionIds?.length) {
+      this.updateLeadTeamUsageFromTeammate(managed)
+    }
+
+    return JSON.parse(JSON.stringify(summary)) as SessionUsage
+  }
+
+  /**
    * Ensure messages are loaded for a managed session.
    * Uses promise deduplication to prevent race conditions when multiple
    * concurrent calls (e.g., rapid session switches + message send) try
@@ -1805,7 +2425,12 @@ export class SessionManager {
   private async loadMessagesFromDisk(managed: ManagedSession): Promise<void> {
     const storedSession = loadStoredSession(managed.workspace.rootPath, managed.id)
     if (storedSession) {
-      managed.messages = (storedSession.messages || []).map(storedToMessage)
+      const maxLoadedMessages = 500
+      const storedMessages = storedSession.messages || []
+      const slicedMessages = storedMessages.length > maxLoadedMessages
+        ? storedMessages.slice(-maxLoadedMessages)
+        : storedMessages
+      managed.messages = slicedMessages.map(storedToMessage)
       managed.tokenUsage = storedSession.tokenUsage
       managed.lastReadMessageId = storedSession.lastReadMessageId
       managed.hasUnread = storedSession.hasUnread  // Explicit unread flag for NEW badge state machine
@@ -1818,13 +2443,20 @@ export class SessionManager {
       // Sync name from disk - ensures title persistence across lazy loading
       managed.name = storedSession.name
       // Restore LLM connection state - ensures correct provider on resume
+      if (storedSession.llmProvider) {
+        managed.llmProvider = storedSession.llmProvider
+      }
       if (storedSession.llmConnection) {
         managed.llmConnection = storedSession.llmConnection
       }
       if (storedSession.connectionLocked) {
         managed.connectionLocked = storedSession.connectionLocked
       }
-      sessionLog.debug(`Lazy-loaded ${managed.messages.length} messages for session ${managed.id}`)
+      if (storedMessages.length > maxLoadedMessages) {
+        sessionLog.info(`Lazy-loaded last ${managed.messages.length} of ${storedMessages.length} messages for session ${managed.id}`)
+      } else {
+        sessionLog.debug(`Lazy-loaded ${managed.messages.length} messages for session ${managed.id}`)
+      }
 
       // Queue recovery: find orphaned queued messages from crash/restart and re-queue them
       const orphanedQueued = managed.messages.filter(m =>
@@ -1885,7 +2517,8 @@ export class SessionManager {
     // Get default model from workspace config (used when no session-specific model is set)
     const defaultModel = wsConfig?.defaults?.model
     // Get default SDD mode from workspace config
-    const defaultSddEnabled = wsConfig?.sdd?.sddEnabled ?? false
+    const defaultSddEnabled = options?.sddEnabled ?? wsConfig?.sdd?.sddEnabled ?? false
+    const defaultSpecId = options?.activeSpecId
 
     // Resolve working directory from options:
     // - 'user_default' or undefined: Use workspace's configured default
@@ -1904,6 +2537,7 @@ export class SessionManager {
     const storedSession = await createStoredSession(workspaceRootPath, {
       permissionMode: defaultPermissionMode,
       workingDirectory: resolvedWorkingDir,
+      llmProvider: options?.llmProvider,
       hidden: options?.hidden,
       todoState: options?.todoState,
       labels: options?.labels,
@@ -1936,6 +2570,16 @@ export class SessionManager {
       resolvedModel = sessionConnection?.defaultModel ?? resolvedModel
     }
 
+    const resolvedLlmProvider: UsageProvider = (() => {
+      const providerType = sessionConnection?.providerType
+      if (providerType === 'openai') return 'openai'
+      if (providerType === 'openai_compat') return inferProviderFromModel(resolvedModel)
+      if (providerType === 'anthropic' || providerType === 'anthropic_compat' || providerType === 'bedrock' || providerType === 'vertex') {
+        return 'anthropic'
+      }
+      return inferProviderFromModel(resolvedModel)
+    })()
+
     // Log mini agent session creation
     if (options?.systemPromptPreset === 'mini' || options?.model) {
       sessionLog.info(`🤖 Creating mini agent session: model=${resolvedModel}, systemPromptPreset=${options?.systemPromptPreset}`)
@@ -1958,6 +2602,7 @@ export class SessionManager {
       sdkCwd: storedSession.sdkCwd,
       // Session-specific model takes priority, then workspace default
       model: resolvedModel,
+      llmProvider: resolvedLlmProvider,
       // LLM connection - initially undefined, will be set when model is selected
       // This allows the connection to be locked after first message
       llmConnection: options?.llmConnection,
@@ -1975,6 +2620,7 @@ export class SessionManager {
       teammateName: options?.teammateName,
       teamColor: options?.teamColor,
       sddEnabled: defaultSddEnabled,
+      activeSpecId: defaultSpecId,
       sddComplianceReports: [],
       // Initialize TokenRefreshManager for this session (handles OAuth token refresh with rate limiting)
       tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
@@ -1984,6 +2630,13 @@ export class SessionManager {
 
     this.sessions.set(storedSession.id, managed)
     this.persistSession(managed)
+
+    if (defaultSddEnabled && !defaultSpecId) {
+      await this.ensureSessionActiveSpec(storedSession.id)
+    }
+    if (defaultSddEnabled) {
+      this.startComplianceWatcher(storedSession.id)
+    }
 
     return {
       id: storedSession.id,
@@ -1998,6 +2651,7 @@ export class SessionManager {
       labels: options?.labels,
       workingDirectory: resolvedWorkingDir,
       model: managed.model,
+      llmProvider: managed.llmProvider,
       thinkingLevel: defaultThinkingLevel,
       sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
       hidden: options?.hidden,
@@ -2008,6 +2662,7 @@ export class SessionManager {
       teammateName: options?.teammateName,
       teamColor: options?.teamColor,
       sddEnabled: defaultSddEnabled,
+      activeSpecId: managed.activeSpecId,
       sddComplianceReports: [],
     }
   }
@@ -2023,6 +2678,8 @@ export class SessionManager {
     teammateName: string
     prompt: string
     model?: string
+    llmConnection?: string
+    role?: TeamRole
   }): Promise<import('../shared/types').Session> {
     const parent = this.sessions.get(params.parentSessionId)
     if (!parent) {
@@ -2044,14 +2701,69 @@ export class SessionManager {
     }
 
     // Create the teammate session
+    const workspaceConfig = loadWorkspaceConfig(parent.workspace.rootPath)
+    // Implements REQ-003: ensure an active spec when SDD is enabled
+    if (parent.sddEnabled && !parent.activeSpecId) {
+      await this.ensureSessionActiveSpec(parent.id)
+    }
+    if (parent.sddEnabled && !parent.activeSpecId) {
+      throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
+    }
+    const teammateRole: TeamRole = params.role ?? 'worker'
+    // Implements REQ-002: honor workspace role model defaults and ignore conflicting overrides
+    const requestedModel = params.model?.trim()
+    const normalizedRequestedModel = requestedModel && requestedModel !== 'auto'
+      ? requestedModel
+      : undefined
+    const resolvedAssignment = resolveTeamModelForRole(workspaceConfig, teammateRole, undefined, parent.model)
+    const configuredModel = resolvedAssignment.model && resolvedAssignment.model !== 'unknown'
+      ? resolvedAssignment.model
+      : undefined
+    if (configuredModel && normalizedRequestedModel && normalizedRequestedModel !== configuredModel) {
+      sessionLog.info(
+        `[AgentTeams] Ignoring model override "${normalizedRequestedModel}" for role ${teammateRole}; ` +
+        `using workspace model "${configuredModel}".`
+      )
+    }
+
+    // Implements REQ-001: honor workspace role model defaults for teammates
+    const teammateModel = configuredModel ?? normalizedRequestedModel ?? parent.model
+    // Implements REQ-004: choose a provider/connection compatible with the resolved model
+    const teammateConnection = resolveConnectionForModel({
+      model: teammateModel,
+      parentConnectionSlug: params.llmConnection ?? parent.llmConnection,
+      workspaceDefaultSlug: workspaceConfig?.defaults?.defaultLlmConnection,
+    })
+
+    if (!teammateConnection) {
+      // Implements REQ-004: fail fast when no compatible connection is configured
+      throw new Error(
+        `No LLM connection configured for model "${teammateModel}". ` +
+        `Please add or update a connection that supports this model before spawning teammates.`
+      )
+    }
+
+    const resolvedConnection = getLlmConnection(teammateConnection)
+    if (!resolvedConnection || !connectionSupportsModel(resolvedConnection, teammateModel)) {
+      throw new Error(
+        `Connection "${teammateConnection}" does not support model "${teammateModel}". ` +
+        `Please update the connection model list before spawning teammates.`
+      )
+    }
+
+
     const teammateSession = await this.createSession(params.workspaceId, {
       teamId: params.teamId,
       parentSessionId: params.parentSessionId,
       teammateName: params.teammateName,
+      teammateRole: params.role,
       teamColor,
       permissionMode: 'allow-all',
       workingDirectory: parent.workingDirectory,
-      model: params.model,
+      model: teammateModel,
+      llmConnection: teammateConnection,
+      sddEnabled: parent.sddEnabled,
+      activeSpecId: parent.activeSpecId,
     })
 
     // Track teammate in parent
@@ -2073,11 +2785,53 @@ export class SessionManager {
       teamColor,
     }, parent.workspace.id)
 
+    // Implements REQ-001: emit team activity for spawn tracing
+    const resolvedTeamId = teamManager.resolveTeamId(params.teamId)
+    teamManager.logActivity(
+      resolvedTeamId,
+      'teammate-spawned',
+      `${params.teammateName} spawned`,
+      teammateSession.id,
+      params.teammateName
+    )
+
+    // Build compact spec context + task metadata for teammates when SDD is enabled
+    let compactSpecContext: string | null = null
+    let parsedSpec: Spec | null = null
+    if (parent.sddEnabled && parent.activeSpecId && existsSync(parent.activeSpecId)) {
+      try {
+        const specContent = await readFile(parent.activeSpecId, 'utf-8')
+        parsedSpec = parseSpecMarkdown(specContent, parent.activeSpecId)
+        compactSpecContext = exportCompactSpec(parsedSpec)
+      } catch (err) {
+        sessionLog.warn(`[AgentTeams] Failed to build compact spec for ${parent.activeSpecId}:`, err)
+      }
+    }
+
+    if (parent.sddEnabled && parsedSpec) {
+      const requirementIds = parsedSpec.requirements.map(req => req.id)
+      const task = teamManager.createTask(
+        resolvedTeamId,
+        `${params.teammateName} task`,
+        params.prompt,
+        parent.id,
+        {
+          requirementIds,
+          driOwner: parsedSpec.ownerDRI,
+          assignee: teammateSession.id,
+        }
+      )
+      // Implements REQ-002: bind task to teammate + mark in progress
+      teamManager.updateTaskStatus(resolvedTeamId, task.id, 'in_progress', teammateSession.id)
+    }
+
+    const teammatePrompt = buildTeammatePromptWithCompactSpec(params.prompt, compactSpecContext)
+
     // Kick off the teammate by sending the prompt
     // Use setTimeout to avoid blocking the caller
     setTimeout(async () => {
       try {
-        await this.sendMessage(teammateSession.id, params.prompt)
+        await this.sendMessage(teammateSession.id, teammatePrompt)
       } catch (err) {
         sessionLog.error(`Failed to start teammate ${params.teammateName}:`, err)
       }
@@ -2146,7 +2900,8 @@ export class SessionManager {
       ?? wsConfig?.defaults?.permissionMode
       ?? globalDefaults.workspaceDefaults.permissionMode
     const defaultThinkingLevel = wsConfig?.defaults?.thinkingLevel ?? globalDefaults.workspaceDefaults.thinkingLevel
-    const defaultSddEnabled = wsConfig?.sdd?.sddEnabled ?? false
+    const defaultSddEnabled = options?.sddEnabled ?? wsConfig?.sdd?.sddEnabled ?? false
+    const defaultSpecId = options?.activeSpecId
 
     const managed: ManagedSession = {
       id: storedSession.id,
@@ -2164,12 +2919,14 @@ export class SessionManager {
       workingDirectory: storedSession.workingDirectory,
       sdkCwd: storedSession.sdkCwd,
       model: options?.model || storedSession.model,
+      llmProvider: storedSession.llmProvider ?? inferProviderFromModel(options?.model || storedSession.model),
       thinkingLevel: defaultThinkingLevel,
       messageQueue: [],
       backgroundShellCommands: new Map(),
       messagesLoaded: true,
       parentSessionId,
       sddEnabled: defaultSddEnabled,
+      activeSpecId: defaultSpecId,
       sddComplianceReports: [],
       // Initialize TokenRefreshManager for this session
       tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
@@ -2179,6 +2936,10 @@ export class SessionManager {
 
     this.sessions.set(storedSession.id, managed)
     this.persistSession(managed)
+
+    if (defaultSddEnabled && !defaultSpecId) {
+      await this.ensureSessionActiveSpec(storedSession.id)
+    }
 
     // Notify all windows that a sub-session was created (for session list updates)
     this.sendEvent({
@@ -2200,10 +2961,12 @@ export class SessionManager {
       labels: options?.labels,
       workingDirectory: storedSession.workingDirectory,
       model: managed.model,
+      llmProvider: managed.llmProvider,
       thinkingLevel: defaultThinkingLevel,
       sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
       parentSessionId,
       sddEnabled: defaultSddEnabled,
+      activeSpecId: managed.activeSpecId,
       sddComplianceReports: [],
     }
   }
@@ -2342,6 +3105,11 @@ export class SessionManager {
       if (connection) {
         provider = providerTypeToAgentProvider(connection.providerType || 'anthropic')
         authType = connectionAuthTypeToBackendAuthType(connection.authType)
+        managed.llmProvider = connection.providerType === 'openai'
+          ? 'openai'
+          : connection.providerType === 'openai_compat'
+            ? inferProviderFromModel(managed.model || connection.defaultModel)
+            : 'anthropic'
         sessionLog.info(`Using LLM connection "${connection.slug}" (${connection.providerType}) for session ${managed.id}`)
       } else {
         // Fallback: try to get default connection
@@ -2350,11 +3118,17 @@ export class SessionManager {
         if (defaultConn) {
           provider = providerTypeToAgentProvider(defaultConn.providerType || 'anthropic')
           authType = connectionAuthTypeToBackendAuthType(defaultConn.authType)
+          managed.llmProvider = defaultConn.providerType === 'openai'
+            ? 'openai'
+            : defaultConn.providerType === 'openai_compat'
+              ? inferProviderFromModel(managed.model || defaultConn.defaultModel)
+              : 'anthropic'
           sessionLog.info(`Using default LLM connection "${defaultConn.slug}" (${defaultConn.providerType}) for session ${managed.id}`)
         } else {
           // No connections at all - fall back to anthropic provider
           provider = 'anthropic'
           authType = undefined
+          managed.llmProvider = inferProviderFromModel(managed.model)
           sessionLog.warn(`No LLM connection found for session ${managed.id}, using default anthropic provider`)
         }
       }
@@ -2402,7 +3176,11 @@ export class SessionManager {
             workingDirectory: managed.workingDirectory,
             sdkCwd: managed.sdkCwd,
             model: managed.model,
+            llmProvider: managed.llmProvider,
             llmConnection: managed.llmConnection,
+            // SDD: pass spec-driven development state to prompt builder
+            sddEnabled: managed.sddEnabled,
+            activeSpecId: managed.activeSpecId,
           },
           // Agent teams: callback to spawn teammates as separate sessions (Codex lead parity)
           onTeammateSpawnRequested: teamsEnabled ? async (params) => {
@@ -2414,6 +3192,8 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
+              llmConnection: managed.llmConnection,
+              role: 'worker',
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -2490,6 +3270,26 @@ export class SessionManager {
         // Wire up onDebug so Codex/AppServerClient debug messages appear in logs
         // (BaseAgent.onDebug defaults to null, so without this all debug output is lost)
         managed.agent.onDebug = (msg: string) => {
+          // Suppress ultra-noisy Codex delta spam to avoid log amplification/OOM
+          const isNoisyCodexLog =
+            msg.includes('[AppServer]') &&
+            (msg.includes('item/started') ||
+              msg.includes('item/completed') ||
+              msg.includes('item/commandExecution/outputDelta') ||
+              msg.includes('item/agentMessage/delta') ||
+              msg.includes('item/reasoning/textDelta') ||
+              msg.includes('item/reasoning/summaryTextDelta') ||
+              msg.includes('item/reasoning/summaryPartAdded') ||
+              msg.includes('thread/tokenUsage/updated') ||
+              msg.includes('account/rateLimits/updated') ||
+              msg.includes('codex/event/') ||
+              msg.includes('Unknown notification: codex/event/') ||
+              msg.includes('Unknown notification: item/reasoning/summaryTextDelta') ||
+              msg.includes('Unknown notification: item/reasoning/summaryPartAdded') ||
+              msg.includes('Unknown notification: account/rateLimits/updated'));
+
+          if (isNoisyCodexLog) return;
+
           sessionLog.info(`[CodexDebug:${managed.id}] ${msg}`)
         }
 
@@ -2565,7 +3365,11 @@ export class SessionManager {
             workingDirectory: managed.workingDirectory,
             sdkCwd: managed.sdkCwd,
             model: managed.model,
+            llmProvider: managed.llmProvider,
             llmConnection: managed.llmConnection,
+            // SDD: pass spec-driven development state to prompt builder
+            sddEnabled: managed.sddEnabled,
+            activeSpecId: managed.activeSpecId,
           },
           // Critical: Immediately persist SDK session ID when captured to prevent loss on crash.
           // Without this, the ID is only saved via debounced persistSession() which may not
@@ -2613,6 +3417,8 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
+              llmConnection: managed.llmConnection,
+              role: 'worker',
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -2697,14 +3503,66 @@ export class SessionManager {
       managed.agent.onPlanSubmitted = async (planPath) => {
         sessionLog.info(`Plan submitted for session ${managed.id}:`, planPath)
         try {
+          if (managed.sddEnabled && !managed.activeSpecId) {
+            await this.ensureSessionActiveSpec(managed.id)
+          }
+          if (managed.sddEnabled) {
+            await this.syncSessionComplianceReportsFromStorage(managed.id)
+          }
           // Read the plan file content
           const planContent = await readFile(planPath, 'utf-8')
+
+          const teamsEnabled = isAgentTeamsEnabled(managed.workspace.rootPath)
+          const hasTeammates = (managed.teammateSessionIds?.length ?? 0) > 0
+          const noTeamReason = this.extractNoTeamReason(planContent)
+          if (teamsEnabled && managed.sddEnabled && !hasTeammates && !noTeamReason) {
+            const warningText =
+              '[SDD] Agent teams are enabled: the plan must either spawn teammates or include a clear reason why no team is needed (e.g., "Team Decision: no-team — <reason>").'
+            const submitPlanMsg = managed.messages.find(
+              m => m.toolName?.includes('SubmitPlan') && m.toolStatus === 'executing'
+            )
+            if (submitPlanMsg) {
+              submitPlanMsg.toolStatus = 'error'
+              submitPlanMsg.content = 'Plan submitted with missing team decision'
+              submitPlanMsg.toolResult = warningText
+            }
+            const warningMessage: Message = {
+              id: generateMessageId(),
+              role: 'warning',
+              content: warningText,
+              timestamp: Date.now(),
+              infoLevel: 'warning',
+            }
+            managed.messages.push(warningMessage)
+            this.sendEvent({
+              type: 'info',
+              sessionId: managed.id,
+              message: warningText,
+              level: 'warning',
+            }, managed.workspace.id)
+            this.persistSession(managed)
+            return
+          }
+
+          if (managed.sddEnabled && managed.activeSpecId) {
+            const interimReport = this.generateSpecComplianceReport(managed)
+            if (interimReport) {
+              const existingReports = managed.sddComplianceReports ?? []
+              managed.sddComplianceReports = [...existingReports, interimReport]
+              this.persistSession(managed)
+              this.sendEvent({
+                type: 'sdd_compliance_report',
+                sessionId: managed.id,
+                report: interimReport,
+              }, managed.workspace.id)
+            }
+          }
 
           // Mark the SubmitPlan tool message as completed (it won't get a tool_result due to forceAbort)
           const submitPlanMsg = managed.messages.find(
             m => m.toolName?.includes('SubmitPlan') && m.toolStatus === 'executing'
           )
-          if (submitPlanMsg) {
+          if (submitPlanMsg && submitPlanMsg.toolStatus !== 'error') {
             submitPlanMsg.toolStatus = 'completed'
             submitPlanMsg.content = 'Plan submitted for review'
             submitPlanMsg.toolResult = 'Plan submitted for review'
@@ -3344,6 +4202,10 @@ export class SessionManager {
     if (!managed) {
       throw new Error(`Session not found: ${sessionId}`)
     }
+    if (managed.sddEnabled && !managed.activeSpecId) {
+      // Fire-and-forget to ensure a spec exists for SDD sessions
+      void this.ensureSessionActiveSpec(sessionId)
+    }
     return {
       sddEnabled: managed.sddEnabled ?? false,
       activeSpecId: managed.activeSpecId,
@@ -3362,6 +4224,24 @@ export class SessionManager {
     managed.sddEnabled = enabled
     if (!enabled) {
       managed.activeSpecId = undefined
+      this.stopComplianceWatcher(sessionId)
+    }
+    // Update the live agent's session config so prompt builder picks up the change
+    if (managed.agent) {
+      const promptBuilder = managed.agent.getPromptBuilder()
+      const session = promptBuilder.getSession()
+      if (session) {
+        session.sddEnabled = enabled
+        if (!enabled) {
+          session.activeSpecId = undefined
+        }
+      }
+      if (!enabled) {
+        promptBuilder.setSDDSpec(null)
+      }
+    }
+    if (enabled) {
+      this.startComplianceWatcher(sessionId)
     }
     this.persistSession(managed)
   }
@@ -3375,12 +4255,136 @@ export class SessionManager {
       throw new Error(`Session not found: ${sessionId}`)
     }
     managed.activeSpecId = specId
-    if (managed.teamId) {
+    let parsedSpec: Spec | null = null
+    if (specId && existsSync(specId)) {
+      const content = await readFile(specId, 'utf-8')
+      parsedSpec = parseSpecMarkdown(content, specId)
+      if (managed.teamId) {
+        const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+        teamManager.setTeamSpec(resolvedTeamId, parsedSpec)
+        if (parsedSpec) {
+          const sectionKeys = [
+            'goals',
+            'nonGoals',
+            'requirements',
+            'risks',
+            'mitigations',
+            'rolloutPlan',
+            'rollbackPlan',
+            'testPlan',
+            'observabilityPlan',
+          ]
+          const requirementIds = parsedSpec.requirements.map(req => req.id)
+          const assignments: DRIAssignment[] = [{
+            userId: parsedSpec.ownerDRI,
+            role: 'owner',
+            sections: [...sectionKeys, ...requirementIds],
+            status: 'active',
+          }]
+          // Implements REQ-002: ensure DRI coverage for spec sections + requirements
+          teamManager.setTeamDRIAssignments(resolvedTeamId, assignments)
+        }
+      }
+    } else if (managed.teamId) {
       // Team manager currently stores full spec objects when available.
       // For ID-only updates, clear the cached spec to avoid stale linkage.
-      teamManager.setTeamSpec(managed.teamId, undefined)
+      const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+      teamManager.setTeamSpec(resolvedTeamId, undefined)
+    }
+    // Update the live agent's session config so prompt builder picks up the change
+    if (managed.agent) {
+      const promptBuilder = managed.agent.getPromptBuilder()
+      const session = promptBuilder.getSession()
+      if (session) {
+        session.activeSpecId = specId
+      }
+      // Set cached spec when available
+      promptBuilder.setSDDSpec(parsedSpec)
+    }
+    if (managed.sddEnabled && !managed.activeSpecId) {
+      await this.ensureSessionActiveSpec(sessionId)
+    }
+    if (managed.sddEnabled) {
+      this.startComplianceWatcher(sessionId)
     }
     this.persistSession(managed)
+  }
+
+  /**
+   * Ensure an active spec exists for a session when SDD is enabled.
+   * Creates a default spec file if needed and sets it as active.
+   */
+  async ensureSessionActiveSpec(sessionId: string): Promise<string | undefined> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    if (managed.activeSpecId) {
+      if (managed.sddEnabled) {
+        this.startComplianceWatcher(sessionId)
+      }
+      return managed.activeSpecId
+    }
+
+    const workspaceConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+    const templateId = workspaceConfig?.sdd?.defaultSpecTemplate
+    const template = workspaceConfig?.sdd?.specTemplates?.find(t => t.id === templateId)
+
+    const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
+    const specsDir = join(sessionPath, 'specs')
+    await mkdir(specsDir, { recursive: true })
+
+    const datePrefix = new Date().toISOString().split('T')[0]
+    let counter = 1
+    let specPath = join(specsDir, `${datePrefix}-spec.md`)
+    while (existsSync(specPath)) {
+      counter += 1
+      specPath = join(specsDir, `${datePrefix}-spec-${counter}.md`)
+    }
+
+    const title = managed.name ? `${managed.name} Spec` : 'Session Spec'
+    const markdown = buildSpecMarkdown({
+      title,
+      ownerDRI: 'Unassigned',
+      template,
+    })
+
+    await writeFile(specPath, markdown, 'utf-8')
+    await this.setSessionActiveSpec(managed.id, specPath)
+    if (managed.sddEnabled) {
+      this.startComplianceWatcher(sessionId)
+    }
+    return managed.activeSpecId
+  }
+
+  /**
+   * Update a requirement status in the active spec markdown and refresh cached spec.
+   */
+  async updateSpecRequirementStatus(
+    sessionId: string,
+    requirementId: string,
+    status: 'pending' | 'in-progress' | 'implemented' | 'verified'
+  ): Promise<Spec | null> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+    if (!managed.activeSpecId || !existsSync(managed.activeSpecId)) {
+      throw new Error('Active spec not found for this session')
+    }
+
+    const specPath = managed.activeSpecId
+    const raw = await readFile(specPath, 'utf-8')
+    const updated = updateRequirementStatusInMarkdown(raw, requirementId, status)
+    if (updated !== raw) {
+      await writeFile(specPath, updated, 'utf-8')
+    }
+
+    await this.setSessionActiveSpec(sessionId, specPath)
+    const refreshed = managed.teamId
+      ? teamManager.getTeamSpec(teamManager.resolveTeamId(managed.teamId))
+      : undefined
+    return refreshed ?? parseSpecMarkdown(updated, specPath)
   }
 
   /**
@@ -3392,6 +4396,100 @@ export class SessionManager {
       throw new Error(`Session not found: ${sessionId}`)
     }
     return managed.sddComplianceReports ?? []
+  }
+
+  /**
+   * Sync SDD compliance reports from persisted session metadata.
+   * Useful when reports are generated out-of-band (e.g., CLI script).
+   * Emits sdd_compliance_report events for any newly ingested reports.
+   */
+  async syncSessionComplianceReportsFromStorage(sessionId: string): Promise<SpecComplianceReport[]> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session not found: ${sessionId}`)
+    }
+
+    const stored = await loadStoredSession(managed.workspace.rootPath, sessionId)
+    if (!stored) {
+      return managed.sddComplianceReports ?? []
+    }
+
+    if (typeof stored.sddEnabled === 'boolean' && stored.sddEnabled !== managed.sddEnabled) {
+      await this.setSessionSDDEnabled(sessionId, stored.sddEnabled)
+    }
+
+    if (stored.activeSpecId && stored.activeSpecId !== managed.activeSpecId) {
+      await this.setSessionActiveSpec(sessionId, stored.activeSpecId)
+    }
+
+    if (managed.sddEnabled) {
+      this.startComplianceWatcher(sessionId)
+    }
+
+    const storedReports = stored.sddComplianceReports ?? []
+    const existingReports = managed.sddComplianceReports ?? []
+    const existingKeys = new Set(
+      existingReports.map(report => `${report.specId}:${report.timestamp}`)
+    )
+    const newReports = storedReports.filter(report => {
+      const key = `${report.specId}:${report.timestamp}`
+      return !existingKeys.has(key)
+    })
+
+    if (newReports.length > 0) {
+      managed.sddComplianceReports = [...existingReports, ...newReports]
+      this.persistSession(managed)
+      for (const report of newReports) {
+        this.sendEvent({
+          type: 'sdd_compliance_report',
+          sessionId,
+          report,
+        }, managed.workspace.id)
+      }
+    }
+
+    return managed.sddComplianceReports ?? []
+  }
+
+  private startComplianceWatcher(sessionId: string): void {
+    if (this.complianceWatchers.has(sessionId)) return
+    const managed = this.sessions.get(sessionId)
+    if (!managed || !managed.sddEnabled) return
+
+    const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
+    const reportsDir = join(sessionPath, 'reports')
+    if (!existsSync(reportsDir)) {
+      void mkdir(reportsDir, { recursive: true })
+    }
+
+    try {
+      const watcher = watch(reportsDir, { recursive: false }, () => {
+        const existingTimer = this.complianceSyncTimers.get(sessionId)
+        if (existingTimer) clearTimeout(existingTimer)
+        const timer = setTimeout(() => {
+          void this.syncSessionComplianceReportsFromStorage(sessionId)
+        }, 250)
+        this.complianceSyncTimers.set(sessionId, timer)
+      })
+      this.complianceWatchers.set(sessionId, watcher)
+      sessionLog.info(`Started compliance watcher for session ${sessionId}`)
+    } catch (error) {
+      sessionLog.warn(`Failed to start compliance watcher for ${sessionId}:`, error)
+    }
+  }
+
+  private stopComplianceWatcher(sessionId: string): void {
+    const watcher = this.complianceWatchers.get(sessionId)
+    if (watcher) {
+      watcher.close()
+      this.complianceWatchers.delete(sessionId)
+      sessionLog.info(`Stopped compliance watcher for session ${sessionId}`)
+    }
+    const timer = this.complianceSyncTimers.get(sessionId)
+    if (timer) {
+      clearTimeout(timer)
+      this.complianceSyncTimers.delete(sessionId)
+    }
   }
 
   /**
@@ -3410,6 +4508,21 @@ export class SessionManager {
       }
     }
     return undefined
+  }
+
+  private extractNoTeamReason(planContent: string): string | null {
+    const lines = planContent.split(/\r?\n/)
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      const match = trimmed.match(/^(team decision|team|no team needed)\s*[:\-]\s*(.+)$/i)
+      if (!match) continue
+      const decisionText = match[2].trim()
+      if (/no\s*team|none|not needed/i.test(decisionText) || /^no\s*team/i.test(trimmed)) {
+        return decisionText
+      }
+    }
+    return null
   }
 
   /**
@@ -3479,8 +4592,7 @@ export class SessionManager {
 
     // Persist changes
     if (needsPersist) {
-      const workspaceRootPath = managed.workspace.rootPath
-      await updateSessionMetadata(workspaceRootPath, sessionId, updates)
+      this.persistSession(managed)
     }
   }
 
@@ -3493,9 +4605,8 @@ export class SessionManager {
     if (managed) {
       managed.hasUnread = true
       managed.lastReadMessageId = undefined
-      // Persist to disk
-      const workspaceRootPath = managed.workspace.rootPath
-      await updateSessionMetadata(workspaceRootPath, sessionId, { hasUnread: true, lastReadMessageId: undefined })
+      // Persist to disk without re-loading session
+      this.persistSession(managed)
     }
   }
 
@@ -3638,8 +4749,20 @@ export class SessionManager {
       if (connection && !managed.connectionLocked) {
         managed.llmConnection = connection
       }
+      const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+      const sessionConn = resolveSessionConnection(managed.llmConnection, wsConfig?.defaults?.defaultLlmConnection)
+      managed.llmProvider = sessionConn?.providerType === 'openai'
+        ? 'openai'
+        : sessionConn?.providerType === 'openai_compat'
+          ? inferProviderFromModel(model ?? sessionConn.defaultModel)
+          : sessionConn
+            ? 'anthropic'
+            : inferProviderFromModel(model ?? managed.model)
       // Persist to disk (include connection if it was updated)
-      const updates: { model?: string; llmConnection?: string } = { model: model ?? undefined }
+      const updates: { model?: string; llmProvider?: UsageProvider; llmConnection?: string } = {
+        model: model ?? undefined,
+        llmProvider: managed.llmProvider,
+      }
       if (connection && !managed.connectionLocked) {
         updates.llmConnection = connection
       }
@@ -3647,8 +4770,6 @@ export class SessionManager {
       // Update agent model if it already exists (takes effect on next query)
       if (managed.agent) {
         // Fallback chain: session model > workspace default > connection default
-        const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
-        const sessionConn = resolveSessionConnection(managed.llmConnection, wsConfig?.defaults?.defaultLlmConnection)
         const effectiveModel = model ?? wsConfig?.defaults?.model ?? sessionConn?.defaultModel!
         managed.agent.setModel(effectiveModel)
       }
@@ -3718,6 +4839,7 @@ export class SessionManager {
     if (managed.agent) {
       managed.agent.dispose()
     }
+    this.stopComplianceWatcher(sessionId)
 
     this.sessions.delete(sessionId)
 
@@ -4187,6 +5309,18 @@ export class SessionManager {
     const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
     const requireFullCoverage = wsConfig?.sdd?.requireFullCoverage === true
 
+    if (managed.isTeamLead && managed.teamId) {
+      const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+      const closeCheck = teamManager.canClosePlan(resolvedTeamId)
+      if (!closeCheck.canClose) {
+        return {
+          allowCompletion: false,
+          blockMessage: `[SDD] Completion blocked: ${closeCheck.blockers.join(' | ')}`,
+          report,
+        }
+      }
+    }
+
     if (requireFullCoverage && report.overallCoverage < 100) {
       return {
         allowCompletion: false,
@@ -4228,7 +5362,7 @@ export class SessionManager {
   private generateSpecComplianceReport(managed: ManagedSession): SpecComplianceReport | undefined {
     if (!managed.activeSpecId) return undefined
 
-    const teamId = managed.teamId
+    const teamId = managed.teamId ? teamManager.resolveTeamId(managed.teamId) : undefined
     const tasks = teamId ? teamManager.getTasks(teamId) : []
     const spec = teamId ? teamManager.getTeamSpec(teamId) : undefined
 
@@ -4311,6 +5445,11 @@ export class SessionManager {
 
     sessionLog.info(`Processing stopped for session ${sessionId}: ${reason}`)
 
+    if ((reason === 'error' || reason === 'timeout') && managed.parentSessionId && managed.teammateName) {
+      const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId)
+      this.updateTeammateTasks(resolvedTeamId, managed.id, 'failed')
+    }
+
     // 1. Cleanup state
     managed.isProcessing = false
     managed.stopRequested = false  // Reset for next turn
@@ -4348,6 +5487,12 @@ export class SessionManager {
           report: complianceReport,
         }, managed.workspace.id)
       }
+
+      if (!beforeResult.allowCompletion) {
+        // Implements REQ-002: hard-block completion when SDD gates fail
+        this.persistSession(managed)
+        return
+      }
     }
 
     // 2. Handle unread state based on whether user is viewing this session
@@ -4357,18 +5502,18 @@ export class SessionManager {
     const isViewing = this.isSessionBeingViewed(sessionId, managed.workspace.id)
     const hasFinalMessage = this.getLastFinalAssistantMessageId(managed.messages) !== undefined
 
-    if (reason === 'complete' && hasFinalMessage) {
-      if (isViewing) {
-        // User is watching - mark as read immediately
-        await this.markSessionRead(sessionId)
-      } else {
-        // User is not watching - mark as unread for NEW badge
-        if (!managed.hasUnread) {
-          managed.hasUnread = true
-          await updateSessionMetadata(managed.workspace.rootPath, sessionId, { hasUnread: true })
+      if (reason === 'complete' && hasFinalMessage) {
+        if (isViewing) {
+          // User is watching - mark as read immediately
+          await this.markSessionRead(sessionId)
+        } else {
+          // User is not watching - mark as unread for NEW badge
+          if (!managed.hasUnread) {
+            managed.hasUnread = true
+            this.persistSession(managed)
+          }
         }
       }
-    }
 
     // 3. Auto-complete mini agent sessions to avoid session list clutter
     //    Mini agents are spawned from EditPopovers for quick config edits
@@ -4409,7 +5554,8 @@ export class SessionManager {
           }
 
           try {
-            const result = await runner.runPipeline(resultContent, taskContext, qgConfig)
+            const spec = managed.teamId ? teamManager.getTeamSpec(teamManager.resolveTeamId(managed.teamId)) : undefined
+            const result = await runner.runPipeline(resultContent, taskContext, qgConfig, spec)
             result.cycleCount = currentCycle
             result.maxCycles = qgConfig.maxReviewCycles
 
@@ -4419,6 +5565,8 @@ export class SessionManager {
               this.qualityGateCycles.delete(cycleKey) // Reset cycle counter
 
               const successReport = formatSuccessReport(result)
+              const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId!)
+              this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
 
               setTimeout(async () => {
                 try {
@@ -4503,6 +5651,8 @@ export class SessionManager {
         } else {
           // Quality gates disabled — original behavior
           sessionLog.info(`[AgentTeams] Relaying results from teammate "${teammateName}" back to lead ${managed.parentSessionId}`)
+          const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId!)
+          this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
 
           setTimeout(async () => {
             try {
@@ -4547,6 +5697,7 @@ export class SessionManager {
 
     // 6. Always persist
     this.persistSession(managed)
+    void this.persistAndBroadcastUsage(managed)
   }
 
   /**
@@ -4918,6 +6069,119 @@ To view this task's output:
     }
   }
 
+  private ensureUsageSummary(managed: ManagedSession): SessionUsage {
+    if (!managed.usageSummary) {
+      managed.usageSummary = createEmptySessionUsage(
+        managed.id,
+        managed.createdAt ?? managed.lastMessageAt ?? Date.now(),
+      )
+    }
+    return managed.usageSummary
+  }
+
+  private resolveSessionProvider(managed: ManagedSession, usageModel?: string, usageProvider?: UsageProvider): UsageProvider {
+    if (usageProvider) return usageProvider
+    if (managed.llmProvider) return managed.llmProvider
+    if (usageModel || managed.model) return inferProviderFromModel(usageModel ?? managed.model)
+    return 'anthropic'
+  }
+
+  private applyUsageToSession(
+    managed: ManagedSession,
+    usage: AgentEventUsage,
+  ): { provider: UsageProvider; model?: string; costUsd: number } {
+    const summary = this.ensureUsageSummary(managed)
+    const provider = this.resolveSessionProvider(managed, usage.model, usage.provider as UsageProvider | undefined)
+    const model = usage.model ?? managed.model
+    const inputTokens = usage.inputTokens ?? 0
+    const outputTokens = usage.outputTokens ?? 0
+    const cacheReadTokens = usage.cacheReadTokens ?? 0
+    const costUsd = usage.costUsd ?? calculateTokenCostUsd({
+      model,
+      provider,
+      inputTokens,
+      outputTokens,
+      cachedInputTokens: cacheReadTokens,
+    })
+
+    const providerUsage = summary.providers[provider] ?? createEmptyProviderUsage()
+    providerUsage.callCount += 1
+    providerUsage.inputTokens += inputTokens
+    providerUsage.outputTokens += outputTokens
+    providerUsage.estimatedCostUsd += costUsd
+    summary.providers[provider] = providerUsage
+
+    summary.totalCalls += 1
+    summary.lastUpdatedAt = new Date().toISOString()
+
+    // Keep session metadata in sync for future turns and persistence
+    managed.llmProvider = provider
+    if (model && !managed.model) {
+      managed.model = model
+    }
+
+    return { provider, model, costUsd }
+  }
+
+  private updateLeadTeamUsageFromTeammate(teammate: ManagedSession): void {
+    if (!teammate.parentSessionId || !teammate.teammateName) return
+    const lead = this.sessions.get(teammate.parentSessionId)
+    if (!lead) return
+
+    const leadSummary = this.ensureUsageSummary(lead)
+    const teamId = lead.teamId || teammate.teamId || teammate.parentSessionId
+    const teammateIds = lead.teammateSessionIds || []
+
+    const perTeammate: TeamSessionUsage['perTeammate'] = {}
+    const perModel: TeamSessionUsage['perModel'] = {}
+    let totalTeamCostUsd = 0
+
+    for (const teammateId of teammateIds) {
+      const teammateSession = this.sessions.get(teammateId)
+      if (!teammateSession) continue
+
+      const teammateSummary = teammateSession.usageSummary
+      if (!teammateSummary) continue
+
+      const provider = teammateSession.llmProvider ?? inferProviderFromModel(teammateSession.model)
+      const inputTokens = Object.values(teammateSummary.providers).reduce((sum, p) => sum + p.inputTokens, 0)
+      const outputTokens = Object.values(teammateSummary.providers).reduce((sum, p) => sum + p.outputTokens, 0)
+      const costUsd = Object.values(teammateSummary.providers).reduce((sum, p) => sum + p.estimatedCostUsd, 0)
+      const callCount = Object.values(teammateSummary.providers).reduce((sum, p) => sum + p.callCount, 0)
+      const model = teammateSession.model || 'unknown'
+
+      perTeammate[teammateId] = {
+        name: teammateSession.teammateName || teammateSession.name || teammateId,
+        model,
+        provider,
+        role: teammateSession.teammateName || 'teammate',
+        inputTokens,
+        outputTokens,
+        costUsd,
+        callCount,
+      }
+
+      if (!perModel[model]) {
+        perModel[model] = { inputTokens: 0, outputTokens: 0, costUsd: 0, callCount: 0 }
+      }
+      perModel[model].inputTokens += inputTokens
+      perModel[model].outputTokens += outputTokens
+      perModel[model].costUsd += costUsd
+      perModel[model].callCount += callCount
+
+      totalTeamCostUsd += costUsd
+    }
+
+    leadSummary.teamUsage = {
+      teamId,
+      teammateCount: Object.keys(perTeammate).length,
+      totalTeamCostUsd,
+      perTeammate,
+      perModel,
+    }
+    leadSummary.lastUpdatedAt = new Date().toISOString()
+  }
+
   private processEvent(managed: ManagedSession, event: AgentEvent): void {
     const sessionId = managed.id
     const workspaceId = managed.workspace.id
@@ -4925,6 +6189,11 @@ To view this task's output:
     switch (event.type) {
       case 'text_delta':
         managed.streamingText += event.text
+        // Hard cap streaming buffer to avoid OOM on long-running deltas
+        const maxStreamingChars = 200_000
+        if (managed.streamingText.length > maxStreamingChars) {
+          managed.streamingText = managed.streamingText.slice(-maxStreamingChars)
+        }
         // Queue delta for batched sending (performance: reduces IPC from 50+/sec to ~20/sec)
         this.queueDelta(sessionId, workspaceId, event.text, event.turnId)
         break
@@ -4948,6 +6217,24 @@ To view this task's output:
           parentToolUseId: textParentToolUseId,
         }
         managed.messages.push(assistantMessage)
+
+        // Prevent unbounded growth of intermediate messages (reasoning/debug streams)
+        if (assistantMessage.isIntermediate) {
+          const maxIntermediateMessages = 20
+          const intermediateMessages = managed.messages.filter(m => m.isIntermediate)
+          if (intermediateMessages.length > maxIntermediateMessages) {
+            const toRemove = intermediateMessages.length - maxIntermediateMessages
+            let removed = 0
+            managed.messages = managed.messages.filter(m => {
+              if (!m.isIntermediate) return true
+              if (removed < toRemove) {
+                removed += 1
+                return false
+              }
+              return true
+            })
+          }
+        }
         managed.streamingText = ''
 
         // Update lastMessageRole and lastFinalMessageId for badge/unread display (only for final messages)
@@ -5445,6 +6732,23 @@ To view this task's output:
         // Complete event from CraftAgent - accumulate usage from this turn
         // Actual 'complete' sent to renderer comes from the finally block in sendMessage
         if (event.usage) {
+          const applied = this.applyUsageToSession(managed, event.usage)
+
+          // If this is a teammate session, fold usage into the lead session totals too
+          if (managed.parentSessionId && managed.teammateName) {
+            const lead = this.sessions.get(managed.parentSessionId)
+            if (lead) {
+              this.applyUsageToSession(lead, {
+                ...event.usage,
+                provider: applied.provider,
+                model: applied.model,
+                costUsd: applied.costUsd,
+              })
+              this.updateLeadTeamUsageFromTeammate(managed)
+              this.persistSession(lead)
+            }
+          }
+
           // Initialize tokenUsage if not set
           if (!managed.tokenUsage) {
             managed.tokenUsage = {
@@ -5461,7 +6765,7 @@ To view this task's output:
           // outputTokens and costUsd are accumulated across all turns (total session usage)
           managed.tokenUsage.outputTokens += event.usage.outputTokens
           managed.tokenUsage.totalTokens = managed.tokenUsage.inputTokens + managed.tokenUsage.outputTokens
-          managed.tokenUsage.costUsd += event.usage.costUsd ?? 0
+          managed.tokenUsage.costUsd += applied.costUsd
           // Cache tokens reflect current state, not accumulated
           managed.tokenUsage.cacheReadTokens = event.usage.cacheReadTokens ?? 0
           managed.tokenUsage.cacheCreationTokens = event.usage.cacheCreationTokens ?? 0
@@ -5490,6 +6794,15 @@ To view this task's output:
           if (event.usage.contextWindow) {
             managed.tokenUsage.contextWindow = event.usage.contextWindow
           }
+          // Some providers (Codex) include running output/cost estimates in usage_update.
+          // We keep display totals monotonic for UI feedback but finalize true totals on complete.
+          if (event.usage.outputTokens !== undefined) {
+            managed.tokenUsage.outputTokens = Math.max(managed.tokenUsage.outputTokens, event.usage.outputTokens)
+            managed.tokenUsage.totalTokens = managed.tokenUsage.inputTokens + managed.tokenUsage.outputTokens
+          }
+          if (event.usage.costUsd !== undefined) {
+            managed.tokenUsage.costUsd = Math.max(managed.tokenUsage.costUsd, event.usage.costUsd)
+          }
 
           // Send to renderer for immediate UI update
           this.sendEvent({
@@ -5506,6 +6819,23 @@ To view this task's output:
       // Note: working_directory_changed is user-initiated only (via updateWorkingDirectory),
       // the agent no longer has a change_working_directory tool
     }
+
+    // Hard cap in-memory message list to prevent unbounded growth
+    const maxInMemoryMessages = 1000
+    if (managed.messages.length > maxInMemoryMessages) {
+      managed.messages = managed.messages.slice(-maxInMemoryMessages)
+    }
+  }
+
+  private updateTeammateTasks(
+    teamId: string,
+    teammateId: string,
+    status: 'completed' | 'failed'
+  ): void {
+    const tasks = teamManager.getTasks(teamId)
+    tasks
+      .filter(task => task.assignee === teammateId && task.status === 'in_progress')
+      .forEach(task => teamManager.updateTaskStatus(teamId, task.id, status))
   }
 
   private sendEvent(event: SessionEvent, workspaceId?: string): void {
@@ -5603,6 +6933,17 @@ To view this task's output:
       sessionLog.info(`Stopped config watcher for ${path}`)
     }
     this.configWatchers.clear()
+
+    // Stop all compliance watchers
+    for (const [sessionId, watcher] of this.complianceWatchers) {
+      watcher.close()
+      sessionLog.info(`Stopped compliance watcher for ${sessionId}`)
+    }
+    this.complianceWatchers.clear()
+    for (const [sessionId, timer] of this.complianceSyncTimers) {
+      clearTimeout(timer)
+    }
+    this.complianceSyncTimers.clear()
 
     // Clear all pending delta flush timers
     for (const [sessionId, timer] of this.deltaFlushTimers) {

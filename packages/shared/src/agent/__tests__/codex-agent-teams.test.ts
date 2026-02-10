@@ -98,8 +98,8 @@ describe('CodexAgent agent teams interception', () => {
 
     // Should block with synthetic result
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('spawned successfully');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('spawned successfully');
 
     // Should emit team_initialized event
     const teamInit = events.find((e) => e.type === 'team_initialized');
@@ -141,8 +141,8 @@ describe('CodexAgent agent teams interception', () => {
 
     // Should block with synthetic result (sdkToolName = 'mcp__session__Task' which endsWith '__Task')
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('spawned successfully');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('spawned successfully');
 
     // Should emit both events
     const teamInit = events.find((e) => e.type === 'team_initialized');
@@ -154,6 +154,40 @@ describe('CodexAgent agent teams interception', () => {
     expect(toolResult).toBeDefined();
     expect(toolResult!.isError).toBe(false);
     expect(String(toolResult!.result)).toContain('Researcher');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 2b. Task spawn without explicit team_name uses fallback (session id)
+  // ---------------------------------------------------------------------------
+  it('defaults team_name to session id when missing', async () => {
+    const agent = createAgent();
+    const { events, decisions } = setupCapture(agent);
+
+    agent.onTeammateSpawnRequested = async (params) => {
+      expect(params.teamName).toBe('session-test');
+      expect(params.teammateName).toBe('Worker');
+      expect(params.prompt).toBe('Do work');
+      return { sessionId: 'teammate-session-3', agentId: 'teammate-session-3' };
+    };
+
+    await callPreToolUse(agent, {
+      toolType: 'mcp',
+      toolName: 'Task',
+      mcpServer: 'session',
+      mcpTool: 'Task',
+      input: { name: 'Worker', prompt: 'Do work' },
+      requestId: 'req-2b',
+      itemId: 'item-2b',
+    });
+
+    expect(decisions.length).toBe(1);
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('spawned successfully');
+
+    const teamInit = events.find((e) => e.type === 'team_initialized');
+    expect(teamInit).toBeDefined();
+    expect(teamInit!.teamName).toBe('session-test');
+    expect(teamInit!.teammateName).toBe('Worker');
   });
 
   // ──────────────────────────────────────────────
@@ -179,8 +213,8 @@ describe('CodexAgent agent teams interception', () => {
     });
 
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('delivered to "Worker"');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('delivered to "Worker"');
 
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'SendMessage');
     expect(toolResult).toBeDefined();
@@ -214,8 +248,8 @@ describe('CodexAgent agent teams interception', () => {
 
     // sdkToolName = 'mcp__session__SendMessage' which endsWith '__SendMessage'
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('delivered to "Researcher"');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('delivered to "Researcher"');
 
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'SendMessage');
     expect(toolResult).toBeDefined();
@@ -246,8 +280,8 @@ describe('CodexAgent agent teams interception', () => {
     });
 
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('Team "my-team" created successfully');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('Team "my-team" created successfully');
 
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'TeamCreate');
     expect(toolResult).toBeDefined();
@@ -278,9 +312,9 @@ describe('CodexAgent agent teams interception', () => {
     });
 
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('Failed to spawn teammate');
-    expect(String(decisions[0].reason)).toContain('Session pool exhausted');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('Failed to spawn teammate');
+    expect(String(decisions[0]!.reason)).toContain('Session pool exhausted');
 
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'Task');
     expect(toolResult).toBeDefined();
@@ -317,8 +351,8 @@ describe('CodexAgent agent teams interception', () => {
     });
 
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
-    expect(String(decisions[0].reason)).toContain('broadcast to all teammates');
+    expect(decisions[0]!.type).toBe('block');
+    expect(String(decisions[0]!.reason)).toContain('broadcast to all teammates');
 
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'SendMessage');
     expect(toolResult).toBeDefined();
@@ -353,7 +387,7 @@ describe('CodexAgent agent teams interception', () => {
     expect(receivedParams!.content).toBe('Task complete, shutting down');
 
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('block');
+    expect(decisions[0]!.type).toBe('block');
 
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'SendMessage');
     expect(toolResult).toBeDefined();
@@ -365,14 +399,14 @@ describe('CodexAgent agent teams interception', () => {
   // ──────────────────────────────────────────────
   // 9. Task without team_name — should NOT intercept
   // ──────────────────────────────────────────────
-  it('does NOT intercept Task when team_name is missing (passes through to normal flow)', async () => {
+  it('intercepts Task when team_name is missing (fallback team id)', async () => {
     const agent = createAgent();
     const { events, decisions } = setupCapture(agent);
 
     let spawnCalled = false;
     agent.onTeammateSpawnRequested = async () => {
       spawnCalled = true;
-      return { sessionId: 'nope', agentId: 'nope' };
+      return { sessionId: 'teammate-session-3', agentId: 'teammate-session-3' };
     };
 
     await callPreToolUse(agent, {
@@ -385,16 +419,10 @@ describe('CodexAgent agent teams interception', () => {
       itemId: 'item-9',
     });
 
-    // onTeammateSpawnRequested should NOT have been called
-    expect(spawnCalled).toBe(false);
-
-    // Should NOT have a team_initialized event
-    expect(events.find((e) => e.type === 'team_initialized')).toBeUndefined();
-
-    // The decision should NOT be a block from agent teams interception.
-    // It should fall through to the normal tool permission flow (which will 'allow' in allow-all mode).
+    expect(spawnCalled).toBe(true);
+    expect(events.find((e) => e.type === 'team_initialized')).toBeDefined();
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('allow');
+    expect(decisions[0]!.type).toBe('block');
   });
 
   // ──────────────────────────────────────────────
@@ -424,7 +452,7 @@ describe('CodexAgent agent teams interception', () => {
 
     // Should fall through to normal allow
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('allow');
+    expect(decisions[0]!.type).toBe('allow');
   });
 
   it('passes through SendMessage tool when teams are disabled (onTeammateMessage is null)', async () => {
@@ -449,7 +477,7 @@ describe('CodexAgent agent teams interception', () => {
 
     // Should fall through to normal allow
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('allow');
+    expect(decisions[0]!.type).toBe('allow');
   });
 
   it('passes through TeamCreate tool when teams are disabled (onTeammateSpawnRequested is null)', async () => {
@@ -471,6 +499,6 @@ describe('CodexAgent agent teams interception', () => {
 
     expect(events.find((e) => e.type === 'tool_result' && e.toolName === 'TeamCreate')).toBeUndefined();
     expect(decisions.length).toBe(1);
-    expect(decisions[0].type).toBe('allow');
+    expect(decisions[0]!.type).toBe('allow');
   });
 });

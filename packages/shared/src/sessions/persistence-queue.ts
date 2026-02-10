@@ -55,8 +55,24 @@ class SessionPersistenceQueue {
 
     this.pending.delete(sessionId)
 
+    // Serialize writes per-session to avoid tmp collisions
+    const inProgress = this.writeInProgress.get(sessionId)
+    if (inProgress) {
+      await inProgress
+    }
+
+    const writePromise = this.writeToDisk(sessionId, entry.data)
+    this.writeInProgress.set(sessionId, writePromise)
+
     try {
-      const { data } = entry
+      await writePromise
+    } finally {
+      this.writeInProgress.delete(sessionId)
+    }
+  }
+
+  private async writeToDisk(sessionId: string, data: StoredSession): Promise<void> {
+    try {
       ensureSessionsDir(data.workspaceRootPath)
       ensureSessionDir(data.workspaceRootPath, sessionId)
 
@@ -90,6 +106,36 @@ class SessionPersistenceQueue {
       await rename(tmpFile, filePath)
       debug(`[PersistenceQueue] Wrote session ${sessionId}`)
     } catch (error) {
+      // If temp file was removed (e.g., dir race), retry once after recreating directories
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        try {
+          ensureSessionsDir(data.workspaceRootPath)
+          ensureSessionDir(data.workspaceRootPath, sessionId)
+          const filePath = getSessionFilePath(data.workspaceRootPath, sessionId)
+          const tmpFile = filePath + '.tmp'
+          const header = createSessionHeader({
+            ...data,
+            workspaceRootPath: toPortablePath(data.workspaceRootPath),
+            workingDirectory: data.workingDirectory ? toPortablePath(data.workingDirectory) : undefined,
+            sdkCwd: data.sdkCwd ? toPortablePath(data.sdkCwd) : undefined,
+            lastUsedAt: Date.now(),
+          })
+          const persistableMessages = data.messages.filter(m => !m.isIntermediate)
+          const lines = [
+            JSON.stringify(header),
+            ...persistableMessages.map(m => JSON.stringify(m)),
+          ]
+          await writeFile(tmpFile, lines.join('\n') + '\n', 'utf-8')
+          try { await unlink(filePath) } catch { /* ignore if doesn't exist */ }
+          await rename(tmpFile, filePath)
+          debug(`[PersistenceQueue] Wrote session ${sessionId} (retry)`)
+          return
+        } catch (retryError) {
+          console.error(`[PersistenceQueue] Failed to write session ${sessionId} after retry:`, retryError)
+          return
+        }
+      }
+
       console.error(`[PersistenceQueue] Failed to write session ${sessionId}:`, error)
     }
   }
@@ -104,21 +150,7 @@ class SessionPersistenceQueue {
     if (entry) {
       clearTimeout(entry.timer)
 
-      // Wait for any in-progress write to complete first
-      const inProgress = this.writeInProgress.get(sessionId)
-      if (inProgress) {
-        await inProgress
-      }
-
-      // Start new write and track it
-      const writePromise = this.write(sessionId)
-      this.writeInProgress.set(sessionId, writePromise)
-
-      try {
-        await writePromise
-      } finally {
-        this.writeInProgress.delete(sessionId)
-      }
+      await this.write(sessionId)
     }
   }
 

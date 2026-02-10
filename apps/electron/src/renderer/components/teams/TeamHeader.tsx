@@ -18,6 +18,7 @@ export interface TeamHeaderProps {
   onToggleDelegateMode?: () => void
   onCleanupTeam?: () => void
   specModeEnabled?: boolean
+  specLabel?: string
   isCompactSidebarMode?: boolean
   onToggleCompactSidebarMode?: () => void
 }
@@ -35,6 +36,7 @@ export function TeamHeader({
   onToggleDelegateMode,
   onCleanupTeam,
   specModeEnabled,
+  specLabel,
   isCompactSidebarMode,
   onToggleCompactSidebarMode,
 }: TeamHeaderProps) {
@@ -56,6 +58,11 @@ export function TeamHeader({
           <Badge variant="outline" className="text-[11px] px-1.5 py-0 border-blue-500/30 text-blue-500">
             Spec Compliance
           </Badge>
+        )}
+        {specModeEnabled && specLabel && (
+          <span className="text-[11px] text-muted-foreground truncate max-w-[240px]" title={specLabel}>
+            {specLabel}
+          </span>
         )}
       </div>
 

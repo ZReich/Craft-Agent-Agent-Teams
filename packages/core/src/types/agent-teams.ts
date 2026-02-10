@@ -372,6 +372,8 @@ export interface TeamActivityEvent {
   id: string;
   timestamp: string;
   type: TeamActivityType;
+  /** Owning team ID for this event */
+  teamId?: string;
   /** Which teammate triggered this event */
   teammateId?: string;
   teammateName?: string;

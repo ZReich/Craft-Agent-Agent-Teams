@@ -128,6 +128,11 @@ export interface AppShellContextType {
   // Right sidebar button (for page headers)
   rightSidebarButton?: React.ReactNode
 
+  // Focus mode controls (fullscreen chat)
+  isFocusModeActive?: boolean
+  onToggleFocusMode?: () => void
+  onSetFocusMode?: (enabled: boolean) => void
+
   // Session list search state (for ChatDisplay highlighting)
   /** Current search query from session list - used to highlight matches in ChatDisplay */
   sessionListSearchQuery?: string

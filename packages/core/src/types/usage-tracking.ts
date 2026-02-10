@@ -21,6 +21,7 @@ export interface SessionUsage {
   // Token totals by provider
   providers: {
     anthropic: ProviderUsage;
+    openai: ProviderUsage;
     moonshot: ProviderUsage;
     openrouter: ProviderUsage;
   };

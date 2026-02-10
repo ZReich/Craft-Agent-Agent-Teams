@@ -1,8 +1,10 @@
 import * as React from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { CheckCircle2, AlertTriangle, XCircle, Link2, TestTube2 } from 'lucide-react'
+import { CheckCircle2, AlertTriangle, XCircle, Link2, TestTube2, ChevronDown } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
+import { DropdownMenu, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { StyledDropdownMenuContent, StyledDropdownMenuItem } from '@/components/ui/styled-dropdown'
 
 export interface SpecCoveragePanelProps {
   requirements: Array<{
@@ -15,6 +17,7 @@ export interface SpecCoveragePanelProps {
   }>
   className?: string
   onRequirementClick?: (requirementId: string) => void
+  onRequirementStatusChange?: (requirementId: string, status: SpecCoveragePanelProps['requirements'][number]['status']) => void
 }
 
 type CoverageState = 'full' | 'partial' | 'none'
@@ -46,6 +49,13 @@ function coverageColor(state: CoverageState): string {
   return 'text-destructive'
 }
 
+const STATUS_LABELS: Record<SpecCoveragePanelProps['requirements'][number]['status'], string> = {
+  pending: 'Pending',
+  'in-progress': 'In Progress',
+  implemented: 'Implemented',
+  verified: 'Verified',
+}
+
 function priorityClass(priority: SpecCoveragePanelProps['requirements'][number]['priority']): string {
   switch (priority) {
     case 'critical':
@@ -60,7 +70,7 @@ function priorityClass(priority: SpecCoveragePanelProps['requirements'][number][
   }
 }
 
-export function SpecCoveragePanel({ requirements, className, onRequirementClick }: SpecCoveragePanelProps) {
+export function SpecCoveragePanel({ requirements, className, onRequirementClick, onRequirementStatusChange }: SpecCoveragePanelProps) {
   const [selectedRequirementId, setSelectedRequirementId] = React.useState<string | null>(null)
 
   const { fullCount, partialCount, noneCount, coveragePercent } = React.useMemo(() => {
@@ -167,6 +177,33 @@ export function SpecCoveragePanel({ requirements, className, onRequirementClick 
                       <Badge variant="outline" className="text-[10px] h-4 px-1.5 py-0 border-border">
                         {coverageLabel(coverageState)}
                       </Badge>
+                      {onRequirementStatusChange ? (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              type="button"
+                              className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-foreground/[0.03]"
+                            >
+                              {STATUS_LABELS[requirement.status]}
+                              <ChevronDown className="size-3" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <StyledDropdownMenuContent align="start" sideOffset={4}>
+                            {(Object.keys(STATUS_LABELS) as Array<keyof typeof STATUS_LABELS>).map((status) => (
+                              <StyledDropdownMenuItem
+                                key={status}
+                                onClick={() => onRequirementStatusChange(requirement.id, status)}
+                              >
+                                {STATUS_LABELS[status]}
+                              </StyledDropdownMenuItem>
+                            ))}
+                          </StyledDropdownMenuContent>
+                        </DropdownMenu>
+                      ) : (
+                        <Badge variant="outline" className="text-[10px] h-4 px-1.5 py-0 border-border">
+                          {STATUS_LABELS[requirement.status]}
+                        </Badge>
+                      )}
                     </div>
 
                     <p className="text-xs text-muted-foreground mt-1 line-clamp-2">

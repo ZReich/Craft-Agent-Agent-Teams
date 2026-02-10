@@ -7,6 +7,7 @@ import { Provider as JotaiProvider } from 'jotai'
 import App from './App'
 import { ThemeProvider } from './context/ThemeContext'
 import { Toaster } from '@/components/ui/sonner'
+import { initRendererLogging } from './lib/renderer-logging'
 import './index.css'
 
 // Known-harmless console messages that should NOT be sent to Sentry.
@@ -65,6 +66,8 @@ sentryInit(
   },
   Sentry.init,
 )
+
+void initRendererLogging()
 
 /**
  * Minimal fallback UI shown when the entire React tree crashes.

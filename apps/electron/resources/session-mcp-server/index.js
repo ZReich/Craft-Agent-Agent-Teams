@@ -33629,6 +33629,91 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
         },
         required: ["prompt"]
       }
+    },
+    {
+      name: "Task",
+      description: `Launch a teammate agent to handle a task autonomously as part of an agent team.
+
+This tool spawns a new agent session that works independently on the given task.
+The teammate runs in its own context window and reports results back when done.
+
+**Required:** team_name and prompt must be provided. Use name to identify the teammate.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_name: {
+            type: "string",
+            description: "Team identifier. All teammates with the same team_name are part of the same team."
+          },
+          name: {
+            type: "string",
+            description: "Human-readable name for the teammate (e.g., 'researcher', 'tester', 'frontend-dev')"
+          },
+          prompt: {
+            type: "string",
+            description: "The task description and instructions for the teammate to execute"
+          },
+          model: {
+            type: "string",
+            description: "Optional model override for the teammate (e.g., 'claude-sonnet-4-5')"
+          }
+        },
+        required: ["team_name", "prompt"]
+      }
+    },
+    {
+      name: "SendMessage",
+      description: `Send a message to a teammate in the current agent team.
+
+Use this to communicate with teammates spawned via the Task tool.
+
+**Message types:**
+- message: Send a direct message to a specific teammate (requires recipient)
+- broadcast: Send to ALL teammates at once (use sparingly)
+- shutdown_request: Ask a teammate to gracefully shut down`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["message", "broadcast", "shutdown_request"],
+            description: "Message type"
+          },
+          recipient: {
+            type: "string",
+            description: "Name of the teammate to message (required for 'message' and 'shutdown_request' types)"
+          },
+          content: {
+            type: "string",
+            description: "The message content"
+          },
+          summary: {
+            type: "string",
+            description: "A 5-10 word summary shown as preview in the UI"
+          }
+        },
+        required: ["type"]
+      }
+    },
+    {
+      name: "TeamCreate",
+      description: `Create a new agent team for coordinating multiple teammates.
+
+Creates a team that teammates can join. Use this before spawning teammates with the Task tool.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_name: {
+            type: "string",
+            description: "Unique name for the team"
+          },
+          description: {
+            type: "string",
+            description: "Brief description of the team's purpose"
+          }
+        },
+        required: ["team_name"]
+      }
     }
   ];
 }
@@ -33708,6 +33793,12 @@ async function main() {
           return await handleSourceTest(ctx, toolArgs);
         case "call_llm":
           return await handleCallLlm(ctx, toolArgs);
+        case "Task":
+        case "SendMessage":
+        case "TeamCreate":
+          // Agent team tools are intercepted by the PreToolUse handler in codex-agent.ts
+          // before reaching this MCP server. If they reach here, teams are not enabled.
+          return { content: [{ type: "text", text: `Agent teams are not enabled for this workspace. Enable agent teams in workspace settings to use ${name}.` }] };
         default:
           return errorResponse(`Unknown tool: ${name}`);
       }

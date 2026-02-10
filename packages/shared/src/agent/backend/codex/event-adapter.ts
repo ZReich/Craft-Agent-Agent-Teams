@@ -62,6 +62,8 @@ export class EventAdapter {
 
   // Track command output for tool results
   private commandOutput: Map<string, string> = new Map();
+  private truncatedCommandOutput: Set<string> = new Set();
+  private readonly maxCommandOutputChars = 50_000;
 
   // Track commands detected as file reads (for Read tool display)
   private readCommands: Map<string, ReadCommandInfo> = new Map();
@@ -71,6 +73,7 @@ export class EventAdapter {
 
   // Current turn ID for event correlation
   private currentTurnId: string | null = null;
+  private readonly maxReasoningChars = 100_000;
 
   /**
    * Store the block reason for a command that will be declined.
@@ -89,6 +92,7 @@ export class EventAdapter {
     this.turnIndex++;
     this.itemIndex = 0;
     this.commandOutput.clear();
+    this.truncatedCommandOutput.clear();
     this.readCommands.clear();
     this.blockReasons.clear();
     this.currentTurnId = turnId || null;
@@ -300,6 +304,10 @@ export class EventAdapter {
         yield { type: 'status', message: `Exited review mode: ${item.review}` };
         break;
 
+      case 'contextCompaction':
+        yield { type: 'status', message: 'Context compacting...' };
+        break;
+
       default:
         // Log unknown types for debugging instead of silent drop
         console.warn(`[EventAdapter] Unknown item type in started: ${(item as { type: string }).type}`);
@@ -345,7 +353,17 @@ export class EventAdapter {
   adaptCommandOutputDelta(notification: OutputDeltaNotification): void {
     const { itemId, delta } = notification;
     const current = this.commandOutput.get(itemId) || '';
-    this.commandOutput.set(itemId, current + delta);
+    if (current.length >= this.maxCommandOutputChars) {
+      this.truncatedCommandOutput.add(itemId);
+      return;
+    }
+    const next = current + delta;
+    if (next.length > this.maxCommandOutputChars) {
+      this.commandOutput.set(itemId, next.slice(0, this.maxCommandOutputChars));
+      this.truncatedCommandOutput.add(itemId);
+    } else {
+      this.commandOutput.set(itemId, next);
+    }
   }
 
   /**
@@ -412,6 +430,10 @@ export class EventAdapter {
         // Review mode transitions already handled in started
         break;
 
+      case 'contextCompaction':
+        // Context compaction handled by thread/compacted notification
+        break;
+
       default:
         // Log unknown types for debugging instead of silent drop
         console.warn(`[EventAdapter] Unknown item type in completed: ${(item as { type: string }).type}`);
@@ -472,7 +494,14 @@ export class EventAdapter {
       item.status === 'failed' || isDeclined || (item.exitCode != null && item.exitCode !== 0);
 
     // Use accumulated output from deltas, or fallback to item output
-    const output = this.commandOutput.get(item.id) || item.aggregatedOutput || '';
+    let output = this.commandOutput.get(item.id) || item.aggregatedOutput || '';
+    if (this.truncatedCommandOutput.has(item.id)) {
+      output = `${output}\n... [output truncated after ${this.maxCommandOutputChars} chars]`;
+      this.truncatedCommandOutput.delete(item.id);
+    }
+
+    // Clear cached output for this command to avoid retaining large buffers
+    this.commandOutput.delete(item.id);
 
     // Get stored block reason if available (set by PreToolUse handler)
     const blockReason = this.blockReasons.get(item.id);
@@ -605,7 +634,10 @@ export class EventAdapter {
    */
   private createReasoningEvent(item: ThreadItem & { type: 'reasoning' }): AgentEvent {
     // v2 reasoning has summary array instead of single text
-    const text = item.summary?.join('\n') || item.content?.join('\n') || '';
+    let text = item.summary?.join('\n') || item.content?.join('\n') || '';
+    if (text.length > this.maxReasoningChars) {
+      text = `${text.slice(0, this.maxReasoningChars)}\n... [reasoning truncated after ${this.maxReasoningChars} chars]`;
+    }
     return {
       type: 'text_complete',
       text,

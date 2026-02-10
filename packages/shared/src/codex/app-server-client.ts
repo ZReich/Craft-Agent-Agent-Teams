@@ -294,6 +294,7 @@ export interface AppServerEvents {
   // Auth notifications
   'account/login/completed': { loginId: string | null; success: boolean; error: string | null };
   'account/updated': { authMode: 'apikey' | 'chatgpt' | 'chatgptAuthTokens' | null };
+  'account/rateLimits/updated': { rateLimits: unknown };
 
   // Legacy EventMsg events (for compatibility)
   'event': EventMsg;
@@ -344,6 +345,7 @@ export class AppServerClient extends EventEmitter {
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private nextRequestId: number = 1;
   private initialized: boolean = false;
+  private unknownNotificationCounts: Map<string, number> = new Map();
 
   // Connection state machine to prevent race conditions
   private connectionState: ConnectionState = 'disconnected';
@@ -977,7 +979,12 @@ export class AppServerClient extends EventEmitter {
     const method = notification.method;
     const params = notification.params;
 
-    this.debug(`← ${method}: ${JSON.stringify(params).slice(0, 200)}`);
+    // Ignore legacy codex/event/* bridge notifications (handled elsewhere, duplicates v2 events)
+    if (method.startsWith('codex/event/')) {
+      return;
+    }
+
+    this.debug(this.formatNotificationDebug(method, params));
 
     // Emit typed events for v2 notifications
     switch (method) {
@@ -1013,6 +1020,17 @@ export class AppServerClient extends EventEmitter {
         this.emit('item/reasoning/textDelta', params as { threadId: string; turnId: string; itemId: string; delta: string });
         break;
 
+      // Some Codex builds emit summaryTextDelta for reasoning streams
+      case 'item/reasoning/summaryTextDelta': {
+        const summaryParams = params as { threadId: string; turnId: string; itemId: string; delta: string };
+        this.emit('item/reasoning/textDelta', summaryParams);
+        break;
+      }
+
+      // Summary part notifications (no text payload) - ignore but don't log as unknown
+      case 'item/reasoning/summaryPartAdded':
+        break;
+
       case 'turn/plan/updated':
         this.emit('turn/plan/updated', params as TurnPlanUpdatedNotification);
         break;
@@ -1024,6 +1042,11 @@ export class AppServerClient extends EventEmitter {
 
       case 'account/updated':
         this.emit('account/updated', params as { authMode: 'apikey' | 'chatgpt' | 'chatgptAuthTokens' | null });
+        break;
+
+      // Rate limit updates (informational only)
+      case 'account/rateLimits/updated':
+        this.emit('account/rateLimits/updated', params as { rateLimits: unknown });
         break;
 
       // Token usage notifications
@@ -1079,8 +1102,65 @@ export class AppServerClient extends EventEmitter {
         break;
 
       default:
-        // Emit as generic event for unknown notifications
-        this.debug(`Unknown notification: ${method}`);
+        // Emit as generic event for unknown notifications (throttle to avoid log spam)
+        this.logUnknownNotification(method);
+    }
+  }
+
+  /**
+   * Format debug output for notifications without heavy JSON serialization.
+   * High-frequency delta events skip payload previews to reduce memory churn.
+   */
+  private formatNotificationDebug(method: string, params: unknown): string {
+    const noisyMethods = new Set([
+      'item/started',
+      'item/completed',
+      'item/commandExecution/outputDelta',
+      'item/agentMessage/delta',
+      'item/reasoning/textDelta',
+      'item/reasoning/summaryTextDelta',
+      'item/reasoning/summaryPartAdded',
+      'item/fileChange/outputDelta',
+      'thread/tokenUsage/updated',
+      'account/rateLimits/updated',
+    ]);
+
+    if (noisyMethods.has(method)) {
+      return `← ${method}`;
+    }
+
+    const preview = this.previewParams(params, 200);
+    return `← ${method}: ${preview}`;
+  }
+
+  /**
+   * Safe, lightweight preview of params to avoid huge JSON allocations.
+   */
+  private previewParams(params: unknown, maxLength: number): string {
+    if (params == null) return 'null';
+    if (typeof params === 'string') {
+      return params.length > maxLength ? `${params.slice(0, maxLength)}...` : params;
+    }
+    try {
+      const json = JSON.stringify(params);
+      return json.length > maxLength ? `${json.slice(0, maxLength)}...` : json;
+    } catch {
+      return '[Unserializable params]';
+    }
+  }
+
+  /**
+   * Throttle unknown notification logging to prevent memory/log explosions.
+   */
+  private logUnknownNotification(method: string): void {
+    const current = this.unknownNotificationCounts.get(method) ?? 0;
+    const next = current + 1;
+    this.unknownNotificationCounts.set(method, next);
+
+    if (next <= 3) {
+      this.debug(`Unknown notification: ${method}`);
+    } else if (next === 4) {
+      this.debug(`Suppressing further unknown notification logs for: ${method}`);
     }
   }
 

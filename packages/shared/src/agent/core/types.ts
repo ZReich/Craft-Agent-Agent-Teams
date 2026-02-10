@@ -92,6 +92,8 @@ export interface PromptBuilderConfig {
   systemPromptPreset?: 'default' | 'mini' | string;
   /** Whether running in headless mode */
   isHeadless?: boolean;
+  /** Agent backend type ('claude' | 'codex'). Affects agent teams tool references in prompt. */
+  agentBackend?: 'claude' | 'codex';
 }
 
 /**

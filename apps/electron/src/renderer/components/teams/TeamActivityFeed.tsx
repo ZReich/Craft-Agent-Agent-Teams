@@ -64,6 +64,11 @@ const MESSAGE_TYPES = new Set<TeamActivityType>(['message-sent', 'plan-submitted
 
 export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
   const [filter, setFilter] = useState<FilterType>('all')
+  // Implements REQ-001, REQ-002: keep activity feed anchored to bottom when appropriate
+  const viewportRef = React.useRef<HTMLDivElement>(null)
+  const endRef = React.useRef<HTMLDivElement>(null)
+  const isStickToBottomRef = React.useRef(true)
+  const skipSmoothUntilRef = React.useRef(0)
 
   const filteredEvents = useMemo(() => {
     if (filter === 'all') return events
@@ -71,6 +76,37 @@ export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
     if (filter === 'messages') return events.filter(e => MESSAGE_TYPES.has(e.type))
     return events.filter(e => !TASK_TYPES.has(e.type) && !MESSAGE_TYPES.has(e.type))
   }, [events, filter])
+
+  const scrollToBottom = React.useCallback((behavior: ScrollBehavior) => {
+    endRef.current?.scrollIntoView({ behavior, block: 'end' })
+  }, [])
+
+  // Scroll to bottom on mount/filter change (instant to avoid visible jump)
+  React.useLayoutEffect(() => {
+    scrollToBottom('instant')
+    isStickToBottomRef.current = true
+    skipSmoothUntilRef.current = Date.now() + 400
+  }, [filter, scrollToBottom])
+
+  // Track scroll position to toggle sticky behavior
+  React.useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const handleScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = viewport
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
+      isStickToBottomRef.current = distanceFromBottom < 20
+    }
+    viewport.addEventListener('scroll', handleScroll)
+    return () => viewport.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  // Auto-scroll on new events only when user is at bottom
+  React.useEffect(() => {
+    if (!isStickToBottomRef.current) return
+    if (Date.now() < skipSmoothUntilRef.current) return
+    scrollToBottom('smooth')
+  }, [filteredEvents.length, scrollToBottom])
 
   return (
     <div className={cn('flex flex-col h-full', className)}>
@@ -94,7 +130,7 @@ export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
       </div>
 
       {/* Timeline */}
-      <ScrollArea className="flex-1 min-h-0">
+      <ScrollArea className="flex-1 min-h-0" viewportRef={viewportRef}>
         <div className="p-3 space-y-1">
           {filteredEvents.length === 0 ? (
             <div className="flex items-center justify-center py-8 text-muted-foreground">
@@ -128,6 +164,7 @@ export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
               )
             })
           )}
+          <div ref={endRef} />
         </div>
       </ScrollArea>
     </div>

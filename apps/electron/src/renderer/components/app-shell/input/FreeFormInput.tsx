@@ -704,6 +704,17 @@ export function FreeFormInput({
     return active
   }, [permissionMode, ultrathinkEnabled])
 
+  const getRecentDirs = React.useCallback(() => {
+    return storage.get<string[]>(storage.KEYS.recentWorkingDirs, [])
+  }, [])
+
+  const addRecentDir = React.useCallback((path: string) => {
+    if (!path) return
+    const existing = storage.get<string[]>(storage.KEYS.recentWorkingDirs, [])
+    const merged = mergeRecentDirs([path], existing)
+    storage.set(storage.KEYS.recentWorkingDirs, merged)
+  }, [])
+
   // Handle slash command selection (mode/feature commands)
   const handleSlashCommand = React.useCallback((commandId: SlashCommandId) => {
     if (commandId === 'safe') onPermissionModeChange?.('safe')
@@ -719,7 +730,7 @@ export function FreeFormInput({
       setRecentFolders(getRecentDirs())
       onWorkingDirectoryChange(path)
     }
-  }, [onWorkingDirectoryChange])
+  }, [addRecentDir, getRecentDirs, onWorkingDirectoryChange])
 
   // Get recent folders and home directory for slash menu and mention menu
   const [recentFolders, setRecentFolders] = React.useState<string[]>([])
@@ -1580,6 +1591,8 @@ export function FreeFormInput({
           {/* 3. Working Directory Selector Badge */}
           {onWorkingDirectoryChange && (
             <WorkingDirectoryBadge
+              // Implements REQ-005: ensure workspaceId is passed for working directory persistence.
+              workspaceId={workspaceId}
               workingDirectory={workingDirectory}
               onWorkingDirectoryChange={onWorkingDirectoryChange}
               sessionFolderPath={sessionFolderPath}
@@ -1901,14 +1914,24 @@ export function FreeFormInput({
 /**
  * Helper functions for recent directories storage
  */
-function getRecentDirs(): string[] {
+function getLocalRecentDirs(): string[] {
   return storage.get<string[]>(storage.KEYS.recentWorkingDirs, [])
 }
 
-function addRecentDir(path: string): void {
-  const recent = getRecentDirs().filter(p => p !== path)
-  const updated = [path, ...recent].slice(0, 25)
-  storage.set(storage.KEYS.recentWorkingDirs, updated)
+function mergeRecentDirs(primary: string[], secondary: string[]): string[] {
+  const seen = new Set<string>()
+  const merged: string[] = []
+  for (const path of [...primary, ...secondary]) {
+    if (!path || seen.has(path)) continue
+    seen.add(path)
+    merged.push(path)
+  }
+  return merged.slice(0, 25)
+}
+
+function areDirsEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false
+  return a.every((value, index) => value === b[index])
 }
 
 /**
@@ -1931,11 +1954,13 @@ function formatPathForDisplay(path: string, homeDir: string): string {
  * Uses cmdk for filterable folder list when there are more than 5 recent folders.
  */
 function WorkingDirectoryBadge({
+  workspaceId,
   workingDirectory,
   onWorkingDirectoryChange,
   sessionFolderPath,
   isEmptySession = false,
 }: {
+  workspaceId?: string
   workingDirectory?: string
   onWorkingDirectoryChange: (path: string) => void
   sessionFolderPath?: string
@@ -1950,11 +1975,37 @@ function WorkingDirectoryBadge({
 
   // Load home directory and recent directories on mount
   React.useEffect(() => {
-    setRecentDirs(getRecentDirs())
+    let cancelled = false
+    const loadRecentDirs = async () => {
+      const localRecent = getLocalRecentDirs()
+      if (window.electronAPI && workspaceId) {
+        try {
+          const settings = await window.electronAPI.getWorkspaceSettings(workspaceId)
+          const storedRecent = settings?.recentWorkingDirectories ?? []
+          const merged = mergeRecentDirs(localRecent, storedRecent)
+          if (!areDirsEqual(merged, storedRecent)) {
+            await window.electronAPI.updateWorkspaceSetting(workspaceId, 'recentWorkingDirectories', merged)
+          }
+          if (localRecent.length > 0) {
+            storage.remove(storage.KEYS.recentWorkingDirs)
+          }
+          if (!cancelled) setRecentDirs(merged)
+        } catch (error) {
+          console.warn('[FreeFormInput] Failed to load workspace recent directories:', error)
+          if (!cancelled) setRecentDirs(localRecent)
+        }
+      } else if (!cancelled) {
+        setRecentDirs(localRecent)
+      }
+    }
+    void loadRecentDirs()
     window.electronAPI?.getHomeDir?.().then((dir: string) => {
-      if (dir) setHomeDir(dir)
+      if (dir && !cancelled) setHomeDir(dir)
     })
-  }, [])
+    return () => {
+      cancelled = true
+    }
+  }, [workspaceId])
 
   // Fetch git branch when working directory changes
   React.useEffect(() => {
@@ -1986,8 +2037,15 @@ function WorkingDirectoryBadge({
     // flash back to the input without visual confirmation of what happened.
     const selectedPath = await window.electronAPI.openFolderDialog()
     if (selectedPath) {
-      addRecentDir(selectedPath)
-      setRecentDirs(getRecentDirs())
+      setRecentDirs((prev) => {
+        const updated = mergeRecentDirs([selectedPath], prev)
+        if (workspaceId && window.electronAPI) {
+          void window.electronAPI.updateWorkspaceSetting(workspaceId, 'recentWorkingDirectories', updated)
+        } else {
+          storage.set(storage.KEYS.recentWorkingDirs, updated)
+        }
+        return updated
+      })
       onWorkingDirectoryChange(selectedPath)
     }
     // Close after the dialog completes (whether user picked or cancelled)
@@ -1995,8 +2053,15 @@ function WorkingDirectoryBadge({
   }
 
   const handleSelectRecent = (path: string) => {
-    addRecentDir(path) // Move to top of recent list
-    setRecentDirs(getRecentDirs())
+    setRecentDirs((prev) => {
+      const updated = mergeRecentDirs([path], prev)
+      if (workspaceId && window.electronAPI) {
+        void window.electronAPI.updateWorkspaceSetting(workspaceId, 'recentWorkingDirectories', updated)
+      } else {
+        storage.set(storage.KEYS.recentWorkingDirs, updated)
+      }
+      return updated
+    })
     onWorkingDirectoryChange(path)
     setPopoverOpen(false)
   }
