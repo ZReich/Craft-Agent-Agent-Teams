@@ -403,6 +403,7 @@ export class ClaudeAgent extends BaseAgent {
   // When true, prevents premature session completion after spawning teammates
   private activeTeamName: string | null = null;
   private activeTeammateCount: number = 0;
+  private hookSystem?: HookSystem;
 
   /**
    * Get the session ID for mode operations.
@@ -481,6 +482,7 @@ export class ClaudeAgent extends BaseAgent {
     super(backendConfig, DEFAULT_MODEL, CLAUDE_CONTEXT_WINDOW);
 
     this.isHeadless = config.isHeadless ?? false;
+    this.hookSystem = config.hookSystem;
 
     // Log which model is being used (helpful for debugging custom models)
     this.debug(`Using model: ${model}`);
@@ -820,7 +822,7 @@ export class ClaudeAgent extends BaseAgent {
         // User hooks from hooks.json are merged with internal hooks
         hooks: (() => {
           // Build user-defined hooks from hooks.json using the workspace-level HookSystem
-          const userHooks = this.config.hookSystem?.buildSdkHooks() ?? {};
+          const userHooks: Partial<Record<string, SdkHookCallbackMatcher[]>> = this.hookSystem?.buildSdkHooks() ?? {};
           if (Object.keys(userHooks).length > 0) {
             debug('[CraftAgent] User SDK hooks loaded:', Object.keys(userHooks).join(', '));
           }
@@ -828,15 +830,20 @@ export class ClaudeAgent extends BaseAgent {
           // Internal hooks for permission handling and logging
           const internalHooks: Record<string, SdkHookCallbackMatcher[]> = {
           PreToolUse: [{
-            hooks: [async (input) => {
+            hooks: [async (input, toolUseId) => {
               // Only handle PreToolUse events
               if (input.hook_event_name !== 'PreToolUse') {
+                return { continue: true };
+              }
+              const toolName = input.tool_name;
+              if (!toolName) {
+                this.onDebug?.('PreToolUse hook: missing tool name, allowing by default');
                 return { continue: true };
               }
 
               // Get current permission mode (single source of truth)
               const permissionMode = getPermissionMode(sessionId);
-              this.onDebug?.(`PreToolUse hook: ${input.tool_name} (permissionMode=${permissionMode})`);
+              this.onDebug?.(`PreToolUse hook: ${toolName} (permissionMode=${permissionMode})`);
 
               // ============================================================
               // PERMISSION MODE HANDLING
@@ -855,7 +862,7 @@ export class ClaudeAgent extends BaseAgent {
               if (permissionMode === 'allow-all') {
                 const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
                 const result = shouldAllowToolInMode(
-                  input.tool_name,
+                  toolName,
                   input.tool_input,
                   'allow-all',
                   { plansFolderPath, permissionsContext }
@@ -863,11 +870,11 @@ export class ClaudeAgent extends BaseAgent {
 
                 if (!result.allowed) {
                   // Tool is explicitly blocked in permissions.json
-                  this.onDebug?.(`Allow-all mode: blocking explicitly blocked tool ${input.tool_name}`);
+                  this.onDebug?.(`Allow-all mode: blocking explicitly blocked tool ${toolName}`);
                   return blockWithReason(result.reason);
                 }
 
-                this.onDebug?.(`Allow-all mode: allowing ${input.tool_name}`);
+                this.onDebug?.(`Allow-all mode: allowing ${toolName}`);
                 // Fall through to source blocking and other checks below
               }
 
@@ -875,7 +882,7 @@ export class ClaudeAgent extends BaseAgent {
               if (permissionMode === 'ask') {
                 const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
                 const result = shouldAllowToolInMode(
-                  input.tool_name,
+                  toolName,
                   input.tool_input,
                   'ask',
                   { plansFolderPath, permissionsContext }
@@ -883,7 +890,7 @@ export class ClaudeAgent extends BaseAgent {
 
                 if (!result.allowed) {
                   // Tool is explicitly blocked in permissions.json
-                  this.onDebug?.(`Ask mode: blocking explicitly blocked tool ${input.tool_name}`);
+                  this.onDebug?.(`Ask mode: blocking explicitly blocked tool ${toolName}`);
                   return blockWithReason(result.reason);
                 }
                 // Don't return here - fall through to other checks (like prompting for permission)
@@ -893,7 +900,7 @@ export class ClaudeAgent extends BaseAgent {
               if (permissionMode === 'safe') {
                 const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
                 const result = shouldAllowToolInMode(
-                  input.tool_name,
+                  toolName,
                   input.tool_input,
                   'safe',
                   { plansFolderPath, permissionsContext }
@@ -901,11 +908,11 @@ export class ClaudeAgent extends BaseAgent {
 
                 if (!result.allowed) {
                   // In safe mode, always block without prompting
-                  this.onDebug?.(`Safe mode: blocking ${input.tool_name}`);
+                  this.onDebug?.(`Safe mode: blocking ${toolName}`);
                   return blockWithReason(result.reason);
                 }
 
-                this.onDebug?.(`Allowed in safe mode: ${input.tool_name}`);
+                this.onDebug?.(`Allowed in safe mode: ${toolName}`);
                 // Fall through to source blocking and other checks below
               }
 
@@ -915,7 +922,7 @@ export class ClaudeAgent extends BaseAgent {
               // we intercept it and create a separate session instead of in-process execution.
               // ============================================================
               // --- Task tool: Spawn teammate as a separate session ---
-              if (input.tool_name === 'Task' && this.onTeammateSpawnRequested) {
+              if (toolName === 'Task' && this.onTeammateSpawnRequested) {
                 const toolInput = input.tool_input as Record<string, unknown>;
                 if (toolInput.team_name && typeof toolInput.team_name === 'string') {
                   const teamName = toolInput.team_name;
@@ -961,7 +968,7 @@ export class ClaudeAgent extends BaseAgent {
               }
 
               // --- SendMessage tool: Route messages to teammate sessions ---
-              if (input.tool_name === 'SendMessage' && this.onTeammateMessage) {
+              if (toolName === 'SendMessage' && this.onTeammateMessage) {
                 const toolInput = input.tool_input as Record<string, unknown>;
                 const msgType = (toolInput.type as string) || 'message';
 
@@ -1003,7 +1010,7 @@ export class ClaudeAgent extends BaseAgent {
               // We don't need to intercept it.
 
               // --- TeamDelete: Trigger our session-based cleanup ---
-              if (input.tool_name === 'TeamDelete' && this.onTeammateMessage) {
+              if (toolName === 'TeamDelete' && this.onTeammateMessage) {
                 this.onDebug?.('[AgentTeams] Intercepting TeamDelete — cleaning up team sessions');
                 // Reset team state on this agent
                 this.activeTeamName = null;
@@ -1019,9 +1026,9 @@ export class ClaudeAgent extends BaseAgent {
               // against the current active source set on each tool call.
               // If a source exists but isn't enabled, try to auto-enable it.
               // ============================================================
-              if (input.tool_name.startsWith('mcp__')) {
+              if (toolName.startsWith('mcp__')) {
                 // Extract server name from tool name (mcp__<server>__<tool>)
-                const parts = input.tool_name.split('__');
+                const parts = toolName.split('__');
                 const serverName = parts[1];
                 if (parts.length >= 3 && serverName) {
                   // Built-in MCP servers that are always available (not user sources)
@@ -1072,7 +1079,7 @@ export class ClaudeAgent extends BaseAgent {
                         }
                       } else if (sourceExists) {
                         // Source exists but no activation handler - just inform
-                        this.onDebug?.(`BLOCKED source tool: ${input.tool_name} (source "${serverName}" exists but is not enabled)`);
+                        this.onDebug?.(`BLOCKED source tool: ${toolName} (source "${serverName}" exists but is not enabled)`);
                         return {
                           continue: false,
                           decision: 'block' as const,
@@ -1080,7 +1087,7 @@ export class ClaudeAgent extends BaseAgent {
                         };
                       } else {
                         // Source doesn't exist or can't be connected
-                        this.onDebug?.(`BLOCKED source tool: ${input.tool_name} (source "${serverName}" does not exist)`);
+                        this.onDebug?.(`BLOCKED source tool: ${toolName} (source "${serverName}" does not exist)`);
                         return {
                           continue: false,
                           decision: 'block' as const,
@@ -1103,7 +1110,7 @@ export class ClaudeAgent extends BaseAgent {
 
               // PATH EXPANSION: Expand ~ in file paths for SDK file tools
               const pathResult = expandToolPaths(
-                input.tool_name,
+                toolName,
                 toolInput,
                 (msg) => this.onDebug?.(msg)
               );
@@ -1113,7 +1120,7 @@ export class ClaudeAgent extends BaseAgent {
 
               // CONFIG FILE VALIDATION: Validate config writes before they happen
               const configResult = validateConfigWrite(
-                input.tool_name,
+                toolName,
                 modifiedInput || toolInput,
                 this.workspaceRootPath,
                 (msg) => this.onDebug?.(msg)
@@ -1128,7 +1135,7 @@ export class ClaudeAgent extends BaseAgent {
 
               // SKILL QUALIFICATION: Ensure skill names are fully-qualified
               // SDK expects "workspaceSlug:skillSlug" format, NOT UUID
-              if (input.tool_name === 'Skill') {
+              if (toolName === 'Skill') {
                 const workspaceSlug = extractWorkspaceSlug(this.workspaceRootPath, this.config.workspace.id);
                 const skillResult = qualifySkillName(
                   modifiedInput || toolInput,
@@ -1143,7 +1150,7 @@ export class ClaudeAgent extends BaseAgent {
               // TOOL METADATA STRIPPING: Remove _intent/_displayName from ALL tools
               // (extracted for UI in tool-matching.ts, stripped here before SDK execution)
               const metadataResult = stripToolMetadata(
-                input.tool_name,
+                toolName,
                 modifiedInput || toolInput,
                 (msg) => this.onDebug?.(msg)
               );
@@ -1170,13 +1177,13 @@ export class ClaudeAgent extends BaseAgent {
 
               // Helper to request permission and wait for response
               const requestPermission = async (
-                toolUseId: string,
+                toolUseId: string | undefined,
                 toolName: string,
                 command: string,
                 baseCommand: string,
                 description: string
               ): Promise<{ allowed: boolean }> => {
-                const requestId = `perm-${toolUseId}`;
+                const requestId = `perm-${toolUseId ?? 'unknown'}`;
                 debug(`[PreToolUse] Requesting permission for ${toolName}: ${command}`);
 
                 const permissionPromise = new Promise<boolean>((resolve) => {
@@ -1206,22 +1213,22 @@ export class ClaudeAgent extends BaseAgent {
 
               // For file write operations in 'ask' mode, prompt for permission
               const fileWriteTools = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
-              if (fileWriteTools.has(input.tool_name) && permissionMode === 'ask') {
+              if (fileWriteTools.has(toolName) && permissionMode === 'ask') {
                 const toolInput = input.tool_input as Record<string, unknown>;
                 const filePath = (toolInput.file_path as string) || (toolInput.notebook_path as string) || 'unknown';
 
                 // Check if this tool type is already allowed for this session
-                if (this.permissionManager.isCommandWhitelisted(input.tool_name)) {
-                  this.onDebug?.(`Auto-allowing "${input.tool_name}" (previously approved)`);
+                if (this.permissionManager.isCommandWhitelisted(toolName)) {
+                  this.onDebug?.(`Auto-allowing "${toolName}" (previously approved)`);
                   return { continue: true };
                 }
 
                 const result = await requestPermission(
-                  input.tool_use_id,
-                  input.tool_name,
+                  toolUseId,
+                  toolName,
                   filePath,
-                  input.tool_name,
-                  `${input.tool_name}: ${filePath}`
+                  toolName,
+                  `${toolName}: ${filePath}`
                 );
 
                 if (!result.allowed) {
@@ -1234,11 +1241,11 @@ export class ClaudeAgent extends BaseAgent {
               }
 
               // For MCP mutation tools in 'ask' mode, prompt for permission
-              if (input.tool_name.startsWith('mcp__') && permissionMode === 'ask') {
+              if (toolName.startsWith('mcp__') && permissionMode === 'ask') {
                 // Check if this is a mutation tool by testing against safe mode's read-only patterns
                 const plansFolderPath = sessionId ? getSessionPlansPath(this.workspaceRootPath, sessionId) : undefined;
                 const safeModeResult = shouldAllowToolInMode(
-                  input.tool_name,
+                  toolName,
                   input.tool_input,
                   'safe',
                   { plansFolderPath }
@@ -1246,19 +1253,19 @@ export class ClaudeAgent extends BaseAgent {
 
                 // If it would be blocked in safe mode, it's a mutation and needs permission
                 if (!safeModeResult.allowed) {
-                  const serverAndTool = input.tool_name.replace('mcp__', '').replace(/__/g, '/');
+                  const serverAndTool = toolName.replace('mcp__', '').replace(/__/g, '/');
 
                   // Check if this tool is already allowed for this session
-                  if (this.permissionManager.isCommandWhitelisted(input.tool_name)) {
-                    this.onDebug?.(`Auto-allowing "${input.tool_name}" (previously approved)`);
+                  if (this.permissionManager.isCommandWhitelisted(toolName)) {
+                    this.onDebug?.(`Auto-allowing "${toolName}" (previously approved)`);
                     return { continue: true };
                   }
 
                   const result = await requestPermission(
-                    input.tool_use_id,
+                    toolUseId,
                     'MCP Tool',
                     serverAndTool,
-                    input.tool_name,
+                    toolName,
                     `MCP: ${serverAndTool}`
                   );
 
@@ -1273,7 +1280,7 @@ export class ClaudeAgent extends BaseAgent {
               }
 
               // For API mutation calls in 'ask' mode, prompt for permission
-              if (input.tool_name.startsWith('api_') && permissionMode === 'ask') {
+              if (toolName.startsWith('api_') && permissionMode === 'ask') {
                 const toolInput = input.tool_input as Record<string, unknown>;
                 const method = ((toolInput?.method as string) || 'GET').toUpperCase();
                 const path = toolInput?.path as string | undefined;
@@ -1295,7 +1302,7 @@ export class ClaudeAgent extends BaseAgent {
                   }
 
                   const result = await requestPermission(
-                    input.tool_use_id,
+                    toolUseId,
                     'API Call',
                     apiDescription,
                     apiDescription,
@@ -1313,7 +1320,7 @@ export class ClaudeAgent extends BaseAgent {
               }
 
               // For Bash in 'ask' mode, check if we need permission
-              if (input.tool_name === 'Bash' && permissionMode === 'ask') {
+              if (toolName === 'Bash' && permissionMode === 'ask') {
                 // Extract command and base command
                 const command = typeof input.tool_input === 'object' && input.tool_input !== null
                   ? (input.tool_input as Record<string, unknown>).command
@@ -1346,13 +1353,13 @@ export class ClaudeAgent extends BaseAgent {
                 }
 
                 // Ask for permission
-                const requestId = `perm-${input.tool_use_id}`;
+                const requestId = `perm-${toolUseId}`;
                 debug(`[PreToolUse] Requesting permission for Bash command: ${commandStr}`);
 
                 const permissionPromise = new Promise<boolean>((resolve) => {
                   this.pendingPermissions.set(requestId, {
                     resolve,
-                    toolName: input.tool_name,
+                    toolName,
                     command: commandStr,
                     baseCommand,
                   });
@@ -1361,7 +1368,7 @@ export class ClaudeAgent extends BaseAgent {
                 if (this.onPermissionRequest) {
                   this.onPermissionRequest({
                     requestId,
-                    toolName: input.tool_name,
+                    toolName,
                     command: commandStr,
                     description: `Execute: ${commandStr}`,
                   });
@@ -1415,6 +1422,7 @@ export class ClaudeAgent extends BaseAgent {
           // Internal hooks run first (permissions), then user hooks
           const mergedHooks: Record<string, SdkHookCallbackMatcher[]> = { ...internalHooks };
           for (const [event, matchers] of Object.entries(userHooks)) {
+            if (!matchers) continue;
             if (mergedHooks[event]) {
               // Append user hooks after internal hooks
               mergedHooks[event] = [...mergedHooks[event], ...matchers];

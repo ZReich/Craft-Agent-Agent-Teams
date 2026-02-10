@@ -430,7 +430,7 @@ export class HookSystem implements HooksConfigProvider {
       sdkHooks[event] = matchers.filter(m => m.enabled !== false).map(matcher => ({
         matcher: matcher.matcher,
         timeout: 30,
-        hooks: [async (input: SdkHookInput, _toolUseId: string, options: { signal?: AbortSignal }) => {
+        hooks: [async (input: SdkHookInput, _toolUseId: string | undefined, options: { signal?: AbortSignal }) => {
           // Build environment variables from SDK input
           const env = buildEnvFromSdkInput(event, input);
 

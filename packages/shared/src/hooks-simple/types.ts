@@ -191,9 +191,18 @@ export interface SdkHookInput {
  */
 export type SdkHookCallback = (
   input: SdkHookInput,
-  toolUseId: string,
+  toolUseId: string | undefined,
   options: { signal?: AbortSignal }
-) => Promise<{ continue: boolean; reason?: string }>;
+) => Promise<{
+  continue?: boolean;
+  reason?: string;
+  decision?: 'approve' | 'block';
+  suppressOutput?: boolean;
+  stopReason?: string;
+  systemMessage?: string;
+  hookSpecificOutput?: unknown;
+  [key: string]: unknown;
+}>;
 
 /**
  * SDK hook matcher format (matches Claude SDK HookCallbackMatcher type)
