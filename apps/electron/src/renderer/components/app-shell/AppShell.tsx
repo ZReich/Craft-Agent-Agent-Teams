@@ -25,6 +25,7 @@ import {
   FolderOpen,
   HelpCircle,
   ExternalLink,
+  Cake,
 } from "lucide-react"
 import { PanelRightRounded } from "../icons/PanelRightRounded"
 import { PanelLeftRounded } from "../icons/PanelLeftRounded"
@@ -38,7 +39,7 @@ import { isMac } from "@/lib/platform"
 import { Button } from "@/components/ui/button"
 import { HeaderIconButton } from "@/components/ui/HeaderIconButton"
 import { Separator } from "@/components/ui/separator"
-import { Tooltip, TooltipTrigger, TooltipContent } from "@craft-agent/ui"
+import { Tooltip, TooltipTrigger, TooltipContent, DocumentFormattedMarkdownOverlay } from "@craft-agent/ui"
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -518,6 +519,20 @@ function AppShellContent({
     setIsFocusModeActive((prev) => !prev)
   }, [])
 
+  // What's New overlay
+  const [showWhatsNew, setShowWhatsNew] = React.useState(false)
+  const [releaseNotesContent, setReleaseNotesContent] = React.useState('')
+  const [hasUnseenReleaseNotes, setHasUnseenReleaseNotes] = React.useState(false)
+
+  // Check for unseen release notes on mount
+  useEffect(() => {
+    window.electronAPI.getLatestReleaseVersion().then((latestVersion) => {
+      if (!latestVersion) return
+      const lastSeen = storage.get(storage.KEYS.whatsNewLastSeenVersion, '')
+      setHasUnseenReleaseNotes(lastSeen !== latestVersion)
+    })
+  }, [])
+
   // Window width tracking for responsive behavior
   const [windowWidth, setWindowWidth] = React.useState(window.innerWidth)
 
@@ -821,16 +836,6 @@ function AppShellContent({
     })
     return cleanup
   }, [])
-
-  // Load skills from backend on mount
-  React.useEffect(() => {
-    if (!activeWorkspaceId) return
-    window.electronAPI.getSkills(activeWorkspaceId).then((loaded) => {
-      setSkills(loaded || [])
-    }).catch(err => {
-      console.error('[Chat] Failed to load skills:', err)
-    })
-  }, [activeWorkspaceId])
 
   // Subscribe to live skill updates (when skills are added/removed dynamically)
   React.useEffect(() => {
@@ -1207,6 +1212,20 @@ function AppShellContent({
   // Use session metadata from Jotai atom (lightweight, no messages)
   // This prevents closures from retaining full message arrays
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
+
+  // Reload skills when active session's workingDirectory changes (for project-level skills)
+  // Skills are loaded from: global (~/.agents/skills/), workspace, and project ({workingDirectory}/.agents/skills/)
+  const activeSessionWorkingDirectory = session.selected
+    ? sessionMetaMap.get(session.selected)?.workingDirectory
+    : undefined
+  React.useEffect(() => {
+    if (!activeWorkspaceId) return
+    window.electronAPI.getSkills(activeWorkspaceId, activeSessionWorkingDirectory).then((loaded) => {
+      setSkills(loaded || [])
+    }).catch(err => {
+      console.error('[Chat] Failed to load skills:', err)
+    })
+  }, [activeWorkspaceId, activeSessionWorkingDirectory])
 
   // Filter session metadata by active workspace
   // Also exclude hidden sessions (mini-agent sessions) from all counts and lists
@@ -1589,6 +1608,19 @@ function AppShellContent({
     navigate(routes.view.settings(subpage))
   }, [])
 
+  // Handler for What's New overlay
+  const handleWhatsNewClick = useCallback(async () => {
+    const content = await window.electronAPI.getReleaseNotes()
+    setReleaseNotesContent(content)
+    setShowWhatsNew(true)
+    setHasUnseenReleaseNotes(false)
+    // Update last seen version
+    const latestVersion = await window.electronAPI.getLatestReleaseVersion()
+    if (latestVersion) {
+      storage.set(storage.KEYS.whatsNewLastSeenVersion, latestVersion)
+    }
+  }, [])
+
   // ============================================================================
   // EDIT POPOVER STATE
   // ============================================================================
@@ -1719,7 +1751,10 @@ function AppShellContent({
     const newSession = await onCreateSession(activeWorkspace.id)
     // Navigate to the new session via central routing
     navigate(routes.view.allSessions(newSession.id))
-  }, [activeWorkspace, onCreateSession])
+
+    // Focus the chat input after navigation completes
+    setTimeout(() => focusZone('chat', { intent: 'programmatic' }), 50)
+  }, [activeWorkspace, onCreateSession, focusZone])
 
   // Delete Source - simplified since agents system is removed
   const handleDeleteSource = useCallback(async (sourceSlug: string) => {
@@ -1792,9 +1827,10 @@ function AppShellContent({
     result.push({ id: 'nav:sources', type: 'nav', action: handleSourcesClick })
     result.push({ id: 'nav:skills', type: 'nav', action: handleSkillsClick })
     result.push({ id: 'nav:settings', type: 'nav', action: () => handleSettingsClick('app') })
+    result.push({ id: 'nav:whats-new', type: 'nav', action: handleWhatsNewClick })
 
     return result
-  }, [handleAllSessionsClick, handleFlaggedClick, handleArchivedClick, handleTodoStateClick, effectiveTodoStates, handleLabelClick, labelConfigs, labelTree, viewConfigs, handleViewClick, handleSourcesClick, handleSkillsClick, handleSettingsClick])
+  }, [handleAllSessionsClick, handleFlaggedClick, handleArchivedClick, handleTodoStateClick, effectiveTodoStates, handleLabelClick, labelConfigs, labelTree, viewConfigs, handleViewClick, handleSourcesClick, handleSkillsClick, handleSettingsClick, handleWhatsNewClick])
 
   // Toggle folder expanded state
   const handleToggleFolder = React.useCallback((path: string) => {
@@ -2263,6 +2299,19 @@ function AppShellContent({
                       variant: isSettingsNavigation(navState) ? "default" : "ghost",
                       onClick: () => handleSettingsClick('app'),
                     },
+                    // --- What's New ---
+                    {
+                      id: "nav:whats-new",
+                      title: "What's New",
+                      icon: hasUnseenReleaseNotes ? (
+                        <span className="relative">
+                          <Cake className="h-3.5 w-3.5" />
+                          <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-accent" />
+                        </span>
+                      ) : Cake,
+                      variant: "ghost" as const,
+                      onClick: handleWhatsNewClick,
+                    },
                   ]}
                 />
                 {/* Agent Tree: Hierarchical list of agents */}
@@ -2378,7 +2427,7 @@ function AppShellContent({
           >
             <div
               style={{ width: sessionListWidth }}
-              className="h-full flex flex-col min-w-0"
+              className="h-full flex flex-col min-w-0 titlebar-no-drag relative z-panel"
             >
             <PanelHeader
               title={isSidebarVisible ? listTitle : undefined}
@@ -3318,6 +3367,14 @@ function AppShellContent({
           />
         </>
       )}
+
+      {/* What's New overlay */}
+      <DocumentFormattedMarkdownOverlay
+        isOpen={showWhatsNew}
+        onClose={() => setShowWhatsNew(false)}
+        content={releaseNotesContent}
+        onOpenUrl={(url) => window.electronAPI.openUrl(url)}
+      />
 
     </AppShellProvider>
   )

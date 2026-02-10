@@ -1,6 +1,6 @@
 {
   "name": "craft-agent",
-  "version": "0.4.1",
+  "version": "0.4.3",
   "description": "Claude Code-like agent for Craft documents",
   "type": "module",
   "private": true,
@@ -89,8 +89,9 @@
     "vitest": "^4.0.18"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.19",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.37",
     "@anthropic-ai/sdk": "^0.71.1",
+    "@github/copilot-sdk": "^0.1.23",
     "@modelcontextprotocol/sdk": "^1.24.3",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-collapsible": "^1.1.12",
