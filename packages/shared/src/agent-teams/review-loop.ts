@@ -118,6 +118,7 @@ export interface ReviewLoopConfig {
 // ============================================================
 
 export class ReviewLoopOrchestrator extends EventEmitter {
+  private static readonly MAX_QUEUE_DEPTH = 50;
   private reviews = new Map<string, ReviewState>();  // taskId → ReviewState
   private callbacks: ReviewLoopCallbacks;
   private config: ReviewLoopConfig;
@@ -164,6 +165,16 @@ export class ReviewLoopOrchestrator extends EventEmitter {
     } else {
       // Resuming after rework — keep cycle history
       existing.status = 'pending';
+    }
+
+    if (this.queue.length >= ReviewLoopOrchestrator.MAX_QUEUE_DEPTH) {
+      this.emit('review:queue_full', {
+        teamId,
+        taskId,
+        teammateId: task.assignee || '',
+        maxQueueDepth: ReviewLoopOrchestrator.MAX_QUEUE_DEPTH,
+      });
+      return;
     }
 
     this.queue.push({ teamId, taskId, task });
@@ -466,6 +477,19 @@ export class ReviewLoopOrchestrator extends EventEmitter {
       // Return task to in_progress so teammate can rework
       this.callbacks.updateTaskStatus(teamId, taskId, 'in_progress', review.teammateId);
 
+      // --- Auto-remediation: extract missing requirements from spec_compliance ---
+      if (result.stages.spec_compliance && !result.stages.spec_compliance.passed) {
+        const missingReqs = this.extractMissingRequirements(result);
+        if (missingReqs.length > 0) {
+          this.emit('review:remediation-needed', {
+            teamId,
+            taskId,
+            teammateId: review.teammateId,
+            missingRequirements: missingReqs,
+          });
+        }
+      }
+
       this.emit('review:failed', {
         teamId,
         taskId,
@@ -499,5 +523,36 @@ export class ReviewLoopOrchestrator extends EventEmitter {
         data: { reportLength: failureReport.length },
       });
     }
+  }
+
+  // ============================================================
+  // Auto-Remediation Helpers
+  // ============================================================
+
+  /**
+   * Extract missing requirement IDs from a quality gate result.
+   * Parses the spec_compliance stage issues for "Requirement REQ-XXX is not addressed" patterns.
+   */
+  private extractMissingRequirements(result: QualityGateResult): string[] {
+    const specStage = result.stages.spec_compliance;
+    if (!specStage) return [];
+
+    const missing: string[] = [];
+    const reqPattern = /[Rr]equirement\s+(REQ-\w+)\s+is\s+not\s+addressed/;
+    const partialPattern = /[Rr]equirement\s+(REQ-\w+)\s+appears?\s+only\s+partially/;
+
+    for (const issue of specStage.issues) {
+      const fullMatch = reqPattern.exec(issue);
+      if (fullMatch?.[1]) {
+        missing.push(fullMatch[1]);
+        continue;
+      }
+      const partialMatch = partialPattern.exec(issue);
+      if (partialMatch?.[1]) {
+        missing.push(partialMatch[1]);
+      }
+    }
+
+    return [...new Set(missing)];
   }
 }

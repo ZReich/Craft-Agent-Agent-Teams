@@ -15,6 +15,7 @@
 import { EventEmitter } from 'events';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { runTypeCheckCached, runTestSuiteCached } from './local-checks';
 
 const execAsync = promisify(exec);
 
@@ -62,6 +63,8 @@ export interface IntegrationGateConfig {
   testSuiteTimeoutMs: number;
   /** Whether to skip tests (useful if only checking compilation). Default: false */
   skipTests: boolean;
+  /** Optional cache namespace for local compile/test checks */
+  localCheckCacheKey?: string;
 }
 
 export const DEFAULT_INTEGRATION_CONFIG: Partial<IntegrationGateConfig> = {
@@ -142,119 +145,39 @@ export class IntegrationGate extends EventEmitter {
    * Run TypeScript compilation on the full project.
    */
   private async runTypeCheck(workDir: string): Promise<IntegrationCheckResult['typeCheck']> {
-    try {
-      await execAsync('npx tsc --noEmit --pretty false 2>&1', {
-        cwd: workDir,
-        timeout: this.config.typeCheckTimeoutMs,
-      });
-      return { passed: true, errorCount: 0, errors: [] };
-    } catch (err: unknown) {
-      const error = err as { stdout?: string; stderr?: string };
-      const output = (error.stdout || error.stderr || '').trim();
-      const errors = output.split('\n').filter(l => l.includes('error TS'));
-
-      // If no actual TS errors found, may be a tooling issue — treat as pass
-      if (errors.length === 0 && output.length > 0) {
-        // Try with bun as fallback
-        try {
-          await execAsync('bun run tsc --noEmit --pretty false 2>&1', {
-            cwd: workDir,
-            timeout: this.config.typeCheckTimeoutMs,
-          });
-          return { passed: true, errorCount: 0, errors: [] };
-        } catch {
-          // If both fail without TS errors, treat as infrastructure issue
-          return { passed: true, errorCount: 0, errors: [] };
-        }
-      }
-
-      return {
-        passed: false,
-        errorCount: errors.length,
-        errors: errors.slice(0, 30), // Cap at 30 errors
-      };
-    }
+    const result = await runTypeCheckCached({
+      workingDir: workDir,
+      timeoutMs: this.config.typeCheckTimeoutMs,
+      cacheKey: this.config.localCheckCacheKey
+        ? `${this.config.localCheckCacheKey}:typecheck`
+        : undefined,
+    });
+    return {
+      passed: result.passed,
+      errorCount: result.errorCount,
+      errors: result.errors,
+    };
   }
 
   /**
    * Run the full test suite.
    */
   private async runTestSuite(workDir: string): Promise<IntegrationCheckResult['testSuite']> {
-    try {
-      const { stdout } = await execAsync('npx vitest run --reporter=json -c vitest.config.ts', {
-        cwd: workDir,
-        timeout: this.config.testSuiteTimeoutMs,
-        env: { ...process.env, CRAFT_DEBUG: '0' },
-      });
-
-      const jsonMatch = stdout.match(/\{[\s\S]*"testResults"[\s\S]*\}/);
-      if (jsonMatch) {
-        const results = JSON.parse(jsonMatch[0]);
-        const passed = results.numPassedTests || 0;
-        const failed = results.numFailedTests || 0;
-        const skipped = results.numPendingTests || 0;
-        const total = passed + failed + skipped;
-
-        const failedTests = (results.testResults || [])
-          .filter((t: { status: string }) => t.status === 'failed')
-          .map((t: { name: string }) => t.name)
-          .slice(0, 20);
-
-        return {
-          passed: failed === 0,
-          total,
-          passed_count: passed,
-          failed,
-          skipped,
-          failedTests,
-        };
-      }
-
-      // Fallback: text parsing
-      const hasFailure = /FAIL|failed/i.test(stdout);
-      return {
-        passed: !hasFailure,
-        total: 0,
-        passed_count: 0,
-        failed: hasFailure ? 1 : 0,
-        skipped: 0,
-        failedTests: hasFailure ? ['Test suite reported failures'] : [],
-      };
-    } catch (err: unknown) {
-      const error = err as { stdout?: string; stderr?: string; code?: number };
-      const output = (error.stdout || error.stderr || '').trim();
-
-      // vitest exits with code 1 on test failures
-      if (error.code === 1) {
-        const jsonMatch = output.match(/\{[\s\S]*"testResults"[\s\S]*\}/);
-        if (jsonMatch) {
-          try {
-            const results = JSON.parse(jsonMatch[0]);
-            const passed = results.numPassedTests || 0;
-            const failed = results.numFailedTests || 0;
-            const skipped = results.numPendingTests || 0;
-
-            const failedTests = (results.testResults || [])
-              .filter((t: { status: string }) => t.status === 'failed')
-              .map((t: { name: string }) => t.name)
-              .slice(0, 20);
-
-            return { passed: false, total: passed + failed + skipped, passed_count: passed, failed, skipped, failedTests };
-          } catch {
-            // JSON parse failed
-          }
-        }
-      }
-
-      return {
-        passed: false,
-        total: 0,
-        passed_count: 0,
-        failed: 1,
-        skipped: 0,
-        failedTests: [output.slice(0, 200) || 'Test execution failed'],
-      };
-    }
+    const result = await runTestSuiteCached({
+      workingDir: workDir,
+      timeoutMs: this.config.testSuiteTimeoutMs,
+      cacheKey: this.config.localCheckCacheKey
+        ? `${this.config.localCheckCacheKey}:tests`
+        : undefined,
+    });
+    return {
+      passed: result.passed,
+      total: result.total,
+      passed_count: result.passed_count,
+      failed: result.failed,
+      skipped: result.skipped,
+      failedTests: result.failedTests,
+    };
   }
 
   /**

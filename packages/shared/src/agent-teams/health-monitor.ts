@@ -82,6 +82,9 @@ const MAX_RECENT_TOOL_CALLS = 20;
 /** Minimum interval between emitting the same issue type for the same teammate (ms) */
 const DEBOUNCE_INTERVAL_MS = 2 * 60 * 1000;
 
+/** Maximum number of retained health issues per teammate */
+const MAX_RETAINED_ISSUES = 20;
+
 // ============================================================
 // TeammateHealthMonitor
 // ============================================================
@@ -138,6 +141,39 @@ export class TeammateHealthMonitor extends EventEmitter {
     if (interval) {
       clearInterval(interval);
       this.intervals.delete(teamId);
+    }
+  }
+
+  /**
+   * Remove a teammate from health tracking for a team.
+   * Safe no-op if the teammate or team does not exist.
+   */
+  removeTeammate(teamId: string, teammateId: string): void {
+    const teamStates = this.states.get(teamId);
+    if (!teamStates) return;
+
+    teamStates.delete(teammateId);
+
+    // Clean up debounce keys for this teammate so stale issue state does not linger.
+    for (const key of Array.from(this.lastEmitted.keys())) {
+      if (key.startsWith(`${teamId}:${teammateId}:`)) {
+        this.lastEmitted.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Clear all health tracking state for a specific team.
+   * Also stops monitoring interval for that team.
+   */
+  clearTeam(teamId: string): void {
+    this.stopMonitoring(teamId);
+    this.states.delete(teamId);
+
+    for (const key of Array.from(this.lastEmitted.keys())) {
+      if (key.startsWith(`${teamId}:`)) {
+        this.lastEmitted.delete(key);
+      }
     }
   }
 
@@ -353,6 +389,9 @@ export class TeammateHealthMonitor extends EventEmitter {
     const state = this.states.get(teamId)?.get(issue.teammateId);
     if (state) {
       state.issues.push(issue);
+      if (state.issues.length > MAX_RETAINED_ISSUES) {
+        state.issues.splice(0, state.issues.length - MAX_RETAINED_ISSUES);
+      }
     }
 
     this.emit(`health:${issue.type}`, issue);

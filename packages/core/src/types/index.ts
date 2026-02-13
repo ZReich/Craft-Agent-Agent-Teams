@@ -79,7 +79,16 @@ export type {
   TeamActivityEvent,
   TeamActivityType,
   TeamCostSummary,
+  // YOLO Mode types
+  YoloMode,
+  YoloPhase,
+  YoloConfig,
+  YoloState,
+  SpecEvolutionProposal,
+  // Phase types
+  TeamPhase,
 } from './agent-teams.ts';
+export { DEFAULT_YOLO_CONFIG } from './agent-teams.ts';
 
 // Team Dashboard View State types (Phase 1)
 export type {

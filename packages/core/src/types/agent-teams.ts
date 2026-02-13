@@ -103,6 +103,10 @@ export interface TeamTask {
   assignee?: string;
   /** IDs of tasks that must complete before this one */
   dependencies?: string[];
+  /** Phase this task belongs to (for phase-aware execution) */
+  phase?: string;
+  /** Phase execution order (lower = earlier; tasks in same phase can run in parallel) */
+  phaseOrder?: number;
   createdAt: string;
   completedAt?: string;
   /** Who created this task (teammate ID or 'user') */
@@ -342,6 +346,10 @@ export interface QualityGateConfig {
   escalationModel: string;
   /** Provider for escalation (default: 'anthropic') */
   escalationProvider: string;
+  /** When true, allow suppression of known pre-existing failing tests */
+  baselineAwareTests?: boolean;
+  /** Known failing tests from baseline (used when baselineAwareTests is enabled) */
+  knownFailingTests?: string[];
   /** Per-stage configuration */
   stages: Record<QualityGateStageName, QualityGateStageConfig>;
 }
@@ -407,6 +415,15 @@ export type TeamActivityType =
   | 'checkpoint-created'
   | 'checkpoint-rollback'
   | 'cost-warning'
+  | 'yolo-started'
+  | 'yolo-phase-changed'
+  | 'yolo-paused'
+  | 'yolo-completed'
+  | 'yolo-aborted'
+  | 'yolo-remediation-created'
+  | 'yolo-spec-evolution-proposed'
+  | 'phase-advanced'
+  | 'phase-blocked'
   | 'error';
 
 // ============================================================
@@ -426,4 +443,128 @@ export interface TeamCostSummary {
   costCapUsd?: number;
   /** Whether cost cap has been reached */
   costCapReached?: boolean;
+}
+
+// ============================================================
+// YOLO Mode (Autonomous Execution)
+// ============================================================
+
+/** YOLO execution mode */
+export type YoloMode = 'smart' | 'fixed' | 'off';
+
+/** Current phase of the YOLO lifecycle state machine */
+export type YoloPhase =
+  | 'idle'
+  | 'spec-generation'
+  | 'task-decomposition'
+  | 'executing'
+  | 'reviewing'
+  | 'integration-check'
+  | 'remediating'
+  | 'synthesizing'
+  | 'paused'
+  | 'completed'
+  | 'aborted';
+
+/**
+ * Configuration for YOLO (autonomous) execution mode.
+ * Controls how the orchestrator drives the spec → execute → verify loop.
+ */
+export interface YoloConfig {
+  /** Execution mode: 'smart' adapts at runtime, 'fixed' follows the initial plan, 'off' disables */
+  mode: YoloMode;
+  /** Allow spec mutations during execution based on implementation discoveries (smart only) */
+  adaptiveSpecs: boolean;
+  /** Maximum total cost in USD before auto-pause */
+  costCapUsd: number;
+  /** Maximum wall-clock time in minutes before auto-pause */
+  timeoutMinutes: number;
+  /** Maximum concurrent teammates working in parallel */
+  maxConcurrency: number;
+  /** Auto-create remediation tasks from quality gate failures */
+  autoRemediate: boolean;
+  /** Require human approval before spec mutations (smart mode safety net) */
+  requireApprovalForSpecChanges: boolean;
+  /** Maximum remediation rounds before aborting (prevents infinite loops) */
+  maxRemediationRounds: number;
+}
+
+/** Sensible defaults for YOLO config */
+export const DEFAULT_YOLO_CONFIG: YoloConfig = {
+  mode: 'off',
+  adaptiveSpecs: true,
+  costCapUsd: 5.00,
+  timeoutMinutes: 60,
+  maxConcurrency: 3,
+  autoRemediate: true,
+  requireApprovalForSpecChanges: true,
+  maxRemediationRounds: 3,
+};
+
+/**
+ * Runtime state of a YOLO execution — tracks progress through the lifecycle.
+ * Persisted on the team so the dashboard can render progress.
+ */
+export interface YoloState {
+  /** Current lifecycle phase */
+  phase: YoloPhase;
+  /** Active YOLO config for this run */
+  config: YoloConfig;
+  /** When the YOLO run started */
+  startedAt: string;
+  /** When the YOLO run completed or was aborted */
+  completedAt?: string;
+  /** Number of remediation rounds executed so far */
+  remediationRound: number;
+  /** Reason for pause or abort */
+  pauseReason?: 'cost-cap' | 'timeout' | 'approval-required' | 'all-teammates-error' | 'max-remediation' | 'user-requested';
+  /** Tasks auto-created by remediation (IDs) */
+  remediationTaskIds: string[];
+  /** Spec evolution proposals pending approval (smart mode) */
+  pendingSpecChanges: SpecEvolutionProposal[];
+  /** Summary of what happened */
+  summary?: string;
+}
+
+/**
+ * A proposed change to the spec discovered during execution.
+ * In smart YOLO mode, these are generated when quality gates reveal spec gaps.
+ */
+export interface SpecEvolutionProposal {
+  id: string;
+  /** Which requirement is affected (or 'new' for a new requirement) */
+  requirementId: string;
+  /** What change is proposed */
+  description: string;
+  /** Why this change is needed */
+  reason: string;
+  /** Which teammate discovered this */
+  discoveredBy: string;
+  /** Which task triggered this discovery */
+  sourceTaskId: string;
+  status: 'pending' | 'accepted' | 'rejected';
+  createdAt: string;
+}
+
+// ============================================================
+// Phase-Aware Task Grouping
+// ============================================================
+
+/**
+ * A phase within a team's execution plan.
+ * Tasks within a phase can run in parallel; phases execute sequentially.
+ */
+export interface TeamPhase {
+  /** Phase identifier */
+  id: string;
+  /** Human-readable phase name */
+  name: string;
+  /** Execution order (lower = earlier) */
+  order: number;
+  /** Current phase status */
+  status: 'pending' | 'in-progress' | 'completed' | 'blocked';
+  /** Task IDs belonging to this phase */
+  taskIds: string[];
+  /** When this phase completed */
+  completedAt?: string;
 }

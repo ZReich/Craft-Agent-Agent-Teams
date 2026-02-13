@@ -55,6 +55,8 @@ export interface AgentTeamsConfig {
   autoEscalationThreshold?: number;
   /** Quality gate configuration — automated code review pipeline */
   qualityGates?: Partial<QualityGateConfig>;
+  /** YOLO mode configuration — autonomous execution without manual intervention */
+  yolo?: Partial<import('@craft-agent/core/types').YoloConfig>;
 }
 
 /**

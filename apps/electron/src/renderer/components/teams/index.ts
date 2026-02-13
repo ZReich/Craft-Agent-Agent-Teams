@@ -22,6 +22,9 @@ export type { TaskListPanelProps } from './TaskListPanel'
 export { TeamActivityFeed } from './TeamActivityFeed'
 export type { TeamActivityFeedProps } from './TeamActivityFeed'
 
+export { HealthAlertsCard } from './HealthAlertsCard'
+export type { HealthAlertsCardProps } from './HealthAlertsCard'
+
 export { TeamCreationDialog } from './TeamCreationDialog'
 export type { TeamCreationDialogProps } from './TeamCreationDialog'
 

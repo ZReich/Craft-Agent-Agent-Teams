@@ -4,6 +4,8 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 import { existsSync, watch } from 'fs'
 import { rm, readFile, mkdir, writeFile, rename, open } from 'fs/promises'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { CraftAgent, type AgentEvent, setPermissionMode, type PermissionMode, unregisterSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest } from '@craft-agent/shared/agent'
 import {
   CodexBackend,
@@ -76,16 +78,18 @@ import { setAnthropicOptionsEnv, setPathToClaudeCodeExecutable, setInterceptorPa
 import { toolMetadataStore } from '@craft-agent/shared/network-interceptor'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { CraftMcpClient } from '@craft-agent/shared/mcp'
-import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
+import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, type SessionProcessReapOptions, type SessionProcessReapReport, type SessionProcessCandidate, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta, QualityGateConfig, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment } from '@craft-agent/core/types'
+import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
 import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
 import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/diff-collector'
 import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
 import { resolveTeamModelForRole } from '@craft-agent/shared/agent-teams/model-resolution'
+import { YoloOrchestrator, mergeYoloConfig, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
+import type { YoloConfig, YoloState } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
 import type { SummarizeCallback } from '@craft-agent/shared/sources'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL } from '@craft-agent/shared/agent/thinking-levels'
@@ -209,6 +213,178 @@ function normalizeTeamRole(rawRole?: string): TeamRole {
   if (!rawRole) return 'worker'
   if (VALID_TEAM_ROLES.has(rawRole as TeamRole)) return rawRole as TeamRole
   return 'worker'
+}
+
+const CODENAME_ADJECTIVES = [
+  'Neon', 'Shadow', 'Solar', 'Arctic', 'Crimson', 'Ivory', 'Titan', 'Delta', 'Nova', 'Obsidian',
+]
+
+const CODENAME_NOUNS = [
+  'Falcon', 'Viper', 'Comet', 'Sentinel', 'Raven', 'Pioneer', 'Circuit', 'Phoenix', 'Atlas', 'Cipher',
+]
+
+function roleLabel(role: TeamRole): string {
+  if (role === 'reviewer') return 'Reviewer'
+  if (role === 'escalation') return 'Escalation'
+  if (role === 'head') return 'Head'
+  if (role === 'lead') return 'Lead'
+  return 'Worker'
+}
+
+function buildTeammateCodename(role: TeamRole, index: number): string {
+  const adjective = CODENAME_ADJECTIVES[index % CODENAME_ADJECTIVES.length]
+  const noun = CODENAME_NOUNS[(Math.floor(index / CODENAME_ADJECTIVES.length)) % CODENAME_NOUNS.length]
+  return `${roleLabel(role)} ${adjective} ${noun}`
+}
+
+function buildTeamCodename(seed: string): string {
+  const normalized = seed.trim().toLowerCase()
+  const hash = Array.from(normalized).reduce((acc, ch) => acc + ch.charCodeAt(0), 0)
+  const adjective = CODENAME_ADJECTIVES[hash % CODENAME_ADJECTIVES.length]
+  const noun = CODENAME_NOUNS[Math.floor(hash / CODENAME_ADJECTIVES.length) % CODENAME_NOUNS.length]
+  return `${adjective} ${noun} Squad`
+}
+
+function formatPercentScore(score: number): string {
+  const normalized = Math.max(0, Math.min(100, Math.round(score)))
+  return `${normalized}%`
+}
+
+function qualityStageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    syntax: 'Syntax & Types',
+    tests: 'Tests',
+    architecture: 'Architecture',
+    simplicity: 'Simplicity',
+    errors: 'Error Handling',
+    completeness: 'Completeness',
+    spec_compliance: 'Spec Compliance',
+    traceability: 'Traceability',
+    rollout_safety: 'Rollout Safety',
+  }
+  return labels[stage] ?? stage
+}
+
+function qualityStageSummaryLines(result: QualityGateResult): string[] {
+  const orderedStages = [
+    'syntax',
+    'tests',
+    'architecture',
+    'simplicity',
+    'errors',
+    'completeness',
+    'spec_compliance',
+    'traceability',
+    'rollout_safety',
+  ] as const
+
+  const lines: string[] = []
+  for (const stageName of orderedStages) {
+    const stage = result.stages[stageName]
+    if (!stage) continue
+    const icon = stage.passed ? '✅' : '❌'
+    if (stageName === 'tests') {
+      const tests = stage as typeof result.stages.tests
+      lines.push(
+        `- ${icon} ${qualityStageLabel(stageName)}: ${formatPercentScore(stage.score)} (${tests.passedTests}/${tests.totalTests} passed)`
+      )
+      continue
+    }
+    lines.push(`- ${icon} ${qualityStageLabel(stageName)}: ${formatPercentScore(stage.score)}`)
+  }
+  return lines
+}
+
+function buildQualityLeadSummary(
+  teammateName: string,
+  result: QualityGateResult,
+  status: 'passed' | 'failed' | 'escalated',
+): string {
+  const statusLabel = status === 'passed' ? 'PASSED' : status === 'escalated' ? 'ESCALATED' : 'FAILED'
+  const icon = status === 'passed' ? '✅' : status === 'escalated' ? '🚨' : '⚠️'
+  const lines = [
+    `### ${icon} Quality Gate ${statusLabel}`,
+    `Teammate: ${teammateName}`,
+    `Overall Score: ${formatPercentScore(result.aggregateScore)}`,
+    `Review Cycle: ${result.cycleCount}/${result.maxCycles}`,
+    '',
+    '**Phase Scoreboard**',
+    ...qualityStageSummaryLines(result),
+  ]
+  return lines.join('\n')
+}
+
+function buildWorkerQualityFeedback(result: QualityGateResult, maxCycles: number): string {
+  const lines = [
+    `## Quality Gate Feedback`,
+    `Cycle ${result.cycleCount}/${maxCycles}`,
+    `Overall score: ${formatPercentScore(result.aggregateScore)}`,
+    '',
+    '**Phase Scoreboard**',
+    ...qualityStageSummaryLines(result),
+    '',
+    'Please fix failing phases first, then re-run.',
+  ]
+  return lines.join('\n')
+}
+
+function formatHealthAlertMessage(issue: HealthIssue): string {
+  const typeLabel = issue.type === 'stall'
+    ? 'STALL'
+    : issue.type === 'error-loop'
+      ? 'ERROR LOOP'
+      : issue.type === 'retry-storm'
+        ? 'RETRY STORM'
+        : 'CONTEXT EXHAUSTION'
+  return [
+    `### ⚠️ Team Health Alert (${typeLabel})`,
+    `Teammate: ${issue.teammateName}`,
+    `Issue: ${issue.details}`,
+  ].join('\n')
+}
+
+function teammateMatchesTargetName(teammateName: string | undefined, sessionName: string | undefined, targetName: string): boolean {
+  const target = targetName.trim().toLowerCase()
+  if (!target) return false
+  const teammate = teammateName?.trim().toLowerCase() ?? ''
+  const session = sessionName?.trim().toLowerCase() ?? ''
+  if (teammate === target || session === target) return true
+
+  if (teammate.includes(`(${target})`) || teammate.includes(`[${target}]`)) return true
+
+  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const boundary = new RegExp(`(?:^|\\W)${escaped}(?:\\W|$)`, 'i')
+  return boundary.test(teammate)
+}
+
+const execFileAsync = promisify(execFile)
+
+interface RuntimeProcessRow {
+  pid: number
+  parentPid?: number
+  name: string
+  commandLine: string
+  createdAt?: string
+}
+
+function commandPreview(commandLine: string): string {
+  const compact = commandLine.replace(/\s+/g, ' ').trim()
+  return compact.length > 220 ? `${compact.slice(0, 220)}…` : compact
+}
+
+function extractSessionIdFromCommand(commandLine: string): string | undefined {
+  if (!commandLine) return undefined
+
+  // Explicit CLI flag (preferred)
+  const flagMatch = commandLine.match(/--session-id(?:=|\s+)(["']?)([a-z0-9][a-z0-9-]{5,})\1/i)
+  if (flagMatch?.[2]) return flagMatch[2]
+
+  // Session directory path fallback (.../sessions/<session-id>/...)
+  const pathMatch = commandLine.match(/[\\/]sessions[\\/](?<id>[a-z0-9][a-z0-9-]{5,})/i)
+  const pathId = pathMatch?.groups?.id
+  if (pathId) return pathId
+
+  return undefined
 }
 
 /**
@@ -1348,6 +1524,8 @@ export class SessionManager {
   private healthMonitor = new TeammateHealthMonitor()
   private healthMonitorTeams = new Set<string>() // teams with active monitoring
   private teamStatusIntervals = new Map<string, NodeJS.Timeout>() // periodic status checks
+  private teamHealthAlertHandlers = new Map<string, (issue: HealthIssue) => void>()
+  private teammateKickoffTimers = new Map<string, NodeJS.Timeout>()
   private usagePersistenceByWorkspace: Map<string, UsagePersistence> = new Map()
   private usageAlertCheckerByWorkspace: Map<string, UsageAlertChecker> = new Map()
   private emittedUsageAlertKeys: Set<string> = new Set()
@@ -1392,11 +1570,12 @@ export class SessionManager {
 
     // Relay health alerts to the lead session
     const alertHandler = (issue: HealthIssue): void => {
-      const typeLabel = issue.type === 'stall' ? 'STALL'
-        : issue.type === 'error-loop' ? 'ERROR LOOP'
-        : issue.type === 'retry-storm' ? 'RETRY STORM'
-        : 'CONTEXT EXHAUSTION'
-      const alertMessage = `[Health Alert — ${typeLabel}] ${issue.teammateName}: ${issue.details}`
+      // Only relay alerts for teammates belonging to this team.
+      const teammate = this.sessions.get(issue.teammateId)
+      if (!teammate) return
+      const teammateTeamId = teammate.teamId ? teamManager.resolveTeamId(teammate.teamId) : undefined
+      if (teammateTeamId !== teamId) return
+      const alertMessage = formatHealthAlertMessage(issue)
       setTimeout(async () => {
         try {
           await this.sendMessage(leadSessionId, alertMessage)
@@ -1409,6 +1588,7 @@ export class SessionManager {
     this.healthMonitor.on('health:error-loop', alertHandler)
     this.healthMonitor.on('health:retry-storm', alertHandler)
     this.healthMonitor.on('health:context-exhaustion', alertHandler)
+    this.teamHealthAlertHandlers.set(teamId, alertHandler)
 
     // Periodic team status check-in (every 2 minutes)
     const statusInterval = setInterval(async () => {
@@ -1423,7 +1603,19 @@ export class SessionManager {
         return
       }
 
-      const lines = health.map(h => {
+      const liveHealth = health.filter(h => {
+        const teammate = this.sessions.get(h.teammateId)
+        if (!teammate || !teammate.parentSessionId) return false
+        const teammateTeamId = teammate.teamId ? teamManager.resolveTeamId(teammate.teamId) : undefined
+        return teammateTeamId === teamId
+      })
+
+      if (liveHealth.length === 0) {
+        this.stopTeamHealthMonitoring(teamId)
+        return
+      }
+
+      const lines = liveHealth.map(h => {
         const elapsed = Date.now() - new Date(h.lastActivityAt).getTime()
         const elapsedStr = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s ago` : `${Math.round(elapsed / 60000)}m ago`
         const task = h.currentTaskId ? `working on ${h.currentTaskId}` : 'idle'
@@ -1431,7 +1623,7 @@ export class SessionManager {
         return `- ${h.teammateName}: ${task} (last activity: ${elapsedStr})${issues}`
       })
 
-      const statusMessage = `[Team Status Check-In]\n${lines.join('\n')}`
+      const statusMessage = `### Team Status Check-In\n${lines.join('\n')}`
       try {
         await this.sendMessage(leadSessionId, statusMessage)
       } catch (err) {
@@ -1449,14 +1641,302 @@ export class SessionManager {
    * Stop health monitoring for a team.
    */
   private stopTeamHealthMonitoring(teamId: string): void {
-    this.healthMonitor.stopMonitoring(teamId)
+    this.healthMonitor.clearTeam(teamId)
     this.healthMonitorTeams.delete(teamId)
+
+    const alertHandler = this.teamHealthAlertHandlers.get(teamId)
+    if (alertHandler) {
+      this.healthMonitor.off('health:stall', alertHandler)
+      this.healthMonitor.off('health:error-loop', alertHandler)
+      this.healthMonitor.off('health:retry-storm', alertHandler)
+      this.healthMonitor.off('health:context-exhaustion', alertHandler)
+      this.teamHealthAlertHandlers.delete(teamId)
+    }
 
     const statusInterval = this.teamStatusIntervals.get(teamId)
     if (statusInterval) {
       clearInterval(statusInterval)
       this.teamStatusIntervals.delete(teamId)
     }
+  }
+
+  /**
+   * Remove a teammate from lead tracking and health monitoring.
+   * Safe to call repeatedly.
+   */
+  private detachTeammateTracking(teammate: ManagedSession): void {
+    const parentSessionId = teammate.parentSessionId
+    if (parentSessionId) {
+      const lead = this.sessions.get(parentSessionId)
+      if (lead?.teammateSessionIds?.length) {
+        const next = lead.teammateSessionIds.filter(id => id !== teammate.id)
+        lead.teammateSessionIds = next.length > 0 ? next : undefined
+        this.persistSession(lead)
+      }
+    }
+
+    const resolvedTeamId = teammate.teamId
+      ? teamManager.resolveTeamId(teammate.teamId)
+      : undefined
+    if (resolvedTeamId) {
+      this.healthMonitor.removeTeammate(resolvedTeamId, teammate.id)
+      const hasLiveTeammates = Array.from(this.sessions.values()).some(s => {
+        if (s.id === teammate.id) return false
+        if (!s.parentSessionId || !s.teamId) return false
+        return teamManager.resolveTeamId(s.teamId) === resolvedTeamId
+      })
+      if (!hasLiveTeammates) {
+        this.stopTeamHealthMonitoring(resolvedTeamId)
+      }
+    }
+  }
+
+  /**
+   * Deterministically terminate a teammate session runtime and detach all team tracking.
+   */
+  private async terminateTeammateSession(teammateId: string, reason: string): Promise<boolean> {
+    const teammate = this.sessions.get(teammateId)
+    if (!teammate) return false
+
+    const kickoffTimer = this.teammateKickoffTimers.get(teammateId)
+    if (kickoffTimer) {
+      clearTimeout(kickoffTimer)
+      this.teammateKickoffTimers.delete(teammateId)
+    }
+
+    if (teammate.agent && teammate.isProcessing) {
+      try {
+        teammate.agent.forceAbort(AbortReason.UserStop)
+      } catch (err) {
+        sessionLog.warn(`[AgentTeams] Failed to force-abort teammate ${teammateId} during ${reason}:`, err)
+      }
+    }
+
+    this.destroyManagedAgent(teammate, reason)
+    this.stopComplianceWatcher(teammateId)
+    this.detachTeammateTracking(teammate)
+
+    teammate.teamId = undefined
+    teammate.parentSessionId = undefined
+    teammate.teammateName = undefined
+    teammate.isProcessing = false
+    this.persistSession(teammate)
+    return true
+  }
+
+  private formatLeadToTeammateMessage(content: string): string {
+    return `## Team Lead Message\n\n${content.trim()}`
+  }
+
+  private formatQualityGateSummary(result: QualityGateResult): string {
+    const stageOrder: Array<keyof QualityGateResult['stages']> = [
+      'syntax',
+      'tests',
+      'architecture',
+      'simplicity',
+      'errors',
+      'completeness',
+    ]
+
+    const labelFor = (stage: keyof QualityGateResult['stages']): string => {
+      if (stage === 'syntax') return 'Syntax'
+      if (stage === 'tests') return 'Tests'
+      if (stage === 'architecture') return 'Architecture'
+      if (stage === 'simplicity') return 'Simplicity'
+      if (stage === 'errors') return 'Error Handling'
+      if (stage === 'completeness') return 'Completeness'
+      return String(stage)
+    }
+
+    const stageLines = stageOrder
+      .map(stage => {
+        const stageResult = result.stages[stage]
+        if (!stageResult) return null
+        const status = stageResult.passed ? '✅' : '❌'
+        return `- ${status} **${labelFor(stage)}:** ${Math.round(stageResult.score)}%`
+      })
+      .filter((line): line is string => Boolean(line))
+
+    return [
+      `### Quality Gate`,
+      ``,
+      `**Overall:** ${result.passed ? '✅ PASS' : '❌ FAIL'} · **Score:** ${Math.round(result.aggregateScore)}% · **Cycle:** ${result.cycleCount ?? 1}/${result.maxCycles ?? 1}`,
+      ``,
+      ...stageLines,
+    ].join('\n')
+  }
+
+  /**
+   * Create and attach a YOLO orchestrator for a team.
+   * Called when YOLO mode is enabled in workspace config and a team is active.
+   */
+  private setupYoloOrchestrator(teamId: string, leadSessionId: string, workingDirectory: string): YoloOrchestrator | null {
+    const lead = this.sessions.get(leadSessionId)
+    if (!lead) return null
+
+    const wsConfig = loadWorkspaceConfig(lead.workspace.rootPath)
+    const yoloConfig = mergeYoloConfig(wsConfig?.agentTeams?.yolo)
+    if (yoloConfig.mode === 'off') return null
+
+    const reviewLoop = teamManager.getReviewLoop()
+    if (!reviewLoop) {
+      sessionLog.warn('[YOLO] Cannot start YOLO — no review loop attached')
+      return null
+    }
+
+    const callbacks: YoloCallbacks = {
+      generateSpec: async (_teamId: string, objective: string) => {
+        // Instruct the lead to generate a spec by sending a structured message
+        await this.sendMessage(leadSessionId,
+          `[YOLO] Generate a specification for the following objective. Output a structured spec with requirements, risks, and acceptance tests.\n\nObjective: ${objective}`)
+        // Poll for the spec — the lead processes the message asynchronously
+        const MAX_SPEC_WAIT_MS = 5 * 60 * 1000 // 5 minutes
+        const SPEC_POLL_MS = 2000
+        const specStart = Date.now()
+        while (Date.now() - specStart < MAX_SPEC_WAIT_MS) {
+          const spec = teamManager.getTeamSpec(_teamId)
+          if (spec) return spec
+          await new Promise(resolve => setTimeout(resolve, SPEC_POLL_MS))
+        }
+        throw new Error('Lead did not generate a spec within the timeout')
+      },
+
+      decomposeIntoTasks: async (_teamId: string, spec) => {
+        return spec.requirements.map((req, idx) => ({
+          title: `Implement ${req.id}: ${req.description.slice(0, 60)}`,
+          description: req.description,
+          requirementIds: [req.id],
+          phase: req.priority === 'critical' ? 'foundation' : req.priority === 'high' ? 'core' : 'polish',
+          phaseOrder: req.priority === 'critical' ? 0 : req.priority === 'high' ? 1 : 2,
+        }))
+      },
+
+      spawnAndAssign: async (_teamId: string, taskIds: string[]) => {
+        const tasks = teamManager.getTasks(_teamId)
+        for (const taskId of taskIds) {
+          const task = tasks.find(t => t.id === taskId)
+          if (!task) continue
+          try {
+            const teammateSession = await this.createTeammateSession({
+              parentSessionId: leadSessionId,
+              workspaceId: lead.workspace.id,
+              teamId: _teamId,
+              teammateName: `worker-${taskId.slice(-6)}`,
+              prompt: task.description || task.title,
+              model: lead.model,
+            })
+            // Assign the task to the spawned teammate
+            const team = teamManager.getTeam(_teamId)
+            const teammate = team?.members.find(m => m.sessionId === teammateSession.id)
+            if (teammate) {
+              teamManager.assignTask(_teamId, taskId, teammate.id)
+            }
+          } catch (err) {
+            sessionLog.error(`[YOLO] Failed to spawn teammate for task ${taskId}:`, err)
+          }
+        }
+      },
+
+      runIntegrationCheck: async (_teamId: string) => {
+        try {
+          const runner = this.getQualityGateRunner()
+          const syntaxResult = await runner.runSyntaxCheck(workingDirectory)
+          const testResult = await runner.runTestExecution(workingDirectory)
+          const issues: string[] = [
+            ...syntaxResult.issues,
+            ...testResult.issues,
+          ]
+          return {
+            passed: syntaxResult.passed && testResult.passed,
+            issues,
+          }
+        } catch (err) {
+          return {
+            passed: false,
+            issues: [err instanceof Error ? err.message : String(err)],
+          }
+        }
+      },
+
+      synthesize: async (_teamId: string) => {
+        const tasks = teamManager.getTasks(_teamId)
+        const completed = tasks.filter(t => t.status === 'completed').length
+        return `YOLO run complete: ${completed}/${tasks.length} tasks completed`
+      },
+
+      onStateChange: (_teamId: string, state: YoloState) => {
+        teamManager.updateYoloState(_teamId, state)
+        this.sendEvent({
+          type: 'yolo_state_changed',
+          sessionId: leadSessionId,
+          teamId: _teamId,
+          state,
+        }, lead.workspace.id)
+      },
+    }
+
+    const orchestrator = new YoloOrchestrator(teamManager, reviewLoop, callbacks)
+    teamManager.setYoloOrchestrator(teamId, orchestrator)
+
+    sessionLog.info(`[YOLO] Orchestrator created for team ${teamId} (mode: ${yoloConfig.mode})`)
+    return orchestrator
+  }
+
+  private deriveYoloObjectiveFromLead(managed: ManagedSession, fallbackTeamName?: string): string {
+    for (let i = managed.messages.length - 1; i >= 0; i--) {
+      const msg = managed.messages[i]
+      if (msg?.role !== 'user') continue
+      const content = typeof msg.content === 'string' ? msg.content.trim() : ''
+      if (content.length > 0) return content
+    }
+    return managed.name?.trim() || `Execute the team objective for ${fallbackTeamName || managed.id}`
+  }
+
+  /**
+   * Ensure a YOLO orchestrator exists for a team if workspace config enables it.
+   * This wires callbacks/state flow but does not force-start a run.
+   */
+  ensureYoloWiredForTeam(teamId: string, leadSessionId: string): void {
+    const lead = this.sessions.get(leadSessionId)
+    if (!lead) return
+
+    const resolvedTeamId = teamManager.resolveTeamId(teamId)
+    if (!teamManager.getTeam(resolvedTeamId)) return
+
+    if (teamManager.getYoloOrchestrator(resolvedTeamId)) return
+
+    const wsConfig = loadWorkspaceConfig(lead.workspace.rootPath)
+    const yoloConfig = mergeYoloConfig(wsConfig?.agentTeams?.yolo)
+    if (yoloConfig.mode === 'off') return
+
+    const workingDirectory = lead.workingDirectory || lead.sdkCwd || getSessionStoragePath(lead.workspace.rootPath, lead.id)
+    this.setupYoloOrchestrator(resolvedTeamId, leadSessionId, workingDirectory)
+  }
+
+  /**
+   * Best-effort auto-start for YOLO runs when a team becomes active.
+   */
+  private startYoloIfConfigured(managed: ManagedSession, teamId: string): void {
+    const resolvedTeamId = teamManager.resolveTeamId(teamId)
+    const team = teamManager.getTeam(resolvedTeamId)
+    if (!team) {
+      sessionLog.warn(`[YOLO] Team ${teamId} not found, skipping auto-start`)
+      return
+    }
+
+    this.ensureYoloWiredForTeam(resolvedTeamId, managed.id)
+    const orchestrator = teamManager.getYoloOrchestrator(resolvedTeamId)
+    if (!orchestrator || orchestrator.isRunning()) return
+
+    const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+    const yoloConfig = mergeYoloConfig(wsConfig?.agentTeams?.yolo)
+    if (yoloConfig.mode === 'off') return
+
+    const objective = this.deriveYoloObjectiveFromLead(managed, team.name)
+    sessionLog.info(`[YOLO] Auto-starting run for team ${resolvedTeamId} objective="${objective.slice(0, 80)}"`)
+    void orchestrator.start(resolvedTeamId, objective, yoloConfig).catch((error) => {
+      sessionLog.error(`[YOLO] Auto-start failed for team ${resolvedTeamId}:`, error)
+    })
   }
 
   setWindowManager(wm: WindowManager): void {
@@ -2770,10 +3250,228 @@ export class SessionManager {
       .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))
   }
 
+  private detectProcessRole(commandLine: string): 'app-server' | 'bridge-mcp' | 'session-mcp' | 'other' {
+    const normalized = commandLine.toLowerCase()
+    if (normalized.includes('app-server')) return 'app-server'
+    if (normalized.includes('bridge-mcp-server')) return 'bridge-mcp'
+    if (normalized.includes('session-mcp-server')) return 'session-mcp'
+    return 'other'
+  }
+
+  private parseCreatedAtMs(createdAt?: string): number {
+    if (!createdAt) return 0
+    const direct = Date.parse(createdAt)
+    if (!Number.isNaN(direct)) return direct
+
+    // Win32_Process.CreationDate format: yyyyMMddHHmmss.mmmmmm+UUU
+    const match = createdAt.match(/^(\d{14})/)
+    if (!match) return 0
+    const stamp = match[1]
+    const yyyy = Number(stamp.slice(0, 4))
+    const mm = Number(stamp.slice(4, 6)) - 1
+    const dd = Number(stamp.slice(6, 8))
+    const hh = Number(stamp.slice(8, 10))
+    const min = Number(stamp.slice(10, 12))
+    const ss = Number(stamp.slice(12, 14))
+    return new Date(yyyy, mm, dd, hh, min, ss).getTime()
+  }
+
+  private async listRuntimeProcesses(): Promise<RuntimeProcessRow[]> {
+    if (process.platform === 'win32') {
+      const script = [
+        '$ErrorActionPreference = "Stop"',
+        '$rows = Get-CimInstance Win32_Process |',
+        '  Where-Object { $_.Name -in @("node.exe", "bun.exe", "bunx.exe") } |',
+        '  Select-Object @{Name="pid";Expression={$_.ProcessId}},',
+        '                @{Name="parentPid";Expression={$_.ParentProcessId}},',
+        '                @{Name="name";Expression={$_.Name}},',
+        '                @{Name="commandLine";Expression={$_.CommandLine}},',
+        '                @{Name="createdAt";Expression={$_.CreationDate}}',
+        '$rows | ConvertTo-Json -Compress',
+      ].join('; ')
+
+      const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-Command', script], {
+        windowsHide: true,
+        maxBuffer: 8 * 1024 * 1024,
+      })
+
+      if (!stdout.trim()) return []
+      const parsed = JSON.parse(stdout.trim()) as RuntimeProcessRow | RuntimeProcessRow[]
+      const rows = Array.isArray(parsed) ? parsed : [parsed]
+      return rows.filter((row): row is RuntimeProcessRow =>
+        typeof row?.pid === 'number' && typeof row?.name === 'string' && typeof row?.commandLine === 'string'
+      )
+    }
+
+    const { stdout } = await execFileAsync('ps', ['-ax', '-o', 'pid=,ppid=,comm=,command='], {
+      maxBuffer: 8 * 1024 * 1024,
+    })
+
+    return stdout
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map((line): RuntimeProcessRow | null => {
+        const match = line.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/)
+        if (!match) return null
+        const pid = Number(match[1])
+        const parentPid = Number(match[2])
+        const name = match[3]
+        const commandLine = match[4]
+        return Number.isFinite(pid) && Number.isFinite(parentPid)
+          ? { pid, parentPid, name, commandLine }
+          : null
+      })
+      .filter((row): row is RuntimeProcessRow => row !== null)
+      .filter(row => /node|bun/i.test(row.name))
+  }
+
+  private async terminateProcess(pid: number): Promise<void> {
+    if (process.platform === 'win32') {
+      await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+      })
+      return
+    }
+
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch {
+      // Process may have already exited
+    }
+  }
+
+  async reapStaleSessionProcesses(options?: SessionProcessReapOptions): Promise<SessionProcessReapReport> {
+    const forceKill = options?.forceKill === true
+    const dryRun = forceKill ? false : options?.dryRun !== false
+    const activeSessionIds = Array.from(this.sessions.keys())
+    const activeSessionSet = new Set(activeSessionIds)
+    const errors: string[] = []
+    const candidates: SessionProcessCandidate[] = []
+    let rows: RuntimeProcessRow[] = []
+
+    try {
+      rows = await this.listRuntimeProcesses()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      errors.push(`Failed to list runtime processes: ${message}`)
+      return {
+        scannedAt: new Date().toISOString(),
+        dryRun,
+        forceKill,
+        scannedProcessCount: 0,
+        candidateCount: 0,
+        terminatedCount: 0,
+        activeSessionIds,
+        candidates: [],
+        errors,
+      }
+    }
+
+    const trackedRows = rows.filter(row => {
+      const command = row.commandLine.toLowerCase()
+      if (!command) return false
+      const hasSessionRef = command.includes('--session-id') || /[\\/]sessions[\\/]/.test(command)
+      const hasCraftRef = /(craft-agent|craftagents|app-server|session-mcp-server|bridge-mcp-server|codex)/.test(command)
+      return hasSessionRef || hasCraftRef
+    })
+
+    const bySessionAndRole = new Map<string, RuntimeProcessRow[]>()
+
+    for (const row of trackedRows) {
+      const sessionId = extractSessionIdFromCommand(row.commandLine)
+      if (!sessionId) continue
+
+      if (!activeSessionSet.has(sessionId)) {
+        candidates.push({
+          pid: row.pid,
+          processName: row.name,
+          sessionId,
+          reason: 'missing_session',
+          createdAt: row.createdAt,
+          commandPreview: commandPreview(row.commandLine),
+        })
+        continue
+      }
+
+      const role = this.detectProcessRole(row.commandLine)
+      if (role !== 'app-server') continue
+      const key = `${sessionId}:${role}`
+      const existing = bySessionAndRole.get(key) ?? []
+      existing.push(row)
+      bySessionAndRole.set(key, existing)
+    }
+
+    for (const [key, entries] of bySessionAndRole.entries()) {
+      if (entries.length <= 1) continue
+      const [sessionId] = key.split(':')
+      const managed = this.sessions.get(sessionId)
+      if (!managed || managed.isProcessing) continue
+
+      const sorted = [...entries].sort((a, b) => this.parseCreatedAtMs(b.createdAt) - this.parseCreatedAtMs(a.createdAt))
+      const stale = sorted.slice(1) // keep newest app-server process
+      for (const row of stale) {
+        candidates.push({
+          pid: row.pid,
+          processName: row.name,
+          sessionId,
+          reason: 'duplicate_idle_session',
+          createdAt: row.createdAt,
+          commandPreview: commandPreview(row.commandLine),
+        })
+      }
+    }
+
+    let terminatedCount = 0
+    if (forceKill && !dryRun) {
+      for (const candidate of candidates) {
+        try {
+          await this.terminateProcess(candidate.pid)
+          terminatedCount++
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          errors.push(`Failed to terminate PID ${candidate.pid}: ${message}`)
+        }
+      }
+    }
+
+    const report: SessionProcessReapReport = {
+      scannedAt: new Date().toISOString(),
+      dryRun,
+      forceKill,
+      scannedProcessCount: trackedRows.length,
+      candidateCount: candidates.length,
+      terminatedCount,
+      activeSessionIds,
+      candidates,
+      errors,
+    }
+
+    sessionLog.info(
+      `[ProcessReaper] scanned=${report.scannedProcessCount} candidates=${report.candidateCount} ` +
+      `terminated=${report.terminatedCount} dryRun=${report.dryRun}`
+    )
+
+    return report
+  }
+
   /**
    * Refresh in-memory agent instances for a workspace so runtime callbacks
    * (including agent teams interception hooks) reflect latest settings.
    */
+  private destroyManagedAgent(managed: ManagedSession, reason: string): void {
+    if (!managed.agent) return
+    try {
+      managed.agent.dispose()
+    } catch (error) {
+      sessionLog.warn(`Failed to dispose agent for session ${managed.id} (${reason}):`, error)
+    } finally {
+      managed.agent = null
+      unregisterSessionScopedToolCallbacks(managed.id)
+      sessionLog.info(`Disposed agent for session ${managed.id} (${reason})`)
+    }
+  }
+
   refreshWorkspaceAgentRuntime(workspaceId: string, reason: string): void {
     let refreshed = 0
     let skipped = 0
@@ -2785,7 +3483,7 @@ export class SessionManager {
         continue
       }
       if (managed.agent) {
-        managed.agent = null
+        this.destroyManagedAgent(managed, `refreshWorkspaceAgentRuntime:${reason}`)
         refreshed++
       }
     }
@@ -3214,8 +3912,14 @@ export class SessionManager {
       throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
     }
     const teammateRole = normalizeTeamRole(params.role)
+    const requestedTeammateName = params.teammateName?.trim() || `${teammateRole}-${Date.now().toString(36)}`
+    const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
+    const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
+    const teammateDisplayName = teammateCodename === requestedTeammateName
+      ? teammateCodename
+      : `${teammateCodename} (${requestedTeammateName})`
     if (params.role && params.role !== teammateRole) {
-      sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested for ${params.teammateName}; defaulting to "${teammateRole}"`)
+      sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested for ${requestedTeammateName}; defaulting to "${teammateRole}"`)
     }
     // Implements REQ-002: honor workspace role model defaults and ignore conflicting overrides
     const requestedModel = params.model?.trim()
@@ -3242,7 +3946,7 @@ export class SessionManager {
       )
     }
 
-    sessionLog.info(`[AgentTeams] Resolved teammate spawn: name=${params.teammateName} role=${teammateRole} model=${teammateModel}`)
+    sessionLog.info(`[AgentTeams] Resolved teammate spawn: requested=${requestedTeammateName} display=${teammateDisplayName} role=${teammateRole} model=${teammateModel}`)
 
     // Implements REQ-004: choose a provider/connection compatible with the resolved model
     const teammateConnectionSlug = resolveConnectionForModel({
@@ -3268,13 +3972,13 @@ export class SessionManager {
       )
     }
 
-    sessionLog.info(`[AgentTeams] Using connection "${teammateConnection}" (${resolvedConnection.providerType}) for teammate "${params.teammateName}"`)
+    sessionLog.info(`[AgentTeams] Using connection "${teammateConnection}" (${resolvedConnection.providerType}) for teammate "${teammateDisplayName}"`)
 
 
     const teammateSession = await this.createSession(params.workspaceId, {
       teamId: params.teamId,
       parentSessionId: params.parentSessionId,
-      teammateName: params.teammateName,
+      teammateName: teammateDisplayName,
       teammateRole,
       teamColor,
       permissionMode: 'allow-all',
@@ -3284,6 +3988,7 @@ export class SessionManager {
       sddEnabled: parent.sddEnabled,
       activeSpecId: parent.activeSpecId,
     })
+    await this.renameSession(teammateSession.id, requestedTeammateName)
 
     // Track teammate in parent
     if (!parent.teammateSessionIds) {
@@ -3299,7 +4004,7 @@ export class SessionManager {
       type: 'team_session_created',
       sessionId: params.parentSessionId,
       teammateSessionId: teammateSession.id,
-      teammateName: params.teammateName,
+      teammateName: teammateDisplayName,
       teamId: params.teamId,
       teamColor,
     }, parent.workspace.id)
@@ -3309,16 +4014,16 @@ export class SessionManager {
     teamManager.logActivity(
       resolvedTeamId,
       'teammate-spawned',
-      `${params.teammateName} spawned`,
+      `${teammateDisplayName} spawned`,
       teammateSession.id,
-      params.teammateName
+      teammateDisplayName
     )
 
     // Start health monitoring for this team (no-op if already started)
     this.startTeamHealthMonitoring(resolvedTeamId, params.parentSessionId)
-    this.healthMonitor.recordActivity(resolvedTeamId, teammateSession.id, params.teammateName, {
+    this.healthMonitor.recordActivity(resolvedTeamId, teammateSession.id, teammateDisplayName, {
       type: 'task_update',
-      taskId: params.teammateName,
+      taskId: requestedTeammateName,
     })
 
     // Build compact spec context + task metadata for teammates when SDD is enabled
@@ -3338,7 +4043,7 @@ export class SessionManager {
       const requirementIds = parsedSpec.requirements.map(req => req.id)
       const task = teamManager.createTask(
         resolvedTeamId,
-        `${params.teammateName} task`,
+        `${teammateDisplayName} task`,
         params.prompt,
         parent.id,
         {
@@ -3354,14 +4059,16 @@ export class SessionManager {
     const teammatePrompt = buildTeammatePromptWithCompactSpec(params.prompt, compactSpecContext)
 
     // Kick off the teammate by sending the prompt
-    // Use setTimeout to avoid blocking the caller
-    setTimeout(async () => {
+    // Use setTimeout to avoid blocking the caller, but track timer so cleanup can cancel it.
+    const kickoffTimer = setTimeout(async () => {
+      this.teammateKickoffTimers.delete(teammateSession.id)
       try {
         await this.sendMessage(teammateSession.id, teammatePrompt)
       } catch (err) {
-        sessionLog.error(`Failed to start teammate ${params.teammateName}:`, err)
+        sessionLog.error(`Failed to start teammate ${teammateDisplayName}:`, err)
       }
     }, 100)
+    this.teammateKickoffTimers.set(teammateSession.id, kickoffTimer)
 
     return teammateSession
   }
@@ -3374,24 +4081,17 @@ export class SessionManager {
     if (!lead || !lead.teammateSessionIds) return
 
     sessionLog.info(`[AgentTeams] Cleaning up team for lead session ${leadSessionId}, ${lead.teammateSessionIds.length} teammates`)
+    const resolvedTeamId = lead.teamId ? teamManager.resolveTeamId(lead.teamId) : undefined
 
     // Interrupt all running teammate sessions
     for (const teammateId of lead.teammateSessionIds) {
-      const teammate = this.sessions.get(teammateId)
-      if (teammate?.isProcessing && teammate.agent) {
-        try {
-          teammate.agent.forceAbort(AbortReason.UserStop)
-          sessionLog.info(`[AgentTeams] Interrupted teammate ${teammateId}`)
-        } catch (err) {
-          sessionLog.error(`[AgentTeams] Failed to interrupt teammate ${teammateId}:`, err)
-        }
-      }
+      await this.terminateTeammateSession(teammateId, 'cleanupTeam')
     }
 
     // Stop health monitoring for this team
-    if (lead.teamId) {
-      const resolvedTeamId = teamManager.resolveTeamId(lead.teamId)
+    if (resolvedTeamId) {
       this.stopTeamHealthMonitoring(resolvedTeamId)
+      await teamManager.cleanupTeam(resolvedTeamId)
     }
 
     // Clear team state on lead
@@ -3754,12 +4454,10 @@ export class SessionManager {
 
             for (const tid of teammateIds) {
               const teammate = this.sessions.get(tid)
-              if (teammate?.teammateName === params.targetName || teammate?.name === params.targetName) {
+              if (teammateMatchesTargetName(teammate?.teammateName, teammate?.name, params.targetName)) {
                 if (params.type === 'shutdown_request') {
-                  if (teammate.agent && teammate.isProcessing) {
-                    teammate.agent.forceAbort(AbortReason.UserStop)
-                  }
-                  return { delivered: true }
+                  const terminated = await this.terminateTeammateSession(tid, 'shutdown_request')
+                  return terminated ? { delivered: true } : { delivered: false, error: `Teammate "${params.targetName}" not found` }
                 }
                 try {
                   await this.sendMessage(tid, `[From Lead] ${params.content}`)
@@ -4107,13 +4805,10 @@ export class SessionManager {
             // Direct message: find teammate by name
             for (const tid of teammateIds) {
               const teammate = this.sessions.get(tid)
-              if (teammate?.teammateName === params.targetName || teammate?.name === params.targetName) {
+              if (teammateMatchesTargetName(teammate?.teammateName, teammate?.name, params.targetName)) {
                 if (params.type === 'shutdown_request') {
-                  // Force-abort the teammate
-                  if (teammate.agent && teammate.isProcessing) {
-                    teammate.agent.forceAbort(AbortReason.UserStop)
-                  }
-                  return { delivered: true }
+                  const terminated = await this.terminateTeammateSession(tid, 'shutdown_request')
+                  return terminated ? { delivered: true } : { delivered: false, error: `Teammate "${params.targetName}" not found` }
                 }
                 // Regular message
                 try {
@@ -4178,9 +4873,9 @@ export class SessionManager {
           const teamsEnabled = isAgentTeamsEnabled(managed.workspace.rootPath)
           const hasTeammates = (managed.teammateSessionIds?.length ?? 0) > 0
           const noTeamReason = this.extractNoTeamReason(planContent)
-          if (teamsEnabled && managed.sddEnabled && !hasTeammates && !noTeamReason) {
+          if (teamsEnabled && !hasTeammates && !noTeamReason) {
             const warningText =
-              '[SDD] Agent teams are enabled: the plan must either spawn teammates or include a clear reason why no team is needed (e.g., "Team Decision: no-team — <reason>").'
+              'Agent teams are enabled: the plan must either spawn teammates or include a clear reason why no team is needed (e.g., "Team Decision: no-team — <reason>").'
             const submitPlanMsg = managed.messages.find(
               m => m.toolName?.includes('SubmitPlan') && m.toolStatus === 'executing'
             )
@@ -4517,6 +5212,15 @@ export class SessionManager {
   private async autoArchiveCompletedTeammateSession(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed || !managed.parentSessionId || !managed.teammateName) return
+
+    if (!managed.isProcessing && managed.agent) {
+      this.destroyManagedAgent(managed, 'autoArchiveCompletedTeammateSession')
+    }
+
+    this.detachTeammateTracking(managed)
+    managed.teamId = undefined
+    managed.parentSessionId = undefined
+    managed.teammateName = undefined
 
     let changed = false
     if (managed.todoState !== 'done') {
@@ -5568,6 +6272,11 @@ export class SessionManager {
       return
     }
 
+    // Ensure team resources are released before deleting a lead session.
+    if (managed.isTeamLead && managed.teammateSessionIds?.length) {
+      await this.cleanupTeam(sessionId)
+    }
+
     // Get workspace slug before deleting
     const workspaceRootPath = managed.workspace.rootPath
 
@@ -5585,17 +6294,21 @@ export class SessionManager {
       clearTimeout(timer)
       this.deltaFlushTimers.delete(sessionId)
     }
+    const kickoffTimer = this.teammateKickoffTimers.get(sessionId)
+    if (kickoffTimer) {
+      clearTimeout(kickoffTimer)
+      this.teammateKickoffTimers.delete(sessionId)
+    }
     this.pendingDeltas.delete(sessionId)
 
     // Cancel any pending persistence write (session is being deleted, no need to save)
     sessionPersistenceQueue.cancel(sessionId)
 
-    // Clean up session-scoped tool callbacks to prevent memory accumulation
-    unregisterSessionScopedToolCallbacks(sessionId)
-
     // Dispose agent to clean up ConfigWatchers, event listeners, MCP connections
     if (managed.agent) {
-      managed.agent.dispose()
+      this.destroyManagedAgent(managed, 'deleteSession')
+    } else {
+      unregisterSessionScopedToolCallbacks(sessionId)
     }
     this.stopComplianceWatcher(sessionId)
 
@@ -6348,6 +7061,7 @@ export class SessionManager {
           )
           const resultContent = lastAssistantMsg?.content || '(No output produced)'
           const teammateName = managed.teammateName
+          const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId)
 
           // Load quality gate config from workspace
           const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
@@ -6385,7 +7099,19 @@ export class SessionManager {
                 this.qualityGateCycles.delete(cycleKey)
                 setTimeout(async () => {
                   try {
-                    const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (QUALITY GATE: ESCALATED after ${currentCycle} cycles):\n\n${resultContent}\n\n---\n\n${reviewInput.failureReason}\n\nAction required: ensure teammate changes are present in the git working tree before re-running quality gates.`
+                    const relayMessage = [
+                      `## Team Result - ${teammateName}`,
+                      '',
+                      '### Quality Gate Escalated',
+                      `Cycle: ${currentCycle}/${qgConfig.maxReviewCycles}`,
+                      `Reason: ${reviewInput.failureReason}`,
+                      '',
+                      'Action required: ensure teammate changes are present in the git working tree before re-running quality gates.',
+                      '',
+                      '---',
+                      '',
+                      resultContent,
+                    ].join('\n')
                     await this.sendMessage(managed.parentSessionId!, relayMessage)
                     await this.autoArchiveCompletedTeammateSession(sessionId)
                   } catch (err) {
@@ -6395,7 +7121,16 @@ export class SessionManager {
               } else {
                 setTimeout(async () => {
                   try {
-                    const feedbackMessage = `[Quality Gate Review — Cycle ${currentCycle}/${qgConfig.maxReviewCycles}]\n\nYour work did not pass the quality gate.\n\n${reviewInput.failureReason}\n\nPlease make sure your implementation is actually written to files in the working directory, then try again.`
+                    const feedbackMessage = [
+                      '## Quality Gate Feedback',
+                      `Cycle ${currentCycle}/${qgConfig.maxReviewCycles}`,
+                      '',
+                      'Your work did not pass quality checks.',
+                      '',
+                      `Blocking issue: ${reviewInput.failureReason}`,
+                      '',
+                      'Please make sure implementation changes are written to files in the working directory, then try again.',
+                    ].join('\n')
                     await this.sendMessage(sessionId, feedbackMessage)
                   } catch (err) {
                     sessionLog.error(`[AgentTeams] Failed to send missing-diff feedback to ${teammateName}:`, err)
@@ -6415,12 +7150,29 @@ export class SessionManager {
               this.qualityGateCycles.delete(cycleKey) // Reset cycle counter
 
               const successReport = formatSuccessReport(result)
-              const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId!)
+              const leadQualitySummary = buildQualityLeadSummary(teammateName, result, 'passed')
+              teamManager.logActivity(
+                resolvedTeamId,
+                'quality-gate-passed',
+                `Quality gate passed at ${formatPercentScore(result.aggregateScore)}`,
+                managed.id,
+                teammateName,
+              )
               this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
 
               setTimeout(async () => {
                 try {
-                  const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}\n\n---\n\n${successReport}`
+                  const relayMessage = [
+                    `## Team Result - ${teammateName}`,
+                    '',
+                    leadQualitySummary,
+                    '',
+                    successReport,
+                    '',
+                    '---',
+                    '',
+                    resultContent,
+                  ].join('\n')
                   await this.sendMessage(managed.parentSessionId!, relayMessage)
                   await this.autoArchiveCompletedTeammateSession(sessionId)
 
@@ -6460,10 +7212,31 @@ export class SessionManager {
               }
 
               const failureReport = formatFailureReport(result, qgConfig)
+              const leadQualitySummary = buildQualityLeadSummary(teammateName, result, 'escalated')
+              teamManager.logActivity(
+                resolvedTeamId,
+                'escalation',
+                `Quality gate escalated at ${formatPercentScore(result.aggregateScore)} after ${currentCycle} cycles`,
+                managed.id,
+                teammateName,
+              )
 
               setTimeout(async () => {
                 try {
-                  const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (QUALITY GATE: ESCALATED after ${currentCycle} cycles):\n\n${resultContent}\n\n---\n\n${failureReport}\n\n**Escalation Diagnosis:**\n${escalationNote}`
+                  const relayMessage = [
+                    `## Team Result - ${teammateName}`,
+                    '',
+                    leadQualitySummary,
+                    '',
+                    failureReport,
+                    '',
+                    '**Escalation Diagnosis:**',
+                    escalationNote,
+                    '',
+                    '---',
+                    '',
+                    resultContent,
+                  ].join('\n')
                   await this.sendMessage(managed.parentSessionId!, relayMessage)
                   await this.autoArchiveCompletedTeammateSession(sessionId)
                 } catch (err) {
@@ -6476,11 +7249,30 @@ export class SessionManager {
               sessionLog.info(`[AgentTeams] Quality gate FAILED for "${teammateName}" (score: ${result.aggregateScore}, cycle ${currentCycle}/${qgConfig.maxReviewCycles})`)
 
               const failureReport = formatFailureReport(result, qgConfig)
+              const workerFeedbackSummary = buildWorkerQualityFeedback(result, qgConfig.maxReviewCycles)
+              teamManager.logActivity(
+                resolvedTeamId,
+                'quality-gate-failed',
+                `Quality gate failed at ${formatPercentScore(result.aggregateScore)} (cycle ${currentCycle}/${qgConfig.maxReviewCycles})`,
+                managed.id,
+                teammateName,
+              )
 
               setTimeout(async () => {
                 try {
-                  const feedbackMessage = `[Quality Gate Review — Cycle ${currentCycle}/${qgConfig.maxReviewCycles}]\n\nYour work did not pass the quality gate. Please fix the issues below and try again.\n\n${failureReport}`
+                  const feedbackMessage = [
+                    workerFeedbackSummary,
+                    '',
+                    failureReport,
+                  ].join('\n')
                   await this.sendMessage(sessionId, feedbackMessage)
+                  teamManager.logActivity(
+                    resolvedTeamId,
+                    'review-feedback-sent',
+                    `Quality feedback sent (cycle ${currentCycle}/${qgConfig.maxReviewCycles})`,
+                    managed.id,
+                    teammateName,
+                  )
                 } catch (err) {
                   sessionLog.error(`[AgentTeams] Failed to send quality gate feedback to ${teammateName}:`, err)
                 }
@@ -7364,6 +8156,7 @@ To view this task's output:
       case 'team_initialized': {
         // Agent teams: When the lead agent spawns a teammate
         const teamName = event.teamName
+        const teamDisplayName = `${teamName} • ${buildTeamCodename(teamName)}`
         const teammateName = event.teammateName || 'Teammate'
 
         sessionLog.info(`Agent team initialized: ${teamName}, spawning ${teammateName}`)
@@ -7377,7 +8170,7 @@ To view this task's output:
         const initMessage: Message = {
           id: generateMessageId(),
           role: 'info',
-          content: `Agent Team initializing: ${teamName}`,
+          content: `Agent Team initializing: ${teamDisplayName}`,
           timestamp: Date.now(),
           infoLevel: 'info',
         }
@@ -7390,6 +8183,8 @@ To view this task's output:
           teamId: teamName,
           teammateName,
         }, workspaceId)
+
+        this.startYoloIfConfigured(managed, teamName)
 
         break
       }
@@ -7421,7 +8216,7 @@ To view this task's output:
               const retryOptions = managed.lastSentOptions
 
               // Force fresh app-server process on retry
-              managed.agent = null
+              this.destroyManagedAgent(managed, 'reconnect-retry')
 
               if (retryMessage) {
                 // Remove the failed turn's user message to avoid duplication in transcript
@@ -7515,7 +8310,7 @@ To view this task's output:
               // 2. Destroy the agent so it gets recreated with fresh token
               // The SDK subprocess has the old token cached in its env, so we must restart it
               sessionLog.info(`[auth-retry] Destroying agent for session ${sessionId}`)
-              managed.agent = null
+              this.destroyManagedAgent(managed, 'auth-retry')
 
               // 3. Retry the message
               // Get the stored message/attachments before they're cleared
@@ -7943,14 +8738,29 @@ To view this task's output:
     }
     this.deltaFlushTimers.clear()
     this.pendingDeltas.clear()
+    for (const timer of this.teammateKickoffTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.teammateKickoffTimers.clear()
 
     // Clear pending credential resolvers (they won't be resolved, but prevents memory leak)
     this.pendingCredentialResolvers.clear()
 
-    // Clean up session-scoped tool callbacks for all sessions
-    for (const sessionId of this.sessions.keys()) {
-      unregisterSessionScopedToolCallbacks(sessionId)
+    // Dispose all live agents and clean session-scoped callbacks
+    for (const managed of this.sessions.values()) {
+      if (managed.agent) {
+        this.destroyManagedAgent(managed, 'sessionManager.cleanup')
+      } else {
+        unregisterSessionScopedToolCallbacks(managed.id)
+      }
     }
+
+    // Stop health monitoring and remove handlers
+    for (const teamId of Array.from(this.healthMonitorTeams)) {
+      this.stopTeamHealthMonitoring(teamId)
+    }
+    this.healthMonitor.dispose()
+    this.teamHealthAlertHandlers.clear()
 
     sessionLog.info('Cleanup complete')
   }

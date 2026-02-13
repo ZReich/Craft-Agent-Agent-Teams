@@ -4,6 +4,7 @@
  * Aligned to minute boundaries for consistent timing.
  * Hooks can subscribe using cron expressions in hooks.json.
  */
+import { debug } from '../utils/debug.ts';
 
 export interface SchedulerTickPayload {
   /** ISO 8601 UTC timestamp */
@@ -67,13 +68,13 @@ export class SchedulerService {
       dayName: days[now.getDay()]!, // getDay() always returns 0-6
     };
 
-    console.log('[SchedulerService] TICK at', payload.localTime, 'UTC:', payload.timestamp);
+    debug('[SchedulerService] TICK', { localTime: payload.localTime, timestamp: payload.timestamp });
 
     try {
       await this.onTick(payload);
-      console.log('[SchedulerService] TICK callback completed');
+      debug('[SchedulerService] TICK callback completed');
     } catch (error) {
-      console.error('[SchedulerService] Tick failed:', error);
+      debug('[SchedulerService] Tick failed', error);
     }
   }
 }

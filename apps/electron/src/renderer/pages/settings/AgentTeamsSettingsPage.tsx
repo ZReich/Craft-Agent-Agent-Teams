@@ -19,11 +19,13 @@ import { HeaderMenu } from '@/components/ui/HeaderMenu'
 import { useAppShellContext } from '@/context/AppShellContext'
 import { navigate, routes } from '@/lib/navigate'
 import { Spinner } from '@craft-agent/ui'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@craft-agent/ui'
 import { Button } from '@/components/ui/button'
 import type { DetailsPageMeta } from '@/lib/navigation-registry'
 import type { ModelPresetId, ModelAssignment, WorkspaceSettings } from '../../../shared/types'
 import { OPENAI_MODELS, isCodexModel } from '@config/models'
 import { isOpenAIProvider } from '@config/llm-connections'
+import { QUALITY_GATE_HELP, parseKnownFailingTests, stringifyKnownFailingTests } from './qualityGateHelp'
 
 import {
   SettingsSection,
@@ -32,6 +34,7 @@ import {
   SettingsToggle,
   SettingsMenuSelectRow,
   SettingsInput,
+  SettingsTextarea,
   SettingsRadioGroup,
   SettingsRadioCard,
 } from '@/components/settings'
@@ -119,6 +122,8 @@ export default function AgentTeamsSettingsPage() {
   const [qgMaxCycles, setQgMaxCycles] = useState('5')
   const [qgEnforceTDD, setQgEnforceTDD] = useState(true)
   const [qgReviewModel, setQgReviewModel] = useState('kimi-k2.5')
+  const [qgBaselineAwareTests, setQgBaselineAwareTests] = useState(false)
+  const [qgKnownFailingTests, setQgKnownFailingTests] = useState('')
   const [qgSyntaxEnabled, setQgSyntaxEnabled] = useState(true)
   const [qgTestsEnabled, setQgTestsEnabled] = useState(true)
   const [qgArchEnabled, setQgArchEnabled] = useState(true)
@@ -178,6 +183,8 @@ export default function AgentTeamsSettingsPage() {
             setReviewerModel(settings.qualityGatesReviewModel)
           }
         }
+        if (settings?.qualityGatesBaselineAwareTests !== undefined) setQgBaselineAwareTests(settings.qualityGatesBaselineAwareTests)
+        setQgKnownFailingTests(stringifyKnownFailingTests(settings?.qualityGatesKnownFailingTests))
         if (settings?.qualityGatesSyntaxEnabled !== undefined) setQgSyntaxEnabled(settings.qualityGatesSyntaxEnabled)
         if (settings?.qualityGatesTestsEnabled !== undefined) setQgTestsEnabled(settings.qualityGatesTestsEnabled)
         if (settings?.qualityGatesArchEnabled !== undefined) setQgArchEnabled(settings.qualityGatesArchEnabled)
@@ -401,6 +408,16 @@ export default function AgentTeamsSettingsPage() {
     saveSetting('agentTeamsReviewerModel', v)
   }, [saveSetting])
 
+  const handleQgBaselineAwareTestsToggle = useCallback((enabled: boolean) => {
+    setQgBaselineAwareTests(enabled)
+    saveSetting('qualityGatesBaselineAwareTests', enabled)
+  }, [saveSetting])
+
+  const handleQgKnownFailingTestsChange = useCallback((value: string) => {
+    setQgKnownFailingTests(value)
+    saveSetting('qualityGatesKnownFailingTests', parseKnownFailingTests(value))
+  }, [saveSetting])
+
   const handleQgStageToggle = useCallback((stage: string, enabled: boolean) => {
     switch (stage) {
       case 'syntax': setQgSyntaxEnabled(enabled); saveSetting('qualityGatesSyntaxEnabled', enabled); break
@@ -471,6 +488,30 @@ export default function AgentTeamsSettingsPage() {
     }
     return BASE_MODEL_OPTIONS
   }, [hasCodexConnection, codexSelected])
+
+  const renderQualityHelpLabel = useCallback((entryKey: keyof typeof QUALITY_GATE_HELP, fallback: string) => {
+    const help = QUALITY_GATE_HELP[entryKey]
+    if (!help) return fallback
+
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <span>{help.title}</span>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex text-muted-foreground hover:text-foreground cursor-help align-middle" aria-label={`${help.title} details`}>
+              <Info className="size-3.5" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-sm">
+            <div className="space-y-1 text-xs leading-relaxed">
+              <p><span className="font-semibold">Checks:</span> {help.meaning}</p>
+              <p><span className="font-semibold">Why enable:</span> {help.whyEnable}</p>
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      </span>
+    )
+  }, [])
 
   // Check which non-Claude providers are needed
   const needsMoonshot = [leadModel, headModel, workerModel, reviewerModel].some(m => m.startsWith('kimi-'))
@@ -769,44 +810,64 @@ export default function AgentTeamsSettingsPage() {
                             <SettingsCard>
                               <div className="px-4 py-2">
                                 <p className="text-xs font-medium text-foreground mb-1">Review Stages</p>
-                                <p className="text-xs text-muted-foreground">Toggle individual review stages on or off</p>
+                                <p className="text-xs text-muted-foreground">Toggle stages on/off. Hover <Info className="inline size-3 align-text-top" /> for what each gate checks and why to keep it enabled.</p>
                               </div>
                               <SettingsToggle
-                                label="Syntax & Types"
+                                label={renderQualityHelpLabel('syntax', 'Syntax & Types')}
                                 description="TypeScript compilation check (free, local)"
                                 checked={qgSyntaxEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('syntax', v)}
                               />
                               <SettingsToggle
-                                label="Test Execution"
+                                label={renderQualityHelpLabel('tests', 'Test Execution')}
                                 description="Run test suite and verify all pass (free, local)"
                                 checked={qgTestsEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('tests', v)}
                               />
                               <SettingsToggle
-                                label="Architecture Review"
+                                label={renderQualityHelpLabel('architecture', 'Architecture Review')}
                                 description="File structure, separation of concerns, patterns (~$0.005)"
                                 checked={qgArchEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('architecture', v)}
                               />
                               <SettingsToggle
-                                label="Simplicity Review"
+                                label={renderQualityHelpLabel('simplicity', 'Simplicity Review')}
                                 description="Code complexity, readability, unnecessary abstractions (~$0.005)"
                                 checked={qgSimplicityEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('simplicity', v)}
                               />
                               <SettingsToggle
-                                label="Error Analysis"
+                                label={renderQualityHelpLabel('errors', 'Error Analysis')}
                                 description="Edge cases, null handling, error paths, security (~$0.006)"
                                 checked={qgErrorsEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('errors', v)}
                               />
                               <SettingsToggle
-                                label="Completeness Check"
+                                label={renderQualityHelpLabel('completeness', 'Completeness Check')}
                                 description="All requirements met, no TODOs or stubs (~$0.005)"
                                 checked={qgCompletenessEnabled}
                                 onCheckedChange={(v) => handleQgStageToggle('completeness', v)}
                               />
+                            </SettingsCard>
+
+                            <SettingsCard>
+                              <SettingsToggle
+                                label={renderQualityHelpLabel('baselineAwareTests', 'Baseline-aware Tests')}
+                                description="Allow known pre-existing failing tests while still failing on newly introduced regressions"
+                                checked={qgBaselineAwareTests}
+                                onCheckedChange={handleQgBaselineAwareTestsToggle}
+                              />
+                              {qgBaselineAwareTests && (
+                                <SettingsTextarea
+                                  inCard
+                                  label="Known failing tests baseline"
+                                  description="Optional. One test identifier per line (or comma-separated). These are treated as pre-existing failures."
+                                  value={qgKnownFailingTests}
+                                  onChange={handleQgKnownFailingTestsChange}
+                                  placeholder="packages/shared/src/foo/__tests__/bar.test.ts > handles legacy edge case"
+                                  rows={4}
+                                />
+                              )}
                             </SettingsCard>
                           </motion.div>
                         )}

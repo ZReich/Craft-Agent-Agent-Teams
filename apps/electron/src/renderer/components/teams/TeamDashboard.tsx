@@ -43,6 +43,7 @@ import { TeammateSidebar } from './TeammateSidebar'
 import { TeammateDetailView } from './TeammateDetailView'
 import { TaskListPanel } from './TaskListPanel'
 import { TeamActivityFeed } from './TeamActivityFeed'
+import { HealthAlertsCard } from './HealthAlertsCard'
 import { TeamCreationDialog } from './TeamCreationDialog'
 import { QualityGateReport } from './QualityGateReport'
 import { SpecCoveragePanel } from './SpecCoveragePanel'
@@ -480,6 +481,14 @@ export function TeamDashboard({
       {/* Main content area */}
       {viewMode === 'overview' ? (
         <div className="flex-1 min-h-0 overflow-y-auto p-3">
+          <HealthAlertsCard
+            events={realtimeActivity}
+            className="mb-3"
+            onOpenActivity={() => {
+              setActiveTab('activity')
+              setViewMode('focus')
+            }}
+          />
           <div className="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-3">
             {teammatesWithTasks.map((teammate) => {
               const activeCount = teammateActiveTaskCount.get(teammate.id) || 0

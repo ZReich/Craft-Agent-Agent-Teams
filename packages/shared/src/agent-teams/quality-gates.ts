@@ -26,6 +26,8 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
   passThreshold: 90,
   maxReviewCycles: 3,
   enforceTDD: true,
+  baselineAwareTests: false,
+  knownFailingTests: [],
   reviewModel: 'kimi-k2.5',
   reviewProvider: 'moonshot',
   escalationModel: 'claude-sonnet-4-5-20250929',
@@ -126,11 +128,14 @@ export function formatFailureReport(
 ): string {
   const lines: string[] = [];
 
-  lines.push(`## Quality Gate Review — FAILED (Score: ${result.aggregateScore}/${config.passThreshold} required)`);
+  lines.push(`## Quality Gate Review - FAILED (${result.aggregateScore}% / ${config.passThreshold}% required)`);
   lines.push(`Review cycle ${result.cycleCount}/${result.maxCycles}`);
   lines.push('');
+  lines.push('### Phase Scoreboard');
+  lines.push(...formatStageScoreboard(result));
+  lines.push('');
 
-  // Binary gate failures (most critical — fix these first)
+  // Binary gate failures (most critical - fix these first)
   const binaryFailures: QualityGateStageName[] = [];
   for (const [name, stageConfig] of Object.entries(config.stages) as [QualityGateStageName, QualityGateStageConfig][]) {
     if (!stageConfig.enabled || !stageConfig.binary) continue;
@@ -145,7 +150,7 @@ export function formatFailureReport(
     for (const name of binaryFailures) {
       const stageResult = result.stages[name];
       if (!stageResult) continue;
-      lines.push(`\n**${stageName(name)}** — FAILED`);
+      lines.push(`\n**${stageName(name)}** - FAILED`);
       for (const issue of stageResult.issues) {
         lines.push(`- ${issue}`);
       }
@@ -196,19 +201,13 @@ export function formatFailureReport(
 export function formatSuccessReport(result: QualityGateResult): string {
   const lines: string[] = [];
 
-  lines.push(`## Quality Gate Review — PASSED (Score: ${result.aggregateScore}/100)`);
+  lines.push(`## Quality Gate Review - PASSED (Score: ${result.aggregateScore}%)`);
   if (result.cycleCount > 1) {
     lines.push(`Passed after ${result.cycleCount} review cycle(s)`);
   }
   lines.push('');
-
-  lines.push('| Stage | Score | Status |');
-  lines.push('|-------|-------|--------|');
-
-  for (const [name, stageResult] of Object.entries(result.stages) as [QualityGateStageName, QualityGateStageResult][]) {
-    const status = stageResult.passed ? 'PASS' : 'FAIL';
-    lines.push(`| ${stageName(name)} | ${stageResult.score}/100 | ${status} |`);
-  }
+  lines.push('### Phase Scoreboard');
+  lines.push(...formatStageScoreboard(result));
 
   // Include suggestions even on pass (for the lead's awareness)
   const allSuggestions: string[] = [];
@@ -245,6 +244,30 @@ function stageName(name: QualityGateStageName | string): string {
     rollout_safety: 'Rollout Safety',
   };
   return names[name] || name;
+}
+
+function formatStageScoreboard(result: QualityGateResult): string[] {
+  const orderedStages: QualityGateStageName[] = [
+    'syntax',
+    'tests',
+    'architecture',
+    'simplicity',
+    'errors',
+    'completeness',
+    'spec_compliance',
+    'traceability',
+    'rollout_safety',
+  ];
+
+  const lines: string[] = [];
+  for (const stageKey of orderedStages) {
+    const stageResult = result.stages[stageKey];
+    if (!stageResult) continue;
+    const status = stageResult.passed ? 'PASS' : 'FAIL';
+    const icon = stageResult.passed ? '[PASS]' : '[FAIL]';
+    lines.push(`- ${icon} ${stageName(stageKey)}: ${stageResult.score}% (${status})`);
+  }
+  return lines;
 }
 
 /**
