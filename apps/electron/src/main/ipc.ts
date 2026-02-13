@@ -513,6 +513,13 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     }
   })
 
+  ipcMain.handle(IPC_CHANNELS.SESSIONS_REAP_STALE_PROCESSES, async (
+    _event,
+    options?: import('../shared/types').SessionProcessReapOptions
+  ) => {
+    return sessionManager.reapStaleSessionProcesses(options)
+  })
+
   // Respond to a permission request (bash command approval)
   // Returns true if the response was delivered, false if agent/session is gone
   ipcMain.handle(IPC_CHANNELS.RESPOND_TO_PERMISSION, async (_event, sessionId: string, requestId: string, allowed: boolean, alwaysAllow: boolean) => {
@@ -1845,6 +1852,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       qualityGatesMaxCycles: qg?.maxReviewCycles ?? 5,
       qualityGatesEnforceTDD: qg?.enforceTDD ?? true,
       qualityGatesReviewModel: qg?.reviewModel ?? 'kimi-k2.5',
+      qualityGatesBaselineAwareTests: qg?.baselineAwareTests ?? false,
+      qualityGatesKnownFailingTests: qg?.knownFailingTests ?? [],
       qualityGatesSyntaxEnabled: qg?.stages?.syntax?.enabled ?? true,
       qualityGatesTestsEnabled: qg?.stages?.tests?.enabled ?? true,
       qualityGatesArchEnabled: qg?.stages?.architecture?.enabled ?? true,
@@ -1868,7 +1877,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
+    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -1937,6 +1946,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         qualityGatesMaxCycles: 'maxReviewCycles',
         qualityGatesEnforceTDD: 'enforceTDD',
         qualityGatesReviewModel: 'reviewModel',
+        qualityGatesBaselineAwareTests: 'baselineAwareTests',
+        qualityGatesKnownFailingTests: 'knownFailingTests',
       }
 
       // Per-stage enabled toggles
@@ -1950,6 +1961,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       }
 
       if (key in qgTopLevelMap) {
+        if (key === 'qualityGatesKnownFailingTests') {
+          value = Array.isArray(value)
+            ? [...new Set(value.filter((entry): entry is string => typeof entry === 'string').map((entry) => entry.trim()).filter(Boolean))]
+            : []
+        }
         qg[qgTopLevelMap[key]] = value
       } else if (key in qgStageMap) {
         const stages = (qg.stages || {}) as Record<string, Record<string, unknown>>
@@ -3724,11 +3740,24 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // Agent Teams
   // ============================================================
 
-  // Broadcast team activity events to all renderers
+  // Broadcast agent-team events to all renderers
   if (!teamActivityListenerRegistered) {
     teamActivityListenerRegistered = true
     void (async () => {
       const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+      const resolveTeamIdForTeammate = (teammateId: string): string | null => {
+        const team = teamManager.getActiveTeams().find(t => t.members.some(m => m.id === teammateId))
+        return team?.id ?? null
+      }
+      const resolveTeamIdForTask = (taskId: string): string | null => {
+        const team = teamManager.getActiveTeams().find(t => teamManager.getTasks(t.id).some(task => task.id === taskId))
+        return team?.id ?? null
+      }
+      const resolveTeamIdForMessage = (messageId: string): string | null => {
+        const team = teamManager.getActiveTeams().find(t => teamManager.getMessages(t.id).some(msg => msg.id === messageId))
+        return team?.id ?? null
+      }
+
       const activityListener = (event: import('@craft-agent/core/types').TeamActivityEvent) => {
         if (!event.teamId) {
           ipcLog.warn('[agent teams] Skipping activity event without teamId', event)
@@ -3742,7 +3771,87 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         }
         windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
       }
+      const teamUpdatedListener = (team: import('@craft-agent/core/types').AgentTeam) => {
+        const envelope: import('@craft-agent/core/types').TeamUpdatedEvent = {
+          type: 'team:updated',
+          teamId: team.id,
+          payload: { team },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+      const teammateSpawnedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
+        const teamId = resolveTeamIdForTeammate(teammate.id)
+        if (!teamId) return
+        const envelope: import('@craft-agent/core/types').TeammateSpawnedEvent = {
+          type: 'teammate:spawned',
+          teamId,
+          payload: { teammate },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+      const teammateUpdatedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
+        const teamId = resolveTeamIdForTeammate(teammate.id)
+        if (!teamId) return
+        const envelope: import('@craft-agent/core/types').TeammateUpdatedEvent = {
+          type: 'teammate:updated',
+          teamId,
+          payload: { teammate },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+      const taskCreatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
+        const teamId = resolveTeamIdForTask(task.id)
+        if (!teamId) return
+        const envelope: import('@craft-agent/core/types').TaskCreatedEvent = {
+          type: 'task:created',
+          teamId,
+          payload: { task },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+      const taskUpdatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
+        const teamId = resolveTeamIdForTask(task.id)
+        if (!teamId) return
+        const envelope: import('@craft-agent/core/types').TaskUpdatedEvent = {
+          type: 'task:updated',
+          teamId,
+          payload: { task },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+      const messageSentListener = (message: import('@craft-agent/core/types').TeammateMessage) => {
+        const teamId = resolveTeamIdForMessage(message.id)
+        if (!teamId) return
+        const envelope: import('@craft-agent/core/types').MessageSentEvent = {
+          type: 'message:sent',
+          teamId,
+          payload: { message },
+          timestamp: message.timestamp ?? new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+      const costUpdatedListener = (teamId: string, summary: import('@craft-agent/core/types').TeamCostSummary) => {
+        const envelope: import('@craft-agent/core/types').CostUpdatedEvent = {
+          type: 'cost:updated',
+          teamId,
+          payload: { summary },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
       teamManager.on('activity', activityListener)
+      teamManager.on('team:updated', teamUpdatedListener)
+      teamManager.on('teammate:spawned', teammateSpawnedListener)
+      teamManager.on('teammate:updated', teammateUpdatedListener)
+      teamManager.on('task:created', taskCreatedListener)
+      teamManager.on('task:updated', taskUpdatedListener)
+      teamManager.on('message:sent', messageSentListener)
+      teamManager.on('cost:updated', costUpdatedListener)
     })()
   }
 
@@ -3795,6 +3904,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       modelPreset: resolvedConfig.presetId,
       workspaceRootPath: workspace.rootPath,
     })
+
+    // Wire YOLO callbacks/state pipeline for this team when enabled in workspace config.
+    // The actual run starts when the lead agent initializes the team in-session.
+    sessionManager.ensureYoloWiredForTeam(team.id, options.leadSessionId)
 
     ipcLog.info(`Agent team created: ${team.id} (${team.name})`)
     return team
@@ -4000,6 +4113,50 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   ipcMain.handle(IPC_CHANNELS.SDD_CAN_CLOSE, async (_event, teamId: string) => {
     const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.canClosePlan(teamManager.resolveTeamId(teamId))
+  })
+
+  // ============================================================
+  // YOLO (Autonomous Execution) Handlers
+  // ============================================================
+
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_START, async (_event, teamId: string, objective: string, config?: Record<string, unknown>) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const resolvedId = teamManager.resolveTeamId(teamId)
+    const team = teamManager.getTeam(resolvedId)
+    if (!team) throw new Error(`Team not found: ${teamId}`)
+
+    // Ensure orchestrator is wired
+    sessionManager.ensureYoloWiredForTeam(resolvedId, team.leadSessionId)
+
+    const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
+    if (!orchestrator) throw new Error(`YOLO orchestrator not available for team ${teamId}`)
+
+    return orchestrator.start(resolvedId, objective, config)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_PAUSE, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const resolvedId = teamManager.resolveTeamId(teamId)
+    const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
+    if (!orchestrator) throw new Error(`YOLO orchestrator not available for team ${teamId}`)
+
+    orchestrator.pause('user-requested')
+  })
+
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_ABORT, async (_event, teamId: string, reason?: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const resolvedId = teamManager.resolveTeamId(teamId)
+    const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
+    if (!orchestrator) throw new Error(`YOLO orchestrator not available for team ${teamId}`)
+
+    orchestrator.abort(reason || 'User requested abort')
+  })
+
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_GET_STATE, async (_event, teamId: string) => {
+    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
+    const resolvedId = teamManager.resolveTeamId(teamId)
+    const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
+    return orchestrator?.getState() ?? null
   })
 
   // ============================================================

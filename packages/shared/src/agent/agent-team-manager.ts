@@ -24,8 +24,11 @@ import type {
   TeammateTokenUsage,
   Spec,
   DRIAssignment,
+  YoloState,
+  TeamPhase,
 } from '@craft-agent/core/types';
 import type { ReviewLoopOrchestrator } from '../agent-teams/review-loop';
+import type { YoloOrchestrator } from '../agent-teams/yolo-orchestrator';
 
 // ============================================================
 // Types
@@ -83,6 +86,9 @@ export class AgentTeamManager extends EventEmitter {
   private teamSpecs = new Map<string, Spec>();  // teamId → active spec
   private teamDRIAssignments = new Map<string, DRIAssignment[]>();  // teamId → DRI assignments
   private synthesisRequested = new Set<string>();  // teamIds that already emitted synthesis request
+  private yoloStates = new Map<string, YoloState>();  // teamId → YOLO state
+  private teamPhases = new Map<string, TeamPhase[]>();  // teamId → phases
+  private yoloOrchestrators = new Map<string, YoloOrchestrator>();  // teamId → orchestrator
 
   /** Review loop orchestrator — when set, task completions are routed through quality gates */
   private reviewLoop: ReviewLoopOrchestrator | null = null;
@@ -178,6 +184,9 @@ export class AgentTeamManager extends EventEmitter {
     // Clean up review loop state for this team
     this.reviewLoop?.cleanup(teamId);
 
+    // Stop YOLO if running
+    this.stopYolo(teamId, 'Team cleanup');
+
     // Release hot runtime memory immediately after cleanup.
     this.tasks.delete(teamId);
     this.messages.delete(teamId);
@@ -185,6 +194,10 @@ export class AgentTeamManager extends EventEmitter {
     this.teamSpecs.delete(teamId);
     this.teamDRIAssignments.delete(teamId);
     this.synthesisRequested.delete(teamId);
+    this.yoloStates.delete(teamId);
+    this.yoloOrchestrators.delete(teamId);
+    this.teamPhases.delete(teamId);
+    this.teams.delete(teamId);
   }
 
   /** Get team status */
@@ -630,6 +643,109 @@ export class AgentTeamManager extends EventEmitter {
       canClose: blockers.length === 0,
       blockers,
     };
+  }
+
+  // ============================================================
+  // YOLO Mode (Autonomous Execution)
+  // ============================================================
+
+  /** Attach a YOLO orchestrator for a team */
+  setYoloOrchestrator(teamId: string, orchestrator: YoloOrchestrator | null): void {
+    if (!orchestrator) {
+      this.yoloOrchestrators.delete(teamId);
+      return;
+    }
+    this.yoloOrchestrators.set(teamId, orchestrator);
+
+    // Forward YOLO state changes to team events
+    orchestrator.on('yolo:phase-changed', (data: { teamId: string; phase: string }) => {
+      const state = orchestrator.getState();
+      if (state) {
+        this.yoloStates.set(data.teamId, { ...state });
+        this.emit('yolo:state-changed', data.teamId, state);
+      }
+    });
+  }
+
+  /** Get the YOLO orchestrator for a team */
+  getYoloOrchestrator(teamId: string): YoloOrchestrator | undefined {
+    return this.yoloOrchestrators.get(teamId);
+  }
+
+  /** Get YOLO state for a team */
+  getYoloState(teamId: string): YoloState | undefined {
+    return this.yoloStates.get(teamId);
+  }
+
+  /** Update YOLO state for a team (called by the orchestrator's onStateChange callback) */
+  updateYoloState(teamId: string, state: YoloState): void {
+    this.yoloStates.set(teamId, state);
+    this.emit('yolo:state-changed', teamId, state);
+  }
+
+  /** Stop a YOLO run for a team */
+  stopYolo(teamId: string, reason?: string): void {
+    const orchestrator = this.yoloOrchestrators.get(teamId);
+    if (orchestrator?.isRunning()) {
+      orchestrator.abort(reason || 'Stopped by user');
+    }
+  }
+
+  /** Check if a team is in YOLO mode */
+  isYoloActive(teamId: string): boolean {
+    const orchestrator = this.yoloOrchestrators.get(teamId);
+    return orchestrator?.isRunning() ?? false;
+  }
+
+  // ============================================================
+  // Phase Management
+  // ============================================================
+
+  /** Set phases for a team */
+  setTeamPhases(teamId: string, phases: TeamPhase[]): void {
+    this.teamPhases.set(teamId, phases);
+  }
+
+  /** Get phases for a team */
+  getTeamPhases(teamId: string): TeamPhase[] {
+    return this.teamPhases.get(teamId) || [];
+  }
+
+  /** Get the current active phase for a team */
+  getCurrentPhase(teamId: string): TeamPhase | undefined {
+    const phases = this.teamPhases.get(teamId) || [];
+    return phases
+      .sort((a, b) => a.order - b.order)
+      .find(p => p.status === 'in-progress' || p.status === 'pending');
+  }
+
+  /** Check if all tasks in a phase are completed */
+  isPhaseComplete(teamId: string, phaseId: string): boolean {
+    const tasks = this.getTasks(teamId);
+    const phaseTasks = tasks.filter(t => t.phase === phaseId);
+    if (phaseTasks.length === 0) return true;
+    return phaseTasks.every(t => t.status === 'completed');
+  }
+
+  /** Check if a task can start based on its phase ordering */
+  canTaskStart(teamId: string, taskId: string): boolean {
+    const tasks = this.getTasks(teamId);
+    const task = tasks.find(t => t.id === taskId);
+    if (!task || !task.phase || task.phaseOrder === undefined) return true;
+
+    const phases = this.teamPhases.get(teamId) || [];
+    const currentPhase = phases.find(p => p.id === task.phase);
+    if (!currentPhase) return true;
+
+    // Check that all earlier phases are completed
+    const earlierPhases = phases.filter(p => p.order < currentPhase.order);
+    for (const earlier of earlierPhases) {
+      if (earlier.status !== 'completed') {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   /**

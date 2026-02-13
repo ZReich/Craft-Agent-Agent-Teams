@@ -595,6 +595,15 @@ export class ClaudeAgent extends BaseAgent {
   }
 
   /**
+   * Returns true when the tool name represents teammate spawning for agent teams.
+   * Claude SDK may expose this tool as either "Task" or "Agent" depending on version/mode.
+   */
+  private isTeammateSpawnToolName(toolName: string | undefined): boolean {
+    if (!toolName) return false;
+    return toolName === 'Task' || toolName === 'Agent';
+  }
+
+  /**
    * Check if a tool requires permission and handle it
    * Returns true if allowed, false if denied
    */
@@ -930,7 +939,7 @@ export class ClaudeAgent extends BaseAgent {
               // we intercept it and create a separate session instead of in-process execution.
               // ============================================================
               // --- Task tool: Spawn teammate as a separate session ---
-              if (toolName === 'Task' && this.onTeammateSpawnRequested) {
+              if (this.isTeammateSpawnToolName(toolName) && this.onTeammateSpawnRequested) {
                 const toolInput = input.tool_input as Record<string, unknown>;
                 const explicitTeamName = typeof toolInput.team_name === 'string'
                   ? toolInput.team_name
@@ -2405,7 +2414,7 @@ export class ClaudeAgent extends BaseAgent {
         // This enables fallback parent assignment for child tools when SDK's
         // parent_tool_use_id is null.
         for (const event of toolStartEvents) {
-          if (event.type === 'tool_start' && event.toolName === 'Task') {
+          if (event.type === 'tool_start' && this.isTeammateSpawnToolName(event.toolName)) {
             activeParentTools.add(event.toolUseId);
 
             // AGENT TEAMS: Detect when a teammate is being spawned
@@ -2499,7 +2508,7 @@ export class ClaudeAgent extends BaseAgent {
 
           // Track active Task tools for fallback parent assignment
           for (const evt of streamEvents) {
-            if (evt.type === 'tool_start' && evt.toolName === 'Task') {
+            if (evt.type === 'tool_start' && this.isTeammateSpawnToolName(evt.toolName)) {
               activeParentTools.add(evt.toolUseId);
             }
           }
@@ -2545,7 +2554,7 @@ export class ClaudeAgent extends BaseAgent {
           // When a Task tool result arrives, we no longer need to track it
           // as an active parent for fallback assignment.
           for (const event of resultEvents) {
-            if (event.type === 'tool_result' && event.toolName === 'Task') {
+            if (event.type === 'tool_result' && this.isTeammateSpawnToolName(event.toolName)) {
               activeParentTools.delete(event.toolUseId);
             }
           }
@@ -2598,7 +2607,7 @@ export class ClaudeAgent extends BaseAgent {
 
           // Track active Task tools discovered via progress events
           for (const evt of progressEvents) {
-            if (evt.type === 'tool_start' && evt.toolName === 'Task') {
+            if (evt.type === 'tool_start' && this.isTeammateSpawnToolName(evt.toolName)) {
               activeParentTools.add(evt.toolUseId);
             }
           }

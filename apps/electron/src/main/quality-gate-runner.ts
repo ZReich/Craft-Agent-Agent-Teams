@@ -19,6 +19,7 @@ import {
   formatFailureReport,
   formatSuccessReport,
 } from '@craft-agent/shared/agent-teams/quality-gates';
+import { runTypeCheckCached, runTestSuiteCached } from '@craft-agent/shared/agent-teams/local-checks';
 import type {
   QualityGateConfig,
   QualityGateResult,
@@ -151,6 +152,12 @@ interface ApiKeyProvider {
   getOpenAiConfig(): Promise<{ apiKey: string; baseUrl?: string | null } | null>;
 }
 
+type TestFailureKind = 'none' | 'no-tests' | 'test-failures' | 'infra-failure' | 'timeout' | 'config-error';
+interface TestBaselineOptions {
+  enabled: boolean;
+  knownFailingTests: string[];
+}
+
 // ============================================================
 // Quality Gate Runner
 // ============================================================
@@ -193,6 +200,21 @@ export class QualityGateRunner {
       issues: [],
       suggestions: [reason, ...suggestions],
     };
+  }
+
+  private shouldRequireTests(taskContext: TaskContext): boolean {
+    if (taskContext.taskType === 'feature') return true;
+    if (taskContext.taskType === 'docs' || taskContext.taskType === 'refactor' || taskContext.taskType === 'other') {
+      return false;
+    }
+
+    // Heuristic fallback when taskType is absent.
+    const desc = (taskContext.taskDescription || '').toLowerCase();
+    const validationLike = /(validate|validation|typecheck|lint|audit|review|investigat|analyz|wiring|wire-up|diagnos|verify|check[- ]?in)/i.test(desc);
+    if (validationLike) return false;
+
+    // Keep strict-by-default for ambiguous work.
+    return true;
   }
 
   private async hasReviewProviderAccess(reviewProvider: ReviewProvider): Promise<boolean> {
@@ -298,7 +320,11 @@ export class QualityGateRunner {
     // Stage 2: Test Execution (local, free)
     if (config.stages.tests.enabled && taskContext.workingDirectory) {
       qgLog.info('[QualityGates] Running test execution');
-      stages.tests = await this.runTestExecution(taskContext.workingDirectory);
+      const requireTests = this.shouldRequireTests(taskContext);
+      stages.tests = await this.runTestExecution(taskContext.workingDirectory, true, requireTests, {
+        enabled: config.baselineAwareTests === true,
+        knownFailingTests: config.knownFailingTests ?? [],
+      });
     }
 
     // Early exit if binary gates fail — no point running AI reviews
@@ -443,205 +469,236 @@ export class QualityGateRunner {
    * Run TypeScript compilation check.
    */
   async runSyntaxCheck(workingDir: string, allowInstall = true): Promise<QualityGateStageResult> {
-    try {
-      await execAsync('npx tsc --noEmit --pretty false 2>&1', {
-        cwd: workingDir,
-        timeout: 60000,
-      });
+    const result = await runTypeCheckCached({
+      workingDir,
+      timeoutMs: 60000,
+      cacheKey: `quality:${workingDir}:typecheck`,
+      forceRefresh: !allowInstall,
+    });
+
+    if (result.passed) {
       return { score: 100, passed: true, issues: [], suggestions: [] };
-    } catch (err: unknown) {
-      const error = err as { stdout?: string; stderr?: string };
-      const output = this.normalizeOutput(error.stdout || error.stderr || 'Unknown compilation error');
-      if (this.isInfraTypeFailure(output) && allowInstall) {
-        const installed = await this.ensureDependenciesInstalled(workingDir);
-        if (installed) {
-          return this.runSyntaxCheck(workingDir, false);
-        }
+    }
+
+    const output = this.normalizeOutput(result.rawOutput || result.errors.join('\n') || 'Unknown compilation error');
+    if (this.isInfraTypeFailure(output) && allowInstall) {
+      const installed = await this.ensureDependenciesInstalled(workingDir);
+      if (installed) {
+        return this.runSyntaxCheck(workingDir, false);
       }
-      if (this.isMissingTypeScript(output)) {
-        try {
-          await execAsync('bun run tsc --noEmit --pretty false 2>&1', {
-            cwd: workingDir,
-            timeout: 60000,
-          });
-          return { score: 100, passed: true, issues: [], suggestions: [] };
-        } catch (bunErr: unknown) {
-          const bunError = bunErr as { stdout?: string; stderr?: string };
-          const bunOutput = (bunError.stdout || bunError.stderr || 'Unknown compilation error').trim();
-          if (this.isInfraTypeFailure(bunOutput) && allowInstall) {
-            const installed = await this.ensureDependenciesInstalled(workingDir);
-            if (installed) {
-              return this.runSyntaxCheck(workingDir, false);
-            }
-          }
-          const bunErrors = bunOutput.split('\n').filter(l => l.includes('error TS'));
-          if (!bunOutput || bunErrors.length === 0 && /unknown compilation error/i.test(bunOutput)) {
-            return {
-              score: 100,
-              passed: true,
-              issues: [],
-              suggestions: ['TypeScript check failed with an unknown error — install dependencies and re-run typecheck'],
-            };
-          }
-          return {
-            score: 0,
-            passed: false,
-            issues: bunErrors.length > 0 ? bunErrors.slice(0, 20) : [bunOutput.slice(0, 500)],
-            suggestions: ['Fix all TypeScript compilation errors before proceeding'],
-          };
-        }
-      }
-      const errors = output.split('\n').filter(l => l.includes('error TS'));
-      if (!output || errors.length === 0 && /unknown compilation error/i.test(output)) {
-        return {
-          score: 100,
-          passed: true,
-          issues: [],
-          suggestions: ['TypeScript check failed with an unknown error — install dependencies and re-run typecheck'],
-        };
-      }
-      if (this.isInfraTypeFailure(output) && allowInstall) {
-        const installed = await this.ensureDependenciesInstalled(workingDir);
-        if (installed) {
-          return this.runSyntaxCheck(workingDir, false);
-        }
-      }
+    }
+
+    const errors = output.split('\n').filter(l => l.includes('error TS'));
+    if (!output || errors.length === 0 && /unknown compilation error/i.test(output)) {
       return {
-        score: 0,
-        passed: false,
-        issues: errors.length > 0 ? errors.slice(0, 20) : [output.slice(0, 500)],
-        suggestions: ['Fix all TypeScript compilation errors before proceeding'],
+        score: 100,
+        passed: true,
+        issues: [],
+        suggestions: ['TypeScript check failed with an unknown error — install dependencies and re-run typecheck'],
       };
     }
+
+    return {
+      score: 0,
+      passed: false,
+      issues: errors.length > 0 ? errors.slice(0, 20) : [output.slice(0, 500)],
+      suggestions: ['Fix all TypeScript compilation errors before proceeding'],
+    };
   }
 
   /**
    * Run test suite and parse results.
    */
-  async runTestExecution(workingDir: string, allowInstall = true): Promise<TestStageResult> {
-    try {
-      // Implements REQ-005: Don't redirect stderr to stdout to keep JSON output clean
-      // ConfigWatcher logs go to stderr, vitest JSON goes to stdout - keep them separate!
-      const { stdout } = await execAsync('npx vitest run --reporter=json -c vitest.config.ts', {
-        cwd: workingDir,
-        timeout: 120000,
-        env: { ...process.env, CRAFT_DEBUG: '0' },
-      });
+  async runTestExecution(
+    workingDir: string,
+    allowInstall = true,
+    requireTests = true,
+    baselineOptions: TestBaselineOptions = { enabled: false, knownFailingTests: [] },
+  ): Promise<TestStageResult> {
+    const timeoutMs = 120000;
+    const maxAttempts = 2;
+    const cacheKey = `quality:${workingDir}:tests`;
+    const attempts: Array<{ kind: TestFailureKind; details: string }> = [];
 
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const forceRefresh = attempt > 1;
       try {
-        const jsonMatch = stdout.match(/\{[\s\S]*"testResults"[\s\S]*\}/);
-        if (jsonMatch) {
-          const results = JSON.parse(jsonMatch[0]);
-          const passed = results.numPassedTests || 0;
-          const failed = results.numFailedTests || 0;
-          const skipped = results.numPendingTests || 0;
-          const total = passed + failed + skipped;
-          // Implements REQ-005: Fail when no test files are found
-          if (total === 0) {
+        const result = await runTestSuiteCached({
+          workingDir,
+          timeoutMs,
+          cacheKey,
+          forceRefresh,
+        });
+
+        const output = this.normalizeOutput(result.rawOutput || '');
+        const diagnostics = this.formatTestDiagnostics(
+          result.metadata?.command ?? 'bun run vitest run --reporter=json -c vitest.config.ts',
+          workingDir,
+          timeoutMs,
+          attempt,
+          maxAttempts,
+          Boolean(result.metadata?.cacheHit),
+        );
+
+        if (result.total === 0) {
+          if (!requireTests) {
             return {
-              score: 0,
-              passed: false,
-              issues: ['No test files found — tests are required for all feature work'],
-              suggestions: ['Add unit tests for this change and re-run the quality gate'],
+              score: 100,
+              passed: true,
+              issues: [],
+              suggestions: ['No test files detected; tests are not required for this task type', diagnostics],
               totalTests: 0,
               passedTests: 0,
               failedTests: 0,
               skippedTests: 0,
             };
           }
-          const infraDetails = JSON.stringify(results.testResults || []);
-          if (failed > 0 && this.isInfraTestFailure(infraDetails) && allowInstall) {
-            const installed = await this.ensureDependenciesInstalled(workingDir);
-            if (installed) {
-              return this.runTestExecution(workingDir, false);
-            }
-          }
 
           return {
-            score: failed === 0 ? 100 : 0,
-            passed: failed === 0,
-            issues: failed > 0
-              ? (results.testResults || [])
-                  .filter((t: { status: string }) => t.status === 'failed')
-                  .map((t: { name: string; message?: string }) => `FAIL: ${t.name}${t.message ? ` — ${t.message}` : ''}`)
-                  .slice(0, 10)
-              : [],
-            suggestions: failed > 0 ? ['Fix all failing tests'] : [],
-            totalTests: total,
-            passedTests: passed,
-            failedTests: failed,
-            skippedTests: skipped,
+            score: 0,
+            passed: false,
+            issues: ['No test files found - tests are required for all feature work', diagnostics],
+            suggestions: ['Add unit tests for this change and re-run the quality gate'],
+            totalTests: 0,
+            passedTests: 0,
+            failedTests: 0,
+            skippedTests: 0,
           };
         }
-      } catch {
-        // JSON parse failed — fall through to text parsing
-      }
 
-      // Fallback: try to detect pass/fail from text output
-      const hasFailure = /FAIL|failed/i.test(stdout);
-      if (/no test files found/i.test(stdout)) {
+        const kind = this.classifyTestFailure(result, output);
+        if (kind !== 'none') {
+          attempts.push({ kind, details: diagnostics });
+        }
+
+        if (kind === 'infra-failure' && allowInstall && attempt === 1) {
+          const installed = await this.ensureDependenciesInstalled(workingDir);
+          if (installed) {
+            continue;
+          }
+        }
+
+        if ((kind === 'infra-failure' || kind === 'timeout' || kind === 'test-failures') && attempt < maxAttempts) {
+          qgLog.warn(`[QualityGates] Test stage failed (${kind}) on attempt ${attempt}; retrying once with cache bypass`);
+          continue;
+        }
+
+        if (kind === 'none') {
+          const warnings = attempts.length > 0
+            ? ['Flaky test behavior detected: initial attempt failed but retry passed', ...attempts.map(a => a.details)]
+            : [];
+          return {
+            score: 100,
+            passed: true,
+            issues: [],
+            suggestions: warnings,
+            totalTests: result.total,
+            passedTests: result.passed_count,
+            failedTests: result.failed,
+            skippedTests: result.skipped,
+          };
+        }
+
+        if (
+          kind === 'test-failures'
+          && baselineOptions.enabled
+          && this.isBaselineOnlyFailure(result.failedTests, baselineOptions.knownFailingTests)
+        ) {
+          return {
+            score: 100,
+            passed: true,
+            issues: [],
+            suggestions: [
+              'Test failures match known baseline failures; blocking suppressed by baseline-aware mode',
+              diagnostics,
+            ],
+            totalTests: result.total,
+            passedTests: result.passed_count,
+            failedTests: result.failed,
+            skippedTests: result.skipped,
+          };
+        }
+
         return {
           score: 0,
           passed: false,
-          issues: ['No test files found — tests are required for all feature work'],
-          suggestions: ['Add unit tests for this change and re-run the quality gate'],
-          totalTests: 0,
-          passedTests: 0,
-          failedTests: 0,
-          skippedTests: 0,
+          issues: [
+            ...result.failedTests.slice(0, 10).map(name => `FAIL: ${name}`),
+            diagnostics,
+            ...attempts
+              .filter(a => a.details !== diagnostics)
+              .map(a => `Previous attempt (${a.kind}): ${a.details}`),
+          ],
+          suggestions: this.testFailureSuggestions(kind),
+          totalTests: result.total,
+          passedTests: result.passed_count,
+          failedTests: result.failed,
+          skippedTests: result.skipped,
         };
-      }
-      return {
-        score: hasFailure ? 0 : 100,
-        passed: !hasFailure,
-        issues: hasFailure ? ['Test execution reported failures — check test output'] : [],
-        suggestions: hasFailure ? ['Fix all failing tests'] : [],
-        totalTests: 0,
-        passedTests: 0,
-        failedTests: hasFailure ? 1 : 0,
-        skippedTests: 0,
-      };
-    } catch (err: unknown) {
-      const error = err as { stdout?: string; stderr?: string; code?: number };
-      const output = this.normalizeOutput(error.stdout || error.stderr || '');
-      if (this.isMissingVitest(output) && allowInstall) {
-        const installed = await this.ensureDependenciesInstalled(workingDir);
-        if (installed) {
-          return this.runTestExecution(workingDir, false);
+      } catch (err: unknown) {
+        const error = err as { stdout?: string; stderr?: string; code?: number };
+        const output = this.normalizeOutput(error.stdout || error.stderr || '');
+        const diagnostics = this.formatTestDiagnostics(
+          'bun run vitest run --reporter=json -c vitest.config.ts',
+          workingDir,
+          timeoutMs,
+          attempt,
+          maxAttempts,
+          false,
+        );
+
+        if (this.isMissingVitest(output) && allowInstall && attempt === 1) {
+          const installed = await this.ensureDependenciesInstalled(workingDir);
+          if (installed) {
+            continue;
+          }
         }
-      }
-      // Exit code 1 usually means test failures
-      if (this.isInfraTestFailure(output) && allowInstall) {
-        const installed = await this.ensureDependenciesInstalled(workingDir);
-        if (installed) {
-          return this.runTestExecution(workingDir, false);
+
+        const kind: TestFailureKind = this.isTimeoutFailure(output)
+          ? 'timeout'
+          : this.isInfraTestFailure(output)
+            ? 'infra-failure'
+            : error.code === 1
+              ? 'test-failures'
+              : 'config-error';
+        attempts.push({ kind, details: diagnostics });
+
+        if ((kind === 'infra-failure' || kind === 'timeout' || kind === 'test-failures') && attempt < maxAttempts) {
+          qgLog.warn(`[QualityGates] Test execution error (${kind}) on attempt ${attempt}; retrying once`);
+          continue;
         }
-      }
-      if (error.code === 1) {
+
+        const outputSnippet = output ? output.slice(0, 500) : 'No error output captured';
         return {
           score: 0,
           passed: false,
-          issues: ['Test suite failed — see output above', output.slice(0, 500)],
-          suggestions: ['Fix all failing tests'],
+          issues: [
+            `Test execution failed (${kind})`,
+            outputSnippet,
+            diagnostics,
+            ...attempts
+              .filter(a => a.details !== diagnostics)
+              .map(a => `Previous attempt (${a.kind}): ${a.details}`),
+          ],
+          suggestions: this.testFailureSuggestions(kind),
           totalTests: 0,
           passedTests: 0,
           failedTests: 1,
           skippedTests: 0,
         };
       }
-      // Other errors (e.g., no test runner found)
-      qgLog.warn('[QualityGates] Test execution error:', error);
-      return {
-        score: 0,
-        passed: false,
-        issues: ['Test runner failed to execute — ensure dependencies are installed'],
-        suggestions: ['Install dependencies and rerun tests'],
-        totalTests: 0,
-        passedTests: 0,
-        failedTests: 1,
-        skippedTests: 0,
-      };
     }
+
+    return {
+      score: 0,
+      passed: false,
+      issues: ['Test stage exhausted retry attempts'],
+      suggestions: ['Re-run tests manually and inspect infrastructure/tooling state'],
+      totalTests: 0,
+      passedTests: 0,
+      failedTests: 1,
+      skippedTests: 0,
+    };
   }
 
   private isInfraTypeFailure(output: string): boolean {
@@ -656,6 +713,10 @@ export class QualityGateRunner {
     return /(cannot find module|err_module_not_found|module not found|missing dependency|missing peer dependency|node_modules|please run (npm|pnpm|yarn|bun) install)/i.test(output);
   }
 
+  private isTimeoutFailure(output: string): boolean {
+    return /(timed out|timeout|exceeded.*time limit)/i.test(output);
+  }
+
   private isMissingTypeScript(output: string): boolean {
     const normalized = this.normalizeOutput(output);
     return /not the tsc command/i.test(normalized)
@@ -666,6 +727,40 @@ export class QualityGateRunner {
   private isMissingVitest(output: string): boolean {
     const normalized = this.normalizeOutput(output);
     return /vitest/i.test(normalized) && (/not found|missing|cannot find|not installed/i.test(normalized) || /not the vitest command/i.test(normalized));
+  }
+
+  private classifyTestFailure(result: { failed: number; rawOutput: string }, normalizedOutput: string): TestFailureKind {
+    if (result.failed === 0) return 'none';
+    if (this.isTimeoutFailure(normalizedOutput)) return 'timeout';
+    if (this.isInfraTestFailure(normalizedOutput)) return 'infra-failure';
+    if (/vitest\.config|configuration|config file|cannot parse/i.test(normalizedOutput)) return 'config-error';
+    return 'test-failures';
+  }
+
+  private formatTestDiagnostics(
+    command: string,
+    cwd: string,
+    timeoutMs: number,
+    attempt: number,
+    maxAttempts: number,
+    cacheHit: boolean,
+  ): string {
+    return `Diagnostics: command="${command}", cwd="${cwd}", timeoutMs=${timeoutMs}, attempt=${attempt}/${maxAttempts}, cacheHit=${cacheHit}`;
+  }
+
+  private testFailureSuggestions(kind: TestFailureKind): string[] {
+    if (kind === 'no-tests') return ['Add unit tests for this change and re-run the quality gate'];
+    if (kind === 'infra-failure') return ['Resolve dependency/tooling errors (install deps, verify workspace setup) and rerun tests'];
+    if (kind === 'timeout') return ['Investigate long-running tests, reduce test scope, or optimize setup before retrying'];
+    if (kind === 'config-error') return ['Fix vitest configuration issues and rerun tests'];
+    return ['Fix all failing tests and rerun the quality gate'];
+  }
+
+  private isBaselineOnlyFailure(failedTests: string[], knownFailingTests: string[]): boolean {
+    if (!failedTests.length || !knownFailingTests.length) return false;
+    const baselineSet = new Set(knownFailingTests.map((n) => n.trim()).filter(Boolean));
+    if (baselineSet.size === 0) return false;
+    return failedTests.every((failed) => baselineSet.has(failed.trim()));
   }
 
   private async runBunVitest(workingDir: string, allowInstall = true): Promise<TestStageResult> {
@@ -785,7 +880,7 @@ export class QualityGateRunner {
       qgLog.info('[QualityGates] Installing dependencies (bun install)');
       await execAsync('bun install', {
         cwd: workingDir,
-        timeout: 300000,
+        timeout: 60000,
       });
       return true;
     } catch (err) {

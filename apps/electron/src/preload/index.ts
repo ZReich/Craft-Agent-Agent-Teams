@@ -18,6 +18,8 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.RESPOND_TO_PERMISSION, sessionId, requestId, allowed, alwaysAllow),
   respondToCredential: (sessionId: string, requestId: string, response: import('../shared/types').CredentialResponse) =>
     ipcRenderer.invoke(IPC_CHANNELS.RESPOND_TO_CREDENTIAL, sessionId, requestId, response),
+  reapStaleSessionProcesses: (options?: import('../shared/types').SessionProcessReapOptions) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SESSIONS_REAP_STALE_PROCESSES, options),
 
   // Consolidated session command handler
   sessionCommand: (sessionId: string, command: import('../shared/types').SessionCommand) =>
@@ -567,6 +569,16 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_PROVIDER_KEY, provider),
   setAgentTeamsProviderKey: (provider: 'moonshot' | 'openrouter', key: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SET_PROVIDER_KEY, provider, key),
+
+  // YOLO (Autonomous Execution)
+  startYolo: (teamId: string, objective: string, config?: Partial<import('@craft-agent/core/types').YoloConfig>) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_START, teamId, objective, config),
+  pauseYolo: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_PAUSE, teamId),
+  abortYolo: (teamId: string, reason?: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_ABORT, teamId, reason),
+  getYoloState: (teamId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_GET_STATE, teamId),
 
   // SDD
   getSDDState: (sessionId: string) =>

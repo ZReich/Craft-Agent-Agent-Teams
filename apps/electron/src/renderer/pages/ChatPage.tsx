@@ -464,11 +464,21 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       if (!isActive) return
       if (event.teamId && event.teamId !== session.teamId) return
       lastTeamRealtimeEventAtRef.current = Date.now()
+
+      if (event.type === 'team:updated') {
+        setTeamStatus(event.payload.team)
+      }
+      if (event.type === 'cost:updated') {
+        setTeamCost(event.payload.summary)
+      }
       if (event.type === 'activity:logged') {
         setTeamActivityEvents((prev) => [...prev, event.payload.activity].slice(-1500))
       }
       if (event.type.startsWith('task:')) {
         scheduleTeamDataReload()
+      }
+      if (event.type.startsWith('teammate:')) {
+        scheduleTeamDataReload(250)
       }
       if (event.type === 'message:sent' && session.teamId) {
         void window.electronAPI.getTeamMessages(session.teamId).then(setTeamMailboxMessages)

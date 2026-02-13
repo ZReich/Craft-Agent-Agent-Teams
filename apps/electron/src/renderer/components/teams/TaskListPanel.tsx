@@ -6,13 +6,12 @@
  */
 
 import * as React from 'react'
-import { useState, useCallback } from 'react'
-import { ChevronUp, ChevronDown, CheckCircle2, Circle, Loader2, AlertCircle, Ban, SearchCheck } from 'lucide-react'
+import { useMemo } from 'react'
+import { ChevronUp, ChevronDown, CheckCircle2, Circle, Loader2, AlertCircle, Ban, SearchCheck, Layers } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import type { TeamTask, TeamTaskStatus, AgentTeammate } from '../../../shared/types'
+import type { TeamTask, TeamTaskStatus, AgentTeammate, TeamPhase } from '../../../shared/types'
 
 export interface TaskListPanelProps {
   tasks: TeamTask[]
@@ -21,6 +20,8 @@ export interface TaskListPanelProps {
   onToggleCollapsed: () => void
   onAssignTask?: (taskId: string, teammateId: string) => void
   highlightedTaskIds?: string[]
+  /** Phase definitions for phase-aware grouping */
+  phases?: TeamPhase[]
 }
 
 const STATUS_CONFIG: Record<TeamTaskStatus, {

@@ -59,6 +59,15 @@ const EVENT_CONFIG: Record<TeamActivityType, {
   'checkpoint-created': { icon: ClipboardList, color: 'text-cyan-500' },
   'checkpoint-rollback': { icon: RefreshCw, color: 'text-orange-500' },
   'cost-warning': { icon: DollarSign, color: 'text-yellow-500' },
+  'yolo-started': { icon: ArrowUpCircle, color: 'text-blue-500' },
+  'yolo-phase-changed': { icon: RefreshCw, color: 'text-blue-500' },
+  'yolo-paused': { icon: AlertTriangle, color: 'text-yellow-500' },
+  'yolo-completed': { icon: CheckCircle2, color: 'text-green-500' },
+  'yolo-aborted': { icon: AlertCircle, color: 'text-destructive' },
+  'yolo-remediation-created': { icon: ClipboardList, color: 'text-amber-500' },
+  'yolo-spec-evolution-proposed': { icon: SearchCheck, color: 'text-purple-500' },
+  'phase-advanced': { icon: ArrowUpCircle, color: 'text-cyan-500' },
+  'phase-blocked': { icon: AlertTriangle, color: 'text-orange-500' },
   'error': { icon: AlertTriangle, color: 'text-destructive' },
 }
 
@@ -85,6 +94,15 @@ const TASK_TYPES = new Set<TeamActivityType>([
   'file-conflict',
   'checkpoint-created',
   'checkpoint-rollback',
+  'phase-advanced',
+  'phase-blocked',
+  'yolo-started',
+  'yolo-phase-changed',
+  'yolo-paused',
+  'yolo-completed',
+  'yolo-aborted',
+  'yolo-remediation-created',
+  'yolo-spec-evolution-proposed',
 ])
 const MESSAGE_TYPES = new Set<TeamActivityType>(['message-sent', 'plan-submitted', 'plan-approved', 'plan-rejected'])
 
@@ -178,7 +196,7 @@ export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
                       {event.teammateName && (
                         <span className="text-xs font-medium">{event.teammateName}</span>
                       )}
-                      <span className="text-xs text-muted-foreground flex-1 truncate">
+                      <span className="text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
                         {event.details}
                       </span>
                       <span className="text-[10px] text-muted-foreground/50 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">

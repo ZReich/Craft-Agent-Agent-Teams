@@ -138,6 +138,13 @@ import type {
   TaskType,
   TDDPhase,
   TaskQualityReport,
+  // YOLO & Phase types
+  YoloMode,
+  YoloPhase,
+  YoloConfig,
+  YoloState,
+  SpecEvolutionProposal,
+  TeamPhase,
 } from '@craft-agent/core/types';
 export type {
   AgentTeam,
@@ -174,6 +181,13 @@ export type {
   TeamActivityType,
   TeamCostSummary,
   TeamEvent,
+  // YOLO & Phase types
+  YoloMode,
+  YoloPhase,
+  YoloConfig,
+  YoloState,
+  SpecEvolutionProposal,
+  TeamPhase,
 };
 
 
@@ -648,6 +662,7 @@ export type SessionEvent =
     }
   // Agent teams events
   | { type: 'team_initialized'; sessionId: string; teamId: string; teammateName?: string }
+  | { type: 'yolo_state_changed'; sessionId: string; teamId: string; state: import('@craft-agent/core/types').YoloState }
 
 // Options for sendMessage
 export interface SendMessageOptions {
@@ -715,6 +730,43 @@ export interface SessionFamily {
 }
 
 /**
+ * Options for stale session process reaping.
+ * - dryRun=true reports candidates without terminating anything.
+ * - forceKill=true attempts to terminate stale candidates.
+ */
+export interface SessionProcessReapOptions {
+  dryRun?: boolean
+  forceKill?: boolean
+}
+
+/**
+ * Stale process candidate tied to a session runtime.
+ */
+export interface SessionProcessCandidate {
+  pid: number
+  processName: string
+  sessionId?: string
+  reason: 'missing_session' | 'duplicate_idle_session'
+  createdAt?: string
+  commandPreview: string
+}
+
+/**
+ * Result for stale session process diagnostics/reaping.
+ */
+export interface SessionProcessReapReport {
+  scannedAt: string
+  dryRun: boolean
+  forceKill: boolean
+  scannedProcessCount: number
+  candidateCount: number
+  terminatedCount: number
+  activeSessionIds: string[]
+  candidates: SessionProcessCandidate[]
+  errors: string[]
+}
+
+/**
  * Parameters for opening a new chat session
  */
 export interface NewChatActionParams {
@@ -736,6 +788,7 @@ export const IPC_CHANNELS = {
   CANCEL_PROCESSING: 'sessions:cancel',
   KILL_SHELL: 'sessions:killShell',
   GET_TASK_OUTPUT: 'tasks:getOutput',
+  SESSIONS_REAP_STALE_PROCESSES: 'sessions:reapStaleProcesses',
   RESPOND_TO_PERMISSION: 'sessions:respondToPermission',
   RESPOND_TO_CREDENTIAL: 'sessions:respondToCredential',
 
@@ -1021,6 +1074,12 @@ export const IPC_CHANNELS = {
   AGENT_TEAMS_GET_PROVIDER_KEY: 'agentTeams:getProviderKey',
   AGENT_TEAMS_SET_PROVIDER_KEY: 'agentTeams:setProviderKey',
 
+  // YOLO (Autonomous Execution)
+  AGENT_TEAMS_YOLO_START: 'agentTeams:yoloStart',
+  AGENT_TEAMS_YOLO_PAUSE: 'agentTeams:yoloPause',
+  AGENT_TEAMS_YOLO_ABORT: 'agentTeams:yoloAbort',
+  AGENT_TEAMS_YOLO_GET_STATE: 'agentTeams:yoloGetState',
+
   // Spec-Driven Development (SDD)
   SDD_GET_STATE: 'sdd:getState',
   SDD_SET_ENABLED: 'sdd:setEnabled',
@@ -1089,6 +1148,7 @@ export interface ElectronAPI {
   getTaskOutput(taskId: string): Promise<string | null>
   respondToPermission(sessionId: string, requestId: string, allowed: boolean, alwaysAllow: boolean): Promise<boolean>
   respondToCredential(sessionId: string, requestId: string, response: CredentialResponse): Promise<boolean>
+  reapStaleSessionProcesses(options?: SessionProcessReapOptions): Promise<SessionProcessReapReport>
 
   // Consolidated session command handler
   sessionCommand(sessionId: string, command: SessionCommand): Promise<void | ShareResult | RefreshTitleResult | SessionFamily | { count: number }>
@@ -1401,6 +1461,12 @@ export interface ElectronAPI {
   getAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter'): Promise<{ hasKey: boolean; maskedKey?: string }>
   setAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter', key: string): Promise<void>
 
+  // YOLO (Autonomous Execution)
+  startYolo(teamId: string, objective: string, config?: Partial<YoloConfig>): Promise<YoloState>
+  pauseYolo(teamId: string): Promise<void>
+  abortYolo(teamId: string, reason?: string): Promise<void>
+  getYoloState(teamId: string): Promise<YoloState | null>
+
   // SDD
   getSDDState(sessionId: string): Promise<{ sddEnabled: boolean; activeSpecId?: string; sddComplianceReports: SpecComplianceReport[] }>
   setSDDEnabled(sessionId: string, enabled: boolean): Promise<{ success: boolean }>
@@ -1492,12 +1558,27 @@ export interface WorkspaceSettings {
   qualityGatesMaxCycles?: number
   qualityGatesEnforceTDD?: boolean
   qualityGatesReviewModel?: string
+  qualityGatesBaselineAwareTests?: boolean
+  qualityGatesKnownFailingTests?: string[]
   qualityGatesSyntaxEnabled?: boolean
   qualityGatesTestsEnabled?: boolean
   qualityGatesArchEnabled?: boolean
   qualityGatesSimplicityEnabled?: boolean
   qualityGatesErrorsEnabled?: boolean
   qualityGatesCompletenessEnabled?: boolean
+  // YOLO (autonomous execution) settings
+  /** YOLO execution mode: 'smart', 'fixed', or 'off' */
+  yoloMode?: 'smart' | 'fixed' | 'off'
+  /** Maximum cost in USD before YOLO auto-pauses */
+  yoloCostCapUsd?: number
+  /** Maximum wall-clock minutes before YOLO auto-pauses */
+  yoloTimeoutMinutes?: number
+  /** Maximum concurrent teammates in YOLO mode */
+  yoloMaxConcurrency?: number
+  /** Auto-create remediation tasks from quality gate failures */
+  yoloAutoRemediate?: boolean
+  /** Maximum remediation rounds before aborting */
+  yoloMaxRemediationRounds?: number
   // Spec-driven development settings (stored in sdd workspace config)
   sddEnabled?: boolean
   sddRequireDRIAssignment?: boolean
