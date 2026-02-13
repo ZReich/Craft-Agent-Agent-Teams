@@ -48,7 +48,7 @@ export function CostDashboard({ cost, teammates, className }: CostDashboardProps
   return (
     <div className={cn('flex flex-col h-full', className)}>
       {/* Summary header */}
-      <div className="px-4 py-3 border-b border-border space-y-3">
+      <div className="px-4 py-4 border-b border-border space-y-4">
         {/* Total cost */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -60,7 +60,7 @@ export function CostDashboard({ cost, teammates, className }: CostDashboardProps
 
         {/* Savings vs all-Opus */}
         {cost.allOpusEstimateUsd && savingsPercent > 0 && (
-          <div className="flex items-center gap-2 text-xs text-green-600">
+          <div className="flex items-center gap-2 text-xs text-success-text">
             <TrendingDown className="size-3" />
             <span>
               Saving {savingsPercent}% vs all-Opus (${cost.allOpusEstimateUsd.toFixed(2)})
@@ -76,8 +76,9 @@ export function CostDashboard({ cost, teammates, className }: CostDashboardProps
                 Budget: ${cost.costCapUsd.toFixed(2)}
               </span>
               <span className={cn(
+                'font-medium',
                 capPercent >= 90 ? 'text-destructive' :
-                capPercent >= 75 ? 'text-yellow-500' : 'text-muted-foreground'
+                capPercent >= 75 ? 'text-info' : 'text-muted-foreground'
               )}>
                 {capPercent}%
               </span>
@@ -87,7 +88,7 @@ export function CostDashboard({ cost, teammates, className }: CostDashboardProps
                 className={cn(
                   'h-full rounded-full transition-all',
                   capPercent >= 90 ? 'bg-destructive' :
-                  capPercent >= 75 ? 'bg-yellow-500' : 'bg-green-500'
+                  capPercent >= 75 ? 'bg-info' : 'bg-success'
                 )}
                 style={{ width: `${capPercent}%` }}
               />
@@ -103,13 +104,13 @@ export function CostDashboard({ cost, teammates, className }: CostDashboardProps
       </div>
 
       <ScrollArea className="flex-1 min-h-0">
-        <div className="p-4 space-y-5">
+        <div className="p-4 space-y-6">
           {/* Per-teammate breakdown */}
-          <div className="space-y-2">
-            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+          <div className="space-y-3">
+            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
               By Teammate
             </h4>
-            <div className="space-y-1.5">
+            <div className="space-y-2">
               {teammates.map((tm) => {
                 const usage = cost.perTeammate[tm.id]
                 if (!usage) return null
@@ -134,11 +135,11 @@ export function CostDashboard({ cost, teammates, className }: CostDashboardProps
           </div>
 
           {/* Per-model breakdown */}
-          <div className="space-y-2">
-            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+          <div className="space-y-3">
+            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
               By Model
             </h4>
-            <div className="space-y-1.5">
+            <div className="space-y-2">
               {Object.entries(cost.perModel).map(([modelId, usage]) => (
                 <div key={modelId} className="flex items-center justify-between py-1">
                   <span className="text-sm">{MODEL_NAMES[modelId] || modelId}</span>

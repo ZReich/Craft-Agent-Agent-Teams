@@ -1090,7 +1090,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Debug logging from renderer → main log file (fire-and-forget, no response)
   ipcMain.on(IPC_CHANNELS.DEBUG_LOG, (_event, ...args: unknown[]) => {
-    ipcLog.info('[renderer]', ...args)
+    // Keep renderer debug logs opt-in to avoid high-volume file I/O in hot UI paths.
+    if (process.env.CRAFT_RENDERER_DEBUG !== '1') return
+    ipcLog.debug('[renderer]', ...args)
   })
 
   // Filesystem search for @ mention file selection.
@@ -1098,8 +1100,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // avoiding reading node_modules/etc. contents entirely. Uses withFileTypes
   // to get entry types without separate stat calls.
   ipcMain.handle(IPC_CHANNELS.FS_SEARCH, async (_event, basePath: string, query: string) => {
-    ipcLog.info('[FS_SEARCH] called:', basePath, query)
+    const startedAt = Date.now()
     const MAX_RESULTS = 50
+    const MAX_SCAN_DIRS = 400
+    const MAX_SCAN_ENTRIES = 25_000
+    const MAX_DEPTH = 6
 
     // Directories to never recurse into
     const SKIP_DIRS = new Set([
@@ -1112,30 +1117,36 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const results: Array<{ name: string; path: string; type: 'file' | 'directory'; relativePath: string }> = []
 
     try {
-      // BFS queue: each entry is a relative path prefix ('' for root)
-      let queue = ['']
+      // BFS queue: each entry is a relative path prefix + depth
+      let queue: Array<{ relDir: string; depth: number }> = [{ relDir: '', depth: 0 }]
+      let scannedDirs = 0
+      let scannedEntries = 0
 
       while (queue.length > 0 && results.length < MAX_RESULTS) {
         // Process current level: read all directories in parallel
-        const nextQueue: string[] = []
+        const nextQueue: Array<{ relDir: string; depth: number }> = []
 
         const dirResults = await Promise.all(
-          queue.map(async (relDir) => {
+          queue.map(async ({ relDir, depth }) => {
             const absDir = relDir ? join(basePath, relDir) : basePath
             try {
-              return { relDir, entries: await readdir(absDir, { withFileTypes: true }) }
+              return { relDir, depth, entries: await readdir(absDir, { withFileTypes: true }) }
             } catch {
               // Skip dirs we can't read (permissions, broken symlinks, etc.)
-              return { relDir, entries: [] as import('fs').Dirent[] }
+              return { relDir, depth, entries: [] as import('fs').Dirent[] }
             }
           })
         )
 
-        for (const { relDir, entries } of dirResults) {
+        for (const { relDir, depth, entries } of dirResults) {
           if (results.length >= MAX_RESULTS) break
+          if (scannedDirs >= MAX_SCAN_DIRS || scannedEntries >= MAX_SCAN_ENTRIES) break
 
+          scannedDirs += 1
           for (const entry of entries) {
             if (results.length >= MAX_RESULTS) break
+            if (scannedEntries >= MAX_SCAN_ENTRIES) break
+            scannedEntries += 1
 
             const name = entry.name
             // Skip hidden files/dirs and ignored directories
@@ -1145,8 +1156,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
             const isDir = entry.isDirectory()
 
             // Queue subdirectories for next BFS level
-            if (isDir) {
-              nextQueue.push(relativePath)
+            if (isDir && depth < MAX_DEPTH) {
+              nextQueue.push({ relDir: relativePath, depth: depth + 1 })
             }
 
             // Check if name or path matches the query
@@ -1172,7 +1183,14 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         return a.name.length - b.name.length
       })
 
-      ipcLog.info('[FS_SEARCH] returning', results.length, 'results')
+      ipcLog.debug(
+        '[FS_SEARCH] returning',
+        results.length,
+        'results',
+        `scannedDirs=${scannedDirs}`,
+        `scannedEntries=${scannedEntries}`,
+        `durationMs=${Date.now() - startedAt}`
+      )
       return results
     } catch (err) {
       ipcLog.error('[FS_SEARCH] error:', err)
@@ -3709,7 +3727,17 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     void (async () => {
       const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
       const activityListener = (event: import('@craft-agent/core/types').TeamActivityEvent) => {
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, event)
+        if (!event.teamId) {
+          ipcLog.warn('[agent teams] Skipping activity event without teamId', event)
+          return
+        }
+        const envelope: import('@craft-agent/core/types').ActivityLoggedEvent = {
+          type: 'activity:logged',
+          teamId: event.teamId,
+          payload: { activity: event },
+          timestamp: event.timestamp,
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
       }
       teamManager.on('activity', activityListener)
     })()
@@ -3803,18 +3831,34 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     return teamManager.getTeamSpec(teamManager.resolveTeamId(teamId))
   })
 
-  // Spawn a new teammate
+  // Spawn a new teammate via SessionManager (creates a full managed session with proper model routing)
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SPAWN_TEAMMATE, async (_event, options: {
     teamId: string;
     name: string;
     role: string;
-    model: string;
-    provider: string;
+    model?: string;
+    provider?: string;
+    parentSessionId?: string;
+    workspaceId?: string;
   }) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
-    const teammate = teamManager.spawnTeammate(options)
-    ipcLog.info(`Teammate spawned: ${teammate.id} (${teammate.name}, ${teammate.model})`)
-    return teammate
+    // Find the lead session for this team
+    const leadSession = sessionManager.findLeadSessionForTeam(options.teamId)
+    if (!leadSession) {
+      throw new Error(`No lead session found for team "${options.teamId}". Ensure a team session is active.`)
+    }
+
+    const teammateSession = await sessionManager.createTeammateSession({
+      parentSessionId: options.parentSessionId ?? leadSession.id,
+      workspaceId: options.workspaceId ?? leadSession.workspaceId,
+      teamId: options.teamId,
+      teammateName: options.name,
+      prompt: '',
+      model: options.model,
+      role: (options.role as import('@craft-agent/core/types').TeamRole) ?? 'worker',
+    })
+
+    ipcLog.info(`Teammate spawned via SessionManager: ${teammateSession.id} (${options.name}, role: ${options.role})`)
+    return teammateSession
   })
 
   // Shut down a teammate

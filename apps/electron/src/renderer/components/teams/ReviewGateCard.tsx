@@ -43,14 +43,7 @@ export function ReviewGateCard({
   const [feedbackMode, setFeedbackMode] = useState(false)
   const [feedback, setFeedback] = useState('')
 
-  // If policy is 'trust', auto-approve
-  if (policy === 'trust') {
-    React.useEffect(() => {
-      onReview({ approved: true })
-    }, [onReview])
-    return null
-  }
-
+  // Hooks must be called unconditionally
   const handleApprove = useCallback(() => {
     onReview({ approved: true })
   }, [onReview])
@@ -66,6 +59,18 @@ export function ReviewGateCard({
   const handleEscalate = useCallback(() => {
     onReview({ approved: false, escalate: true, feedback: feedback.trim() || 'Escalating to higher-tier model' })
   }, [feedback, onReview])
+
+  // Auto-approve for 'trust' policy - must come after all hooks
+  React.useEffect(() => {
+    if (policy === 'trust') {
+      onReview({ approved: true })
+    }
+  }, [policy, onReview])
+
+  // If policy is 'trust', don't render the UI
+  if (policy === 'trust') {
+    return null
+  }
 
   return (
     <div

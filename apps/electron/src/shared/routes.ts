@@ -161,6 +161,18 @@ export const routes = {
       subpage
         ? `settings/${subpage}` as const
         : 'settings' as const,
+
+    /** Focus view (full-screen focus mode for a session) */
+    focus: (sessionId: string, params?: { contextPane?: boolean; timeline?: boolean }) => {
+      const base = `focus/session/${sessionId}` as const
+      if (params && (params.contextPane !== undefined || params.timeline !== undefined)) {
+        const queryParams: Record<string, string> = {}
+        if (params.contextPane !== undefined) queryParams.contextPane = String(params.contextPane)
+        if (params.timeline !== undefined) queryParams.timeline = String(params.timeline)
+        return `${base}${toQueryString(queryParams)}` as const
+      }
+      return base
+    },
   },
 } as const
 

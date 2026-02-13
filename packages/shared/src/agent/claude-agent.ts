@@ -128,6 +128,7 @@ export interface ClaudeAgentConfig {
     teammateName: string;
     prompt: string;
     model?: string;
+    role?: string;
   }) => Promise<{ sessionId: string; agentId: string }>;
   /** Callback to send a message to a teammate session (agent teams) */
   onTeammateMessage?: (params: {
@@ -587,6 +588,13 @@ export class ClaudeAgent extends BaseAgent {
   }
 
   /**
+   * Returns true when the agent is currently coordinating an active team.
+   */
+  public hasActiveTeam(): boolean {
+    return this.activeTeamName !== null && this.activeTeammateCount > 0;
+  }
+
+  /**
    * Check if a tool requires permission and handle it
    * Returns true if allowed, false if denied
    */
@@ -929,6 +937,7 @@ export class ClaudeAgent extends BaseAgent {
                   const teammateName = (toolInput.name as string) || `teammate-${Date.now()}`;
                   const prompt = (toolInput.prompt as string) || '';
                   const model = toolInput.model as string | undefined;
+                  const role = toolInput.role as string | undefined;
 
                   // CRITICAL: Set activeTeamName/Count NOW (before returning synthetic result)
                   // This ensures the keep-alive check at completion time sees an active team.
@@ -945,6 +954,7 @@ export class ClaudeAgent extends BaseAgent {
                       teammateName,
                       prompt,
                       model,
+                      role,
                     });
 
                     this.onDebug?.(`[AgentTeams] Teammate ${teammateName} spawned as session ${result.sessionId}`);
@@ -1617,7 +1627,7 @@ export class ClaudeAgent extends BaseAgent {
               }
             }
 
-            if (event.type === 'complete') {
+            if (event.type === 'complete' || (event.type === 'usage_update' && event.teamKeepAlive)) {
               receivedComplete = true;
             }
             yield event;
@@ -2245,6 +2255,20 @@ export class ClaudeAgent extends BaseAgent {
         canRetry: true,
         retryDelayMs: 2000,
       },
+      'max_output_tokens': {
+        code: 'invalid_request',
+        title: 'Output Limit Reached',
+        message: 'The response exceeded the maximum output token limit.',
+        details: [
+          'The model generated more output than allowed',
+          'Try breaking your request into smaller parts',
+        ],
+        actions: [
+          { key: 'r', label: 'Retry', action: 'retry' },
+        ],
+        canRetry: true,
+        retryDelayMs: 1000,
+      },
       'unknown': {
         code: 'unknown_error',
         title: 'Unknown Error',
@@ -2375,9 +2399,15 @@ export class ClaudeAgent extends BaseAgent {
             // If the Task tool has a team_name parameter, this is part of an agent team
             const taskInput = event.input as Record<string, unknown>;
             if (taskInput.team_name && typeof taskInput.team_name === 'string') {
-              // Track this as an active team - prevents premature session completion
+              // Track the team name for keep-alive logic
               this.activeTeamName = taskInput.team_name;
-              this.activeTeammateCount++;
+
+              // Only increment count here when onTeammateSpawnRequested is NOT set.
+              // When the callback IS set, the interception at tool execution time (line ~945)
+              // handles the count to avoid double-incrementing.
+              if (!this.onTeammateSpawnRequested) {
+                this.activeTeammateCount++;
+              }
 
               // Emit team initialization event so UI can show TeamDashboard
               events.push({
@@ -2609,25 +2639,26 @@ export class ClaudeAgent extends BaseAgent {
           contextWindow: primaryModelUsage?.contextWindow,
         };
 
-        if (message.subtype === 'success') {
-          // AGENT TEAMS: Don't complete the session if we're managing an active team
-          // The lead agent needs to stay alive to coordinate teammates and synthesize results
-          if (this.activeTeamName && this.activeTeammateCount > 0) {
-            // Team is active - send usage update but keep session running
-            // The lead will continue processing and eventually send a message to synthesize results
-            this.onDebug?.(`[AgentTeams] Team "${this.activeTeamName}" active with ${this.activeTeammateCount} teammates - keeping session alive`);
-            events.push({
-              type: 'usage_update',
-              usage: {
-                inputTokens: usage.inputTokens,
-                contextWindow: usage.contextWindow,
-              },
-            });
+          if (message.subtype === 'success') {
+            // AGENT TEAMS: Don't complete the session if we're managing an active team
+            // The lead agent needs to stay alive to coordinate teammates and synthesize results
+            if (this.activeTeamName && this.activeTeammateCount > 0) {
+              // Team is active - send usage update but keep session running
+              // The lead will continue processing and eventually send a message to synthesize results
+              this.onDebug?.(`[AgentTeams] Team "${this.activeTeamName}" active with ${this.activeTeammateCount} teammates - keeping session alive`);
+              events.push({
+                type: 'usage_update',
+                usage: {
+                  inputTokens: usage.inputTokens,
+                  contextWindow: usage.contextWindow,
+                },
+                teamKeepAlive: true,
+              });
+            } else {
+              // Normal completion - no active team
+              events.push({ type: 'complete', usage });
+            }
           } else {
-            // Normal completion - no active team
-            events.push({ type: 'complete', usage });
-          }
-        } else {
           // Error result - emit error then complete with whatever usage we have
           const errorMsg = 'errors' in message ? message.errors.join(', ') : 'Query failed';
 

@@ -6,8 +6,8 @@ export default mergeConfig(
   baseConfig,
   defineConfig({
     test: {
-      environment: 'node',
-      include: ['src/**/*.{test,spec}.ts'],
+      environment: 'jsdom',
+      include: ['src/**/*.{test,spec}.{ts,tsx}'],
       passWithNoTests: false,
     },
   }),

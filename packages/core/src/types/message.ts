@@ -405,7 +405,7 @@ export type AgentEvent =
   | { type: 'task_progress'; toolUseId: string; elapsedSeconds: number; turnId?: string }
   | { type: 'shell_killed'; shellId: string; turnId?: string }
   | { type: 'source_activated'; sourceSlug: string; originalMessage: string }
-  | { type: 'usage_update'; usage: (Pick<AgentEventUsage, 'inputTokens'> & Partial<Omit<AgentEventUsage, 'inputTokens'>>) }
+  | { type: 'usage_update'; usage: (Pick<AgentEventUsage, 'inputTokens'> & Partial<Omit<AgentEventUsage, 'inputTokens'>>); teamKeepAlive?: boolean }
   | { type: 'todos_updated'; todos: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed'; activeForm?: string }>; turnId?: string; explanation?: string | null }
   | { type: 'team_initialized'; teamName: string; teammateName?: string; teamToolUseId: string; turnId?: string };
 

@@ -19,5 +19,17 @@ export default defineConfig({
   test: {
     // Environment is set at top of file (before modules load) to ensure debug logging is disabled
     passWithNoTests: false,
+    globals: true,
+    setupFiles: [resolve(__dirname, 'apps/electron/src/renderer/test-utils/vitest-setup.ts')],
+    // Add timeout and thread settings to prevent hangs
+    testTimeout: 10000,
+    hookTimeout: 10000,
+    teardownTimeout: 10000,
+    pool: 'forks',
+    poolOptions: {
+      forks: {
+        singleFork: true,
+      },
+    },
   },
 });

@@ -89,12 +89,23 @@ export function shouldPass(
   result: QualityGateResult,
   config: QualityGateConfig,
 ): boolean {
-  // Check binary gates first (syntax, tests must be perfect)
+  // All enabled stages that were actually executed must pass.
+  // Stages that weren't run (e.g., SDD stages when no spec is active) are skipped.
+  for (const [name, stageConfig] of Object.entries(config.stages) as [QualityGateStageName, QualityGateStageConfig][]) {
+    if (!stageConfig.enabled) continue;
+
+    const stageResult = result.stages[name];
+    if (!stageResult) continue; // Stage wasn't executed — skip
+    if (!stageResult.passed) return false;
+  }
+
+  // Check binary gates (syntax, tests must be perfect)
   for (const [name, stageConfig] of Object.entries(config.stages) as [QualityGateStageName, QualityGateStageConfig][]) {
     if (!stageConfig.enabled || !stageConfig.binary) continue;
 
     const stageResult = result.stages[name];
-    if (!stageResult || !stageResult.passed) return false;
+    if (!stageResult) continue; // Stage wasn't executed — skip
+    if (!stageResult.passed) return false;
   }
 
   // Check aggregate score threshold
@@ -195,7 +206,7 @@ export function formatSuccessReport(result: QualityGateResult): string {
   lines.push('|-------|-------|--------|');
 
   for (const [name, stageResult] of Object.entries(result.stages) as [QualityGateStageName, QualityGateStageResult][]) {
-    const status = stageResult.passed ? 'PASS' : 'WARN';
+    const status = stageResult.passed ? 'PASS' : 'FAIL';
     lines.push(`| ${stageName(name)} | ${stageResult.score}/100 | ${status} |`);
   }
 
@@ -266,7 +277,7 @@ export function mergeQualityGateConfig(
 
   // If a review model was set without an explicit provider, infer it
   if (!userConfig.reviewProvider && merged.reviewModel) {
-    merged.reviewProvider = resolveReviewProvider(merged.reviewModel, merged.reviewProvider);
+    merged.reviewProvider = resolveReviewProvider(merged.reviewModel);
   }
 
   return merged;

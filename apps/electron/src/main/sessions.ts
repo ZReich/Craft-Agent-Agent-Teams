@@ -598,7 +598,7 @@ async function refreshOAuthTokensIfNeeded(
   if (refreshed.length > 0) {
     // Rebuild server configs with fresh tokens
     sessionLog.debug(`[OAuth] Rebuilding servers after ${refreshed.length} token refresh(es)`)
-    const enabledSources = sources.filter(s => s.config.enabled && s.config.isAuthenticated)
+    const enabledSources = sources.filter(s => isSourceUsable(s))
     const { mcpServers, apiServers } = await buildServersFromSources(
       enabledSources,
       sessionPath,
@@ -1096,6 +1096,10 @@ interface ManagedSession {
   authRetryAttempted?: boolean
   // Flag indicating auth retry is in progress (to prevent complete handler from interfering)
   authRetryInProgress?: boolean
+  // Flag to prevent infinite retry loops when Codex app-server disconnects mid-turn
+  connectionRetryAttempted?: boolean
+  // Flag indicating reconnect retry is in progress (to prevent premature completion cleanup)
+  connectionRetryInProgress?: boolean
   // Whether this session is hidden from session list (e.g., mini edit sessions)
   hidden?: boolean
   // Sub-session hierarchy (1 level max)
@@ -2173,9 +2177,94 @@ export class SessionManager {
         }
       }
 
+      // Repair agent-team links on startup in case a prior crash interrupted
+      // metadata persistence (e.g., missing teammateSessionIds on lead sessions).
+      this.repairTeamSessionLinks()
+
       sessionLog.info(`Loaded ${totalSessions} sessions from disk (metadata only)`)
     } catch (error) {
       sessionLog.error('Failed to load sessions from disk:', error)
+    }
+  }
+
+  /**
+   * Best-effort repair for team metadata consistency after loading sessions.
+   * This keeps team grouping stable in the sidebar after crashes/restarts.
+   */
+  private repairTeamSessionLinks(): void {
+    let repairedLeads = 0
+    let repairedTeammates = 0
+
+    const leadsByTeamId = new Map<string, ManagedSession>()
+    for (const session of this.sessions.values()) {
+      if (session.isTeamLead && session.teamId) {
+        leadsByTeamId.set(session.teamId, session)
+      }
+    }
+
+    // Fill missing parent/team metadata on teammate sessions when we can infer it
+    for (const teammate of this.sessions.values()) {
+      if (teammate.isTeamLead) continue
+
+      if (!teammate.parentSessionId && teammate.teamId) {
+        const inferredLead = leadsByTeamId.get(teammate.teamId)
+        if (inferredLead && inferredLead.id !== teammate.id) {
+          teammate.parentSessionId = inferredLead.id
+          teammate.teamColor = teammate.teamColor ?? inferredLead.teamColor
+          repairedTeammates++
+          this.persistSession(teammate)
+        }
+      }
+    }
+
+    // Rebuild lead -> teammate mapping from child parentSessionId references
+    const teammateIdsByLead = new Map<string, string[]>()
+    for (const teammate of this.sessions.values()) {
+      if (!teammate.parentSessionId) continue
+      const arr = teammateIdsByLead.get(teammate.parentSessionId) ?? []
+      arr.push(teammate.id)
+      teammateIdsByLead.set(teammate.parentSessionId, arr)
+    }
+
+    for (const lead of this.sessions.values()) {
+      const rebuilt = teammateIdsByLead.get(lead.id) ?? []
+      if (rebuilt.length === 0) continue
+
+      const existing = lead.teammateSessionIds ?? []
+      const isSameLength = existing.length === rebuilt.length
+      const hasSameMembers = isSameLength && rebuilt.every(id => existing.includes(id))
+
+      const shouldRepair = !lead.isTeamLead || !hasSameMembers
+      if (shouldRepair) {
+        lead.isTeamLead = true
+        lead.teammateSessionIds = rebuilt
+        repairedLeads++
+        this.persistSession(lead)
+      }
+
+      // Also propagate lead team metadata down to teammates when missing
+      for (const teammateId of rebuilt) {
+        const teammate = this.sessions.get(teammateId)
+        if (!teammate) continue
+
+        let teammateChanged = false
+        if (!teammate.teamId && lead.teamId) {
+          teammate.teamId = lead.teamId
+          teammateChanged = true
+        }
+        if (!teammate.teamColor && lead.teamColor) {
+          teammate.teamColor = lead.teamColor
+          teammateChanged = true
+        }
+        if (teammateChanged) {
+          repairedTeammates++
+          this.persistSession(teammate)
+        }
+      }
+    }
+
+    if (repairedLeads > 0 || repairedTeammates > 0) {
+      sessionLog.warn(`[AgentTeams] Repaired team links after startup (leads=${repairedLeads}, teammates=${repairedTeammates})`)
     }
   }
 
@@ -2935,6 +3024,19 @@ export class SessionManager {
   }
 
   /**
+   * Find the lead session for a given team ID.
+   * Returns the session with isTeamLead=true and matching teamId, or null if not found.
+   */
+  findLeadSessionForTeam(teamId: string): { id: string; workspaceId: string } | null {
+    for (const [, session] of this.sessions) {
+      if (session.isTeamLead && session.teamId === teamId) {
+        return { id: session.id, workspaceId: session.workspace.id }
+      }
+    }
+    return null
+  }
+
+  /**
    * Create a separate session for an agent team teammate.
    * The teammate gets its own CraftAgent, SDK subprocess, and context window.
    */
@@ -2995,14 +3097,21 @@ export class SessionManager {
 
     // Implements REQ-001: honor workspace role model defaults for teammates
     const teammateModel = configuredModel ?? normalizedRequestedModel ?? parent.model ?? workspaceConfig?.defaults?.model ?? DEFAULT_MODEL
+
+    if (!teammateModel) {
+      throw new Error(
+        `No model configured for teammate. Parent session "${parent.id}" has no model set.`
+      )
+    }
+
     // Implements REQ-004: choose a provider/connection compatible with the resolved model
-    const teammateConnection = resolveConnectionForModel({
+    const teammateConnectionSlug = resolveConnectionForModel({
       model: teammateModel,
       parentConnectionSlug: params.llmConnection ?? parent.llmConnection,
       workspaceDefaultSlug: workspaceConfig?.defaults?.defaultLlmConnection,
     })
 
-    if (!teammateConnection) {
+    if (!teammateConnectionSlug) {
       // Implements REQ-004: fail fast when no compatible connection is configured
       throw new Error(
         `No LLM connection configured for model "${teammateModel}". ` +
@@ -3010,6 +3119,7 @@ export class SessionManager {
       )
     }
 
+    const teammateConnection = teammateConnectionSlug
     const resolvedConnection = getLlmConnection(teammateConnection)
     if (!resolvedConnection || !connectionSupportsModel(resolvedConnection, teammateModel)) {
       throw new Error(
@@ -3462,8 +3572,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              llmConnection: managed.llmConnection,
-              role: 'worker',
+              role: params.role ?? 'worker',
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -3814,8 +3923,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              llmConnection: managed.llmConnection,
-              role: 'worker',
+              role: params.role ?? 'worker',
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -4245,6 +4353,34 @@ export class SessionManager {
       // Notify all windows for this workspace
       this.sendEvent({ type: 'todo_state_changed', sessionId, todoState }, managed.workspace.id)
     }
+  }
+
+  /**
+   * For completed teammate sessions: mark done + archive so they no longer
+   * clutter the sidebar and no longer participate in active-session UX flows.
+   */
+  private async autoArchiveCompletedTeammateSession(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed || !managed.parentSessionId || !managed.teammateName) return
+
+    let changed = false
+    if (managed.todoState !== 'done') {
+      managed.todoState = 'done'
+      changed = true
+    }
+    if (!managed.isArchived) {
+      managed.isArchived = true
+      managed.archivedAt = Date.now()
+      changed = true
+    }
+    if (!changed) return
+
+    this.persistSession(managed)
+    await this.flushSession(managed.id)
+
+    // Notify renderer state changes (same shape as existing session actions).
+    this.sendEvent({ type: 'todo_state_changed', sessionId: managed.id, todoState: managed.todoState ?? 'done' }, managed.workspace.id)
+    this.sendEvent({ type: 'session_archived', sessionId: managed.id }, managed.workspace.id)
   }
 
   /**
@@ -5121,7 +5257,28 @@ export class SessionManager {
         sessionLog.info(`Refreshed title for session ${sessionId}: "${title}"`)
         return { success: true, title }
       }
-      // Failed to generate - clear regenerating state
+      // AI title generation failed — fall back to extractive title from user messages
+      sessionLog.info(`refreshTitle: AI title generation returned null, using extractive fallback`)
+      const lastUserMsg = userMessages[userMessages.length - 1] || ''
+      const cleanMsg = lastUserMsg.replace(/[\n\r]+/g, ' ').replace(/\s+/g, ' ').trim()
+      if (cleanMsg) {
+        let fallbackTitle: string
+        const sentenceEnd = cleanMsg.search(/[.!?]\s/)
+        if (sentenceEnd > 0 && sentenceEnd <= 60) {
+          fallbackTitle = cleanMsg.slice(0, sentenceEnd + 1)
+        } else if (cleanMsg.length <= 60) {
+          fallbackTitle = cleanMsg
+        } else {
+          const truncated = cleanMsg.slice(0, 57).replace(/\s+\S*$/, '').trim()
+          fallbackTitle = truncated.length > 0 ? truncated + '...' : cleanMsg.slice(0, 57) + '...'
+        }
+        managed.name = fallbackTitle
+        this.persistSession(managed)
+        this.sendEvent({ type: 'title_generated', sessionId, title: fallbackTitle }, managed.workspace.id)
+        sessionLog.info(`Refreshed title for session ${sessionId} (fallback): "${fallbackTitle}"`)
+        return { success: true, title: fallbackTitle }
+      }
+      // No usable content — clear regenerating state
       this.sendEvent({ type: 'title_regenerating', sessionId, isRegenerating: false }, managed.workspace.id)
       return { success: false, error: 'Failed to generate title' }
     } catch (error) {
@@ -5305,7 +5462,7 @@ export class SessionManager {
     sessionLog.info(`Deleted session ${sessionId}`)
   }
 
-  async sendMessage(sessionId: string, message: string, attachments?: FileAttachment[], storedAttachments?: StoredAttachment[], options?: SendMessageOptions, existingMessageId?: string, _isAuthRetry?: boolean): Promise<void> {
+  async sendMessage(sessionId: string, message: string, attachments?: FileAttachment[], storedAttachments?: StoredAttachment[], options?: SendMessageOptions, existingMessageId?: string, _isAuthRetry?: boolean, _isReconnectRetry?: boolean): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed) {
       throw new Error(`Session ${sessionId} not found`)
@@ -5315,7 +5472,7 @@ export class SessionManager {
     // The renderer sometimes sends the same message twice (~100-200ms apart),
     // which interrupts Codex sessions before they can initialize.
     // Skip dedup for queue-drain calls (existingMessageId) and auth retries.
-    if (!existingMessageId && !_isAuthRetry) {
+    if (!existingMessageId && !_isAuthRetry && !_isReconnectRetry) {
       const now = Date.now()
       const lastDedup = managed.lastSendDedup
       if (lastDedup && lastDedup.content === message && (now - lastDedup.timestamp) < 500) {
@@ -5478,8 +5635,9 @@ export class SessionManager {
     // IMPORTANT: Skip reset if this is an auth retry call - the flag is already true
     // and resetting it would allow infinite retry loops
     // Note: authRetryInProgress is NOT reset here - it's managed by the retry logic
-    if (!_isAuthRetry) {
+    if (!_isAuthRetry && !_isReconnectRetry) {
       managed.authRetryAttempted = false
+      managed.connectionRetryAttempted = false
     }
 
     // Store message/attachments for potential retry after auth refresh
@@ -5624,7 +5782,7 @@ export class SessionManager {
         if (event.type === 'complete') {
           // Skip normal completion handling if auth retry is in progress
           // The retry will handle its own completion
-          if (managed.authRetryInProgress) {
+          if (managed.authRetryInProgress || managed.connectionRetryInProgress) {
             sessionLog.info('Chat completed but auth retry is in progress, skipping normal completion handling')
             sendSpan.mark('chat.complete.auth_retry_pending')
             sendSpan.end()
@@ -5713,6 +5871,10 @@ export class SessionManager {
       // Normal completion returns early after calling onProcessingStopped
       // Errors are handled in catch block
       if (managed.isProcessing && managed.processingGeneration === myGeneration) {
+        if (managed.connectionRetryInProgress) {
+          sessionLog.info('Skipping unexpected-exit cleanup because reconnect retry is in progress')
+          return
+        }
         sessionLog.info('Finally block cleanup - unexpected exit')
         sendSpan.mark('chat.unexpected_exit')
         sendSpan.end()
@@ -6008,16 +6170,21 @@ export class SessionManager {
     //    while it's still alive and listening.
     if (reason === 'complete' && managed.parentSessionId && managed.teammateName) {
       const lead = this.sessions.get(managed.parentSessionId)
-      if (lead && lead.isTeamLead) {
-        const lastAssistantMsg = [...managed.messages].reverse().find(m =>
-          m.role === 'assistant' && !m.isIntermediate
-        )
-        const resultContent = lastAssistantMsg?.content || '(No output produced)'
-        const teammateName = managed.teammateName
+        if (lead && lead.isTeamLead) {
+          const lastAssistantMsg = [...managed.messages].reverse().find(m =>
+            m.role === 'assistant' && !m.isIntermediate
+          )
+          const resultContent = lastAssistantMsg?.content || '(No output produced)'
+          const teammateName = managed.teammateName
 
-        // Load quality gate config from workspace
-        const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
-        const qgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
+          // Load quality gate config from workspace
+          const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+          const qgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
+          const clearLeadTeamState = (): void => {
+            if (lead.agent instanceof CraftAgent) {
+              lead.agent.clearTeamState()
+            }
+          }
 
         // Run quality gate pipeline if enabled
         if (qgConfig.enabled) {
@@ -6052,6 +6219,7 @@ export class SessionManager {
                 try {
                   const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}\n\n---\n\n${successReport}`
                   await this.sendMessage(managed.parentSessionId!, relayMessage)
+                  await this.autoArchiveCompletedTeammateSession(sessionId)
 
                   // Check if ALL teammates are now done
                   const allDone = (lead.teammateSessionIds || []).every(tid => {
@@ -6060,6 +6228,7 @@ export class SessionManager {
                   })
                   if (allDone) {
                     sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
+                    clearLeadTeamState()
                     setTimeout(async () => {
                       try {
                         await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
@@ -6093,6 +6262,7 @@ export class SessionManager {
                 try {
                   const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (QUALITY GATE: ESCALATED after ${currentCycle} cycles):\n\n${resultContent}\n\n---\n\n${failureReport}\n\n**Escalation Diagnosis:**\n${escalationNote}`
                   await this.sendMessage(managed.parentSessionId!, relayMessage)
+                  await this.autoArchiveCompletedTeammateSession(sessionId)
                 } catch (err) {
                   sessionLog.error(`[AgentTeams] Failed to relay escalated results from ${teammateName}:`, err)
                 }
@@ -6123,6 +6293,7 @@ export class SessionManager {
               try {
                 const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (quality gate skipped due to error):\n\n${resultContent}`
                 await this.sendMessage(managed.parentSessionId!, relayMessage)
+                await this.autoArchiveCompletedTeammateSession(sessionId)
               } catch (relayErr) {
                 sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, relayErr)
               }
@@ -6138,14 +6309,16 @@ export class SessionManager {
             try {
               const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}`
               await this.sendMessage(managed.parentSessionId!, relayMessage)
+              await this.autoArchiveCompletedTeammateSession(sessionId)
 
               const allDone = (lead.teammateSessionIds || []).every(tid => {
                 const t = this.sessions.get(tid)
                 return t && !t.isProcessing
               })
-              if (allDone) {
-                sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
-                setTimeout(async () => {
+               if (allDone) {
+                 sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
+                 clearLeadTeamState()
+                 setTimeout(async () => {
                   try {
                     await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
                   } catch (err) {
@@ -6161,11 +6334,13 @@ export class SessionManager {
       }
     }
 
+    const keepAliveForTeam = this.shouldDelayCompletionForAgentTeam(managed)
+
     // 5. Check queue and process or complete
     if (managed.messageQueue.length > 0) {
       // Has queued messages - process next
       this.processNextQueuedMessage(sessionId)
-    } else {
+    } else if (!keepAliveForTeam) {
       // No queue - emit complete to UI (include tokenUsage and hasUnread for state updates)
       this.sendEvent({
         type: 'complete',
@@ -6173,11 +6348,28 @@ export class SessionManager {
         tokenUsage: managed.tokenUsage,
         hasUnread: managed.hasUnread,  // Propagate unread state to renderer
       }, managed.workspace.id)
+    } else {
+      sessionLog.info(`[AgentTeams] Delaying completion for lead session ${sessionId} while teammates finish`)
     }
 
     // 6. Always persist
     this.persistSession(managed)
     void this.persistAndBroadcastUsage(managed)
+  }
+
+  private shouldDelayCompletionForAgentTeam(managed: ManagedSession): boolean {
+    // Check if this session is a team lead with active teammate sessions
+    if (!managed.isTeamLead || !managed.teammateSessionIds?.length) {
+      return false
+    }
+
+    // Check if any teammates are still processing
+    const hasActiveTeammates = managed.teammateSessionIds.some(teammateId => {
+      const teammate = this.sessions.get(teammateId)
+      return teammate?.isProcessing === true
+    })
+
+    return hasActiveTeammates
   }
 
   /**
@@ -6824,7 +7016,7 @@ To view this task's output:
         // Track if already completed to avoid sending duplicate events
         const wasAlreadyComplete = existingToolMsg?.toolStatus === 'completed'
 
-        sessionLog.info(`RESULT MATCH: toolUseId=${event.toolUseId}, found=${!!existingToolMsg}, toolName=${existingToolMsg?.toolName || toolName}, wasComplete=${wasAlreadyComplete}`)
+        sessionLog.debug(`RESULT MATCH: toolUseId=${event.toolUseId}, found=${!!existingToolMsg}, toolName=${existingToolMsg?.toolName || toolName}, wasComplete=${wasAlreadyComplete}`)
 
         // parentToolUseId comes from CraftAgent (SDK-authoritative) or existing message
         const parentToolUseId = existingToolMsg?.parentToolUseId || event.parentToolUseId
@@ -6843,7 +7035,7 @@ To view this task's output:
           // This is normal for background subagent child tools where tool_result arrives
           // without a prior tool_start. If tool_start arrives later, findToolMessage will
           // locate this message by toolUseId and update it with input/intent/displayMeta.
-          sessionLog.info(`RESULT WITHOUT START: toolUseId=${event.toolUseId}, toolName=${toolName} (creating message from result)`)
+          sessionLog.debug(`RESULT WITHOUT START: toolUseId=${event.toolUseId}, toolName=${toolName} (creating message from result)`)
           const fallbackWorkspaceRootPath = managed.workspace.rootPath
           const fallbackSources = loadAllSources(fallbackWorkspaceRootPath)
           const fallbackToolDisplayMeta = resolveToolDisplayMeta(toolName, undefined, fallbackWorkspaceRootPath, fallbackSources)
@@ -6893,7 +7085,7 @@ To view this task's output:
           for (const child of pendingChildren) {
             child.toolStatus = 'completed'
             child.toolResult = child.toolResult || ''
-            sessionLog.info(`CHILD AUTO-COMPLETED: toolUseId=${child.toolUseId}, toolName=${child.toolName} (parent ${toolName} completed)`)
+            sessionLog.debug(`CHILD AUTO-COMPLETED: toolUseId=${child.toolUseId}, toolName=${child.toolName} (parent ${toolName} completed)`)
             this.sendEvent({
               type: 'tool_result',
               sessionId,
@@ -7004,6 +7196,74 @@ To view this task's output:
           sessionLog.info('Skipping abort error event (expected during interrupt)')
           break
         }
+
+        const isConnectionLostError =
+          event.message.includes('Connection to Codex lost') ||
+          event.message.includes('Client disconnected')
+
+        if (isConnectionLostError && !managed.connectionRetryAttempted && managed.lastSentMessage) {
+          sessionLog.warn(`[reconnect-retry] Connection lost, attempting one automatic retry for session ${sessionId}`)
+          managed.connectionRetryAttempted = true
+          managed.connectionRetryInProgress = true
+
+          // Mark not-processing so retry can start a fresh agent turn immediately.
+          managed.isProcessing = false
+
+          setImmediate(async () => {
+            try {
+              const retryMessage = managed.lastSentMessage
+              const retryAttachments = managed.lastSentAttachments
+              const retryStoredAttachments = managed.lastSentStoredAttachments
+              const retryOptions = managed.lastSentOptions
+
+              // Force fresh app-server process on retry
+              managed.agent = null
+
+              if (retryMessage) {
+                // Remove the failed turn's user message to avoid duplication in transcript
+                const lastUserMsgIndex = managed.messages.findLastIndex(m => m.role === 'user')
+                if (lastUserMsgIndex !== -1) {
+                  managed.messages.splice(lastUserMsgIndex, 1)
+                }
+
+                managed.connectionRetryInProgress = false
+                await this.sendMessage(
+                  sessionId,
+                  retryMessage,
+                  retryAttachments,
+                  retryStoredAttachments,
+                  retryOptions,
+                  undefined,  // existingMessageId
+                  false,      // _isAuthRetry
+                  true        // _isReconnectRetry
+                )
+                sessionLog.info(`[reconnect-retry] Retry completed for session ${sessionId}`)
+              } else {
+                managed.connectionRetryInProgress = false
+              }
+            } catch (retryError) {
+              managed.connectionRetryInProgress = false
+              sessionLog.error(`[reconnect-retry] Retry failed for session ${sessionId}:`, retryError)
+              Sentry.captureException(retryError, {
+                tags: { errorSource: 'reconnect-retry', sessionId },
+              })
+
+              const failedMessage: Message = {
+                id: generateMessageId(),
+                role: 'error',
+                content: event.message,
+                timestamp: Date.now(),
+              }
+              managed.messages.push(failedMessage)
+              this.sendEvent({ type: 'error', sessionId, error: event.message }, workspaceId)
+              this.onProcessingStopped(sessionId, 'error')
+            }
+          })
+
+          // Skip immediate error rendering; retry path handles recovery/terminal error.
+          break
+        }
+
         // AgentEvent uses `message` not `error`
         const errorMessage: Message = {
           id: generateMessageId(),
@@ -7023,7 +7283,7 @@ To view this task's output:
           break
         }
         // Typed errors have structured information - send both formats for compatibility
-        sessionLog.info('typed_error:', JSON.stringify(event.error, null, 2))
+        sessionLog.debug('typed_error:', JSON.stringify(event.error, null, 2))
 
         // Check for auth errors that can be retried by refreshing the token
         // The SDK subprocess caches the token at startup, so if it expires mid-session,
@@ -7085,7 +7345,8 @@ To view this task's output:
                   retryStoredAttachments,
                   retryOptions,
                   undefined,  // existingMessageId
-                  true        // _isAuthRetry - prevents infinite retry loop
+                  true,       // _isAuthRetry - prevents infinite retry loop
+                  false       // _isReconnectRetry
                 )
                 sessionLog.info(`[auth-retry] Retry completed for session ${sessionId}`)
               } else {

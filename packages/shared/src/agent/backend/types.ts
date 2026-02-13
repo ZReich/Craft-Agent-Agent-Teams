@@ -403,6 +403,7 @@ export interface BackendConfig {
     teammateName: string;
     prompt: string;
     model?: string;
+    role?: string;
   }) => Promise<{ sessionId: string; agentId: string }>;
 
   /** Callback to send a message to a teammate session (agent teams) */

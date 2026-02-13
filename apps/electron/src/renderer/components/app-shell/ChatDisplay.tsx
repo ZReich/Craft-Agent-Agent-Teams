@@ -15,6 +15,8 @@ import {
 import { motion, AnimatePresence } from "motion/react"
 
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 import { Markdown, CollapsibleMarkdownProvider, StreamingMarkdown, type RenderMode } from "@/components/markdown"
 import { AnimatedCollapsibleContent } from "@/components/ui/collapsible"
@@ -357,6 +359,12 @@ function ScrollOnMount({
     if (skip) return
     targetRef.current?.scrollIntoView({ behavior: 'instant' })
     onScroll?.()
+    // Fallback: retry after layout settles (covers ScrollArea viewport init timing
+    // when component remounts, e.g. switching back from Team Dashboard)
+    const rafId = requestAnimationFrame(() => {
+      targetRef.current?.scrollIntoView({ behavior: 'instant' })
+    })
+    return () => cancelAnimationFrame(rafId)
   }, [skip])
   return null
 }
@@ -440,6 +448,11 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   const [visibleTurnCount, setVisibleTurnCount] = React.useState(TURNS_PER_PAGE)
   // Sticky-bottom: When true, auto-scroll on content changes. Toggled by user scroll behavior.
   const isStickToBottomRef = React.useRef(true)
+  // Live-follow UI state: paused when user scrolls up, resumed when returning to bottom.
+  const [isLiveFollowPaused, setIsLiveFollowPaused] = React.useState(false)
+  const [unreadWhilePaused, setUnreadWhilePaused] = React.useState(0)
+  const lastMessageCountRef = React.useRef(0)
+  const unreadSessionIdRef = React.useRef<string | null>(null)
   // Skip smooth scroll briefly after session switch (instant scroll already happened)
   const skipSmoothScrollUntilRef = React.useRef(0)
   const internalTextareaRef = React.useRef<RichTextInputHandle>(null)
@@ -1073,7 +1086,14 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     const { scrollTop, scrollHeight, clientHeight } = viewport
     const distanceFromBottom = scrollHeight - scrollTop - clientHeight
     // 20px threshold for "at bottom" detection
-    isStickToBottomRef.current = distanceFromBottom < 20
+    const isAtBottom = distanceFromBottom < 20
+    isStickToBottomRef.current = isAtBottom
+    if (isAtBottom) {
+      setIsLiveFollowPaused(false)
+      setUnreadWhilePaused(0)
+    } else if (distanceFromBottom > 120) {
+      setIsLiveFollowPaused(true)
+    }
 
     // Load more turns when scrolling near top (within 100px)
     if (scrollTop < 100) {
@@ -1116,6 +1136,10 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     // On session switch: reset UI state (scroll handled by ScrollOnMount)
     if (isSessionSwitch) {
       isStickToBottomRef.current = true
+      setIsLiveFollowPaused(false)
+      setUnreadWhilePaused(0)
+      lastMessageCountRef.current = session?.messages.length ?? 0
+      unreadSessionIdRef.current = session?.id ?? null
       setVisibleTurnCount(TURNS_PER_PAGE)
     }
 
@@ -1144,13 +1168,43 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
       resizeObserver.disconnect()
       if (debounceTimer) clearTimeout(debounceTimer)
     }
-  }, [session?.id])
+  }, [session?.id, session?.messages.length])
+
+  // Track unread growth while live-follow is paused.
+  React.useEffect(() => {
+    const sessionId = session?.id ?? null
+    const messageCount = session?.messages.length ?? 0
+
+    if (unreadSessionIdRef.current !== sessionId) {
+      unreadSessionIdRef.current = sessionId
+      lastMessageCountRef.current = messageCount
+      setUnreadWhilePaused(0)
+      return
+    }
+
+    const previousCount = lastMessageCountRef.current
+    if (messageCount > previousCount && !isStickToBottomRef.current) {
+      setUnreadWhilePaused(prev => prev + (messageCount - previousCount))
+      setIsLiveFollowPaused(true)
+    }
+    lastMessageCountRef.current = messageCount
+  }, [session?.id, session?.messages.length])
+
+  const handleJumpToLive = React.useCallback(() => {
+    isStickToBottomRef.current = true
+    setIsLiveFollowPaused(false)
+    setUnreadWhilePaused(0)
+    skipSmoothScrollUntilRef.current = Date.now() + 300
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [])
 
   // Handle message submission from InputContainer
   // Backend handles interruption and queueing if currently processing
   const handleSubmit = (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => {
     // Force stick-to-bottom when user sends a message
     isStickToBottomRef.current = true
+    setIsLiveFollowPaused(false)
+    setUnreadWhilePaused(0)
     onSendMessage(message, attachments, skillSlugs)
 
     // Immediately scroll to bottom after sending - use requestAnimationFrame
@@ -1286,6 +1340,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                     targetRef={messagesEndRef}
                     skip={skipScrollToBottom}
                     onScroll={() => {
+                      setIsLiveFollowPaused(false)
+                      setUnreadWhilePaused(0)
                       skipSmoothScrollUntilRef.current = Date.now() + 500
                     }}
                   />
@@ -1518,6 +1574,32 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
               </div>
               </ScrollArea>
             </div>
+
+            <AnimatePresence>
+              {!compactMode && isLiveFollowPaused && (
+                <motion.div
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 8 }}
+                  transition={{ duration: 0.15, ease: 'easeOut' }}
+                  className="absolute bottom-3 right-4 z-20 pointer-events-none"
+                >
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleJumpToLive}
+                    className="pointer-events-auto gap-2 bg-background/95"
+                  >
+                    Jump to Live ↓
+                    {unreadWhilePaused > 0 && (
+                      <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] h-4">
+                        {unreadWhilePaused}
+                      </Badge>
+                    )}
+                  </Button>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
           {/* === INPUT CONTAINER: FreeForm or Structured Input === */}

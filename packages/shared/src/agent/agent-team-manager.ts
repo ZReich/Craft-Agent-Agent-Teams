@@ -71,6 +71,10 @@ export interface TeamManagerEvents {
 // ============================================================
 
 export class AgentTeamManager extends EventEmitter {
+  private static readonly MAX_ACTIVITY_EVENTS = 1500;
+  private static readonly MAX_TEAM_MESSAGES = 2000;
+  private static readonly MAX_TEAM_TASKS = 3000;
+
   private teams = new Map<string, AgentTeam>();
   private tasks = new Map<string, TeamTask[]>();  // teamId → tasks
   private messages = new Map<string, TeammateMessage[]>();  // teamId → messages
@@ -78,6 +82,29 @@ export class AgentTeamManager extends EventEmitter {
   private teamSpecs = new Map<string, Spec>();  // teamId → active spec
   private teamDRIAssignments = new Map<string, DRIAssignment[]>();  // teamId → DRI assignments
   private synthesisRequested = new Set<string>();  // teamIds that already emitted synthesis request
+
+  private pushCapped<T>(arr: T[], item: T, max: number): void {
+    arr.push(item);
+    if (arr.length > max) {
+      arr.splice(0, arr.length - max);
+    }
+  }
+
+  private trimTasks(tasks: TeamTask[]): TeamTask[] {
+    if (tasks.length <= AgentTeamManager.MAX_TEAM_TASKS) {
+      return tasks;
+    }
+
+    const openTasks = tasks.filter(t => t.status !== 'completed');
+    const completedTasks = tasks.filter(t => t.status === 'completed');
+
+    const completedSlots = Math.max(0, AgentTeamManager.MAX_TEAM_TASKS - openTasks.length);
+    const keptCompleted = completedSlots > 0
+      ? completedTasks.slice(-completedSlots)
+      : [];
+
+    return [...openTasks, ...keptCompleted];
+  }
 
   // ============================================================
   // Team Lifecycle
@@ -125,9 +152,15 @@ export class AgentTeamManager extends EventEmitter {
     }
 
     team.status = 'completed';
+    team.members = [];
     this.emit('team:updated', team);
     this.emit('team:cleanup', teamId);
     this.addActivity(teamId, 'teammate-shutdown', 'Team cleaned up', undefined, undefined);
+
+    // Release hot runtime memory immediately after cleanup.
+    this.tasks.delete(teamId);
+    this.messages.delete(teamId);
+    this.activityLog.delete(teamId);
     this.teamSpecs.delete(teamId);
     this.teamDRIAssignments.delete(teamId);
     this.synthesisRequested.delete(teamId);
@@ -295,8 +328,8 @@ export class AgentTeamManager extends EventEmitter {
     };
 
     const teamTasks = this.tasks.get(teamId) || [];
-    teamTasks.push(task);
-    this.tasks.set(teamId, teamTasks);
+    this.pushCapped(teamTasks, task, AgentTeamManager.MAX_TEAM_TASKS + 100);
+    this.tasks.set(teamId, this.trimTasks(teamTasks));
 
     this.emit('task:created', task);
     return task;
@@ -313,6 +346,7 @@ export class AgentTeamManager extends EventEmitter {
     if (status === 'completed') task.completedAt = new Date().toISOString();
 
     this.emit('task:updated', task);
+    this.tasks.set(teamId, this.trimTasks(teamTasks));
 
     // Add activity
     const activityType: TeamActivityType = status === 'completed' ? 'task-completed'
@@ -358,7 +392,7 @@ export class AgentTeamManager extends EventEmitter {
     };
 
     const teamMessages = this.messages.get(teamId) || [];
-    teamMessages.push(msg);
+    this.pushCapped(teamMessages, msg, AgentTeamManager.MAX_TEAM_MESSAGES);
     this.messages.set(teamId, teamMessages);
 
     this.emit('message:sent', msg);
@@ -400,7 +434,7 @@ export class AgentTeamManager extends EventEmitter {
     };
 
     const log = this.activityLog.get(teamId) || [];
-    log.push(event);
+    this.pushCapped(log, event, AgentTeamManager.MAX_ACTIVITY_EVENTS);
     this.activityLog.set(teamId, log);
 
     this.emit('activity', event);

@@ -93,6 +93,12 @@ log.initialize()
 // Increase V8 heap size to reduce OOM risk under heavy sessions
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096')
 
+// Prevent GPU process crash (error_code=18) on Windows by disabling GPU sandbox
+app.commandLine.appendSwitch('disable-gpu-sandbox')
+if (process.env.ELECTRON_DISABLE_GPU) {
+  app.commandLine.appendSwitch('disable-gpu')
+}
+
 // Ensure Chromium disk cache uses a writable location (prevents access denied on Windows)
 try {
   const userDataPath = app.getPath('userData')
@@ -435,9 +441,28 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   // On macOS, apps typically stay active until explicitly quit
-  if (process.platform !== 'darwin') {
-    app.quit()
+  if (process.platform === 'darwin') return
+
+  // Dev safety net: if all windows close unexpectedly while agents are still
+  // processing, recreate a window instead of quitting and dropping active runs.
+  if (isDebugMode && sessionManager && windowManager) {
+    const hasActiveRuns = sessionManager.getSessions().some(s => s.isProcessing)
+    if (hasActiveRuns) {
+      mainLog.warn('All windows closed while sessions are processing - recreating window (debug mode)')
+      const workspaces = getWorkspaces()
+      if (workspaces.length > 0) {
+        const savedState = loadWindowState()
+        const preferredWorkspaceId = savedState?.lastFocusedWorkspaceId
+        const workspaceId = preferredWorkspaceId && workspaces.some(ws => ws.id === preferredWorkspaceId)
+          ? preferredWorkspaceId
+          : workspaces[0].id
+        windowManager.createWindow({ workspaceId })
+        return
+      }
+    }
   }
+
+  app.quit()
 })
 
 // Track if we're in the process of quitting (to avoid re-entry)

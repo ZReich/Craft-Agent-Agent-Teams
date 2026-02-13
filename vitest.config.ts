@@ -7,9 +7,9 @@ export default defineConfig({
   test: {
     // Root config runs only the core/shared/electron test suites
     include: [
-      'packages/shared/src/**/*.{test,spec}.ts',
-      'packages/core/src/**/*.{test,spec}.ts',
-      'apps/electron/src/**/*.{test,spec}.ts',
+      'packages/shared/src/**/*.{test,spec}.{ts,tsx}',
+      'packages/core/src/**/*.{test,spec}.{ts,tsx}',
+      'apps/electron/src/**/*.{test,spec}.{ts,tsx}',
     ],
     // Implements REQ-007: Quarantine legacy failing tests
     exclude: [

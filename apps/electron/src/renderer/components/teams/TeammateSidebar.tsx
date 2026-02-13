@@ -84,7 +84,7 @@ export function TeammateSidebar({
                   />
                 </div>
 
-                {/* Info */}
+                {/* Info - Simplified to remove duplication */}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5">
                     <span className="text-sm font-medium truncate">{teammate.name}</span>
@@ -94,20 +94,11 @@ export function TeammateSidebar({
                       </Badge>
                     )}
                   </div>
+                  {/* Show only status or current task, not both */}
                   <div className="flex items-center gap-1.5 mt-0.5">
                     <span className="text-[11px] text-muted-foreground truncate">
                       {teammate.currentTask || config.label}
                     </span>
-                  </div>
-                  <div className="flex items-center gap-1 mt-1">
-                    <Badge variant="outline" className="text-[10px] px-1 py-0 h-4 border-border">
-                      {modelName}
-                    </Badge>
-                    {teammate.tokenUsage && (
-                      <span className="text-[10px] text-muted-foreground">
-                        ${teammate.tokenUsage.costUsd.toFixed(2)}
-                      </span>
-                    )}
                   </div>
                 </div>
               </button>

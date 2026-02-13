@@ -1166,6 +1166,7 @@ export class CodexAgent extends BaseAgent {
       const teammateName = (inputObj.name as string) || `teammate-${Date.now()}`;
       const prompt = (inputObj.prompt as string) || (inputObj.input as string) || '';
       const model = inputObj.model as string | undefined;
+      const role = inputObj.role as string | undefined;
 
       if (!explicitTeamName) {
         this.debug(`[AgentTeams] No team_name provided; defaulting to "${teamName}"`);
@@ -1179,6 +1180,7 @@ export class CodexAgent extends BaseAgent {
           teammateName,
           prompt,
           model,
+          role,
         });
 
         // Implements REQ-001: Track active team to prevent premature completion

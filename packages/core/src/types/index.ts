@@ -81,6 +81,51 @@ export type {
   TeamCostSummary,
 } from './agent-teams.ts';
 
+// Team Dashboard View State types (Phase 1)
+export type {
+  DashboardPanel,
+  TaskFilter,
+  ActivityFilter,
+  TeamDashboardViewState,
+  DashboardViewAction,
+  TeammateDetailViewState,
+  DashboardMetrics,
+} from './team-view-state.ts';
+export { createInitialDashboardState } from './team-view-state.ts';
+
+// Team Event types (Phase 1)
+export type {
+  TeamEventEnvelope,
+  TeamInitializedEvent,
+  TeamUpdatedEvent,
+  TeamCleanupEvent,
+  TeamCompletedEvent,
+  TeammateSpawnedEvent,
+  TeammateUpdatedEvent,
+  TeammateDeltaEvent,
+  TeammateShutdownEvent,
+  TaskCreatedEvent,
+  TaskUpdatedEvent,
+  TaskClaimedEvent,
+  TaskCompletedEvent,
+  MessageSentEvent,
+  MessageBroadcastEvent,
+  ActivityLoggedEvent,
+  CostUpdatedEvent,
+  CostWarningEvent,
+  TeamErrorEvent,
+  TeamEvent,
+  TeamEventBatch,
+} from './team-events.ts';
+export {
+  createTeamEvent,
+  isTeamLifecycleEvent,
+  isTeammateEvent,
+  isTaskEvent,
+  isMessageEvent,
+  createEventBatch,
+} from './team-events.ts';
+
 // SDD (Spec-Driven Development) types
 export type {
   Spec,

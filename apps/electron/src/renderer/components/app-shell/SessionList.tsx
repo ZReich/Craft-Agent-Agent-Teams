@@ -163,11 +163,11 @@ interface TeamGroupProps {
 function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSessionItem }: TeamGroupProps) {
   const teamId = lead.teamId || lead.id
   const teamColor = lead.teamColor || '#7c3aed'
-  const hasActiveWork = teammates.some(t => t.isProcessing)
 
-  // Expanded if: (a) not manually collapsed, OR (b) teammates are still working
+  // Expanded only when not collapsed.
+  // This allows older active teams to stay minimized when a new team is spawned.
   const isManuallyCollapsed = collapsedTeams.has(teamId)
-  const isExpanded = hasActiveWork || !isManuallyCollapsed
+  const isExpanded = !isManuallyCollapsed
 
   const workingCount = teammates.filter(t => t.isProcessing).length
   const doneCount = teammates.filter(t => !t.isProcessing).length
@@ -1110,6 +1110,7 @@ export function SessionList({
   const [displayLimit, setDisplayLimit] = useState(INITIAL_DISPLAY_LIMIT)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const sentinelRef = useRef<HTMLDivElement>(null)
+  const scrollViewportRef = useRef<HTMLDivElement>(null)
 
   // Content search state (full-text search via ripgrep)
   const [contentSearchResults, setContentSearchResults] = useState<Map<string, { matchCount: number; snippet: string }>>(new Map())
@@ -1345,7 +1346,12 @@ export function SessionList({
           loadMore()
         }
       },
-      { rootMargin: '100px' }  // Trigger slightly before reaching bottom
+      {
+        // Observe inside the scroll area viewport (not the browser window)
+        // so infinite loading works reliably in this internal scroller.
+        root: scrollViewportRef.current,
+        rootMargin: '100px',
+      }  // Trigger slightly before reaching bottom
     )
 
     observer.observe(sentinelRef.current)
@@ -1696,7 +1702,7 @@ export function SessionList({
         />
       )}
       {/* ScrollArea with mask-fade-top-short - shorter fade to avoid header overlap */}
-      <ScrollArea className="flex-1 select-none mask-fade-top-short">
+      <ScrollArea className="flex-1 select-none mask-fade-top-short" viewportRef={scrollViewportRef}>
         <div
           ref={zoneRef}
           className="flex flex-col pb-14 min-w-0"
@@ -1879,9 +1885,13 @@ export function SessionList({
                 <div key={group.date.toISOString()}>
                   <SessionListSectionHeader label={group.label} />
                   {group.sessions.map((item, indexInGroup) => {
-                    // Skip teammates — they're rendered inside their lead's TeamGroup
+                    // Skip teammates only when their parent is visible on this page.
+                    // If parent is outside pagination, render teammate normally so it
+                    // doesn't disappear until more items are loaded.
                     if (item.parentSessionId) {
-                      return null
+                      const parentVisible = paginatedItems.some(s => s.id === item.parentSessionId)
+                      if (parentVisible) return null
+                      return renderItem(item, indexInGroup === 0)
                     }
 
                     // Team lead — render as a collapsible TeamGroup
@@ -1890,6 +1900,13 @@ export function SessionList({
                       const teammates = (item.teammateSessionIds || [])
                         .map(tid => group.sessions.find(s => s.id === tid) || paginatedItems.find(s => s.id === tid))
                         .filter((t): t is SessionMeta => t != null)
+                        // Newest/active teammates first so newly spawned members are immediately visible.
+                        .sort((a, b) => {
+                          if (a.isProcessing !== b.isProcessing) {
+                            return a.isProcessing ? -1 : 1
+                          }
+                          return (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
+                        })
 
                       return (
                         <TeamGroup

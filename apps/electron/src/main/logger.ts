@@ -1,6 +1,23 @@
 import log from 'electron-log/main'
 import { app } from 'electron'
 
+function serializeLogValue(value: unknown): unknown {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack,
+      cause: value.cause ? String(value.cause) : undefined,
+    }
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(serializeLogValue)
+  }
+
+  return value
+}
+
 /**
  * Debug mode is enabled when running from source (not packaged) or with --debug flag.
  * - true: `bun run electron:start` or `electron .` or packaged app with `--debug`
@@ -20,7 +37,7 @@ if (isDebugMode) {
       timestamp: message.date.toISOString(),
       level: message.level,
       scope: message.scope,
-      message: message.data,
+      message: message.data.map(serializeLogValue),
     }),
   ]
 
@@ -32,7 +49,10 @@ if (isDebugMode) {
     const scope = message.scope ? `[${message.scope}]` : ''
     const level = message.level.toUpperCase().padEnd(5)
     const data = message.data
-      .map((d: unknown) => (typeof d === 'object' ? JSON.stringify(d) : String(d)))
+      .map((d: unknown) => {
+        const normalized = serializeLogValue(d)
+        return typeof normalized === 'object' ? JSON.stringify(normalized) : String(normalized)
+      })
       .join(' ')
     return [`${message.date.toISOString()} ${level} ${scope} ${data}`]
   }

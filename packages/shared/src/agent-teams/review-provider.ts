@@ -6,6 +6,7 @@ export function resolveReviewProvider(model: string, fallback?: string): ReviewP
   const lower = model.toLowerCase();
   if (lower.startsWith('kimi-')) return 'moonshot';
   if (isCodexModel(model) || lower.startsWith('gpt-') || lower.startsWith('openai/')) return 'openai';
+  if (lower.startsWith('claude-') || lower.startsWith('anthropic/')) return 'anthropic';
   if (fallback === 'moonshot' || fallback === 'openai') return fallback as ReviewProvider;
   return 'anthropic';
 }

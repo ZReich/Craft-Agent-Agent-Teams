@@ -34,7 +34,7 @@ export interface ParsedRoute {
 // Compound Route Types (new format)
 // =============================================================================
 
-export type NavigatorType = 'sessions' | 'sources' | 'skills' | 'settings'
+export type NavigatorType = 'sessions' | 'sources' | 'skills' | 'settings' | 'focus'
 
 export interface ParsedCompoundRoute {
   /** The navigator type */
@@ -58,7 +58,7 @@ export interface ParsedCompoundRoute {
  * Known prefixes that indicate a compound route
  */
 const COMPOUND_ROUTE_PREFIXES = [
-  'allSessions', 'flagged', 'archived', 'state', 'label', 'view', 'sources', 'skills', 'settings'
+  'allSessions', 'flagged', 'archived', 'state', 'label', 'view', 'sources', 'skills', 'settings', 'focus'
 ]
 
 /**
@@ -151,6 +151,17 @@ export function parseCompoundRoute(route: string): ParsedCompoundRoute | null {
       }
     }
 
+    return null
+  }
+
+  // Focus navigator - focus/session/{sessionId}
+  if (first === 'focus') {
+    if (segments[1] === 'session' && segments[2]) {
+      return {
+        navigator: 'focus',
+        details: { type: 'session', id: segments[2] },
+      }
+    }
     return null
   }
 
@@ -398,11 +409,33 @@ export function parseRouteToNavigationState(
   route: string,
   sidebarParam?: string
 ): NavigationState | null {
+  // Extract query params from route for focus mode (contextPane, timeline)
+  const [pathPart, queryPart] = route.split('?')
+  const queryParams = new URLSearchParams(queryPart || '')
+
   // Parse compound routes
-  if (isCompoundRoute(route)) {
-    const compound = parseCompoundRoute(route)
+  if (isCompoundRoute(pathPart)) {
+    const compound = parseCompoundRoute(pathPart)
     if (compound) {
       const state = convertCompoundToNavigationState(compound)
+
+      // Apply focus-specific query params
+      if (state.navigator === 'focus') {
+        const contextPaneVisible = queryParams.get('contextPane') === 'true'
+        const timelineDrawerVisible = queryParams.get('timeline') === 'true'
+        const focusState: NavigationState = {
+          ...state,
+          contextPaneVisible: contextPaneVisible || undefined,
+          timelineDrawerVisible: timelineDrawerVisible || undefined,
+        }
+        // Add rightSidebar if param provided
+        const rightSidebar = parseRightSidebarParam(sidebarParam)
+        if (rightSidebar) {
+          return { ...focusState, rightSidebar }
+        }
+        return focusState
+      }
+
       // Add rightSidebar if param provided
       const rightSidebar = parseRightSidebarParam(sidebarParam)
       if (rightSidebar) {
@@ -466,6 +499,19 @@ function convertCompoundToNavigationState(compound: ParsedCompoundRoute): Naviga
       navigator: 'skills',
       details: { type: 'skill', skillSlug: compound.details.id },
     }
+  }
+
+  // Focus - requires a session (no empty state for focus mode)
+  if (compound.navigator === 'focus') {
+    if (compound.details) {
+      return {
+        navigator: 'focus',
+        details: { type: 'session', sessionId: compound.details.id },
+      }
+    }
+    // Focus mode requires a session - return null if none provided
+    // This will cause navigation to fall back or show an error
+    return { navigator: 'sessions', filter: { kind: 'allSessions' }, details: null }
   }
 
   // Sessions
@@ -598,6 +644,16 @@ function convertParsedRouteToNavigationState(parsed: ParsedRoute): NavigationSta
         }
       }
       return { navigator: 'sessions', filter: { kind: 'allSessions' }, details: null }
+    case 'focus':
+      if (parsed.id) {
+        return {
+          navigator: 'focus',
+          details: { type: 'session', sessionId: parsed.id },
+          contextPaneVisible: parsed.params.contextPane === 'true',
+          timelineDrawerVisible: parsed.params.timeline === 'true',
+        }
+      }
+      return null
     default:
       return null
   }
@@ -609,6 +665,14 @@ function convertParsedRouteToNavigationState(parsed: ParsedRoute): NavigationSta
 export function buildRouteFromNavigationState(state: NavigationState): string {
   if (state.navigator === 'settings') {
     return `settings/${state.subpage}`
+  }
+
+  if (state.navigator === 'focus') {
+    const base = `focus/session/${state.details.sessionId}`
+    const params: string[] = []
+    if (state.contextPaneVisible) params.push('contextPane=true')
+    if (state.timelineDrawerVisible) params.push('timeline=true')
+    return params.length > 0 ? `${base}?${params.join('&')}` : base
   }
 
   if (state.navigator === 'sources') {

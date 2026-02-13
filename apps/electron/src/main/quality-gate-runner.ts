@@ -162,6 +162,45 @@ export class QualityGateRunner {
     this.apiKeyProvider = apiKeyProvider;
   }
 
+  private serializeError(error: unknown): { message: string; name?: string; stack?: string; cause?: string } {
+    if (error instanceof Error) {
+      return {
+        message: error.message,
+        name: error.name,
+        stack: error.stack,
+        cause: error.cause ? String(error.cause) : undefined,
+      };
+    }
+
+    return {
+      message: typeof error === 'string' ? error : JSON.stringify(error),
+    };
+  }
+
+  private createStageFailureResult(message: string, suggestions: string[] = []): QualityGateStageResult {
+    return {
+      score: 0,
+      passed: false,
+      issues: [message],
+      suggestions,
+    };
+  }
+
+  private async validateReviewProviderAccess(reviewProvider: ReviewProvider): Promise<string | null> {
+    if (reviewProvider === 'moonshot') {
+      const key = await this.apiKeyProvider.getMoonshotApiKey();
+      return key ? null : 'Moonshot credential is missing for the selected review model/provider';
+    }
+
+    if (reviewProvider === 'openai') {
+      const cfg = await this.apiKeyProvider.getOpenAiConfig();
+      return cfg?.apiKey ? null : 'OpenAI credential is missing for the selected review model/provider';
+    }
+
+    const key = await this.apiKeyProvider.getAnthropicApiKey();
+    return key ? null : 'Anthropic credential is missing for the selected review model/provider';
+  }
+
   /**
    * Run the full quality gate pipeline on a teammate's work.
    */
@@ -224,6 +263,18 @@ export class QualityGateRunner {
     const enabledAiStages = aiStages.filter(s => config.stages[s].enabled);
 
     if (enabledAiStages.length > 0) {
+      const providerAccessError = await this.validateReviewProviderAccess(reviewProvider);
+      if (providerAccessError) {
+        qgLog.error('[QualityGates] Review provider preflight failed:', providerAccessError);
+        for (const stage of enabledAiStages) {
+          stages[stage] = this.createStageFailureResult(
+            providerAccessError,
+            ['Configure valid credentials for the selected model/provider and retry quality gates'],
+          );
+        }
+        return this.buildResult(stages, config, reviewProvider);
+      }
+
       qgLog.info(`[QualityGates] Running ${enabledAiStages.length} AI review stages in parallel`);
       const aiResults = await Promise.allSettled(
         enabledAiStages.map(stage => this.runAIReview(stage, diff, taskContext, config, reviewProvider))
@@ -235,14 +286,12 @@ export class QualityGateRunner {
         if (result.status === 'fulfilled') {
           stages[stageName] = result.value;
         } else {
-          qgLog.error(`[QualityGates] AI review stage "${stageName}" failed:`, result.reason);
-          // On AI failure, give a passing score to avoid blocking on infra issues
-          stages[stageName] = {
-            score: 100,
-            passed: true,
-            issues: ['AI review stage encountered an error — manual review recommended'],
-            suggestions: [],
-          };
+          const errorDetails = this.serializeError(result.reason);
+          qgLog.error(`[QualityGates] AI review stage "${stageName}" failed:`, errorDetails);
+          stages[stageName] = this.createStageFailureResult(
+            `AI review stage "${stageName}" failed: ${errorDetails.message}`,
+            ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
+          );
         }
       }
     }
@@ -656,12 +705,10 @@ export class QualityGateRunner {
       const jsonMatch = responseText.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
         qgLog.warn(`[QualityGates] AI review "${stage}" returned non-JSON response`);
-        return {
-          score: 100,
-          passed: true,
-          issues: ['AI review returned an unexpected format — manual review recommended'],
-          suggestions: [],
-        };
+        return this.createStageFailureResult(
+          `AI review "${stage}" returned an unexpected non-JSON format`,
+          ['Ensure the configured model supports structured JSON responses for review stages'],
+        );
       }
 
       const parsed = JSON.parse(jsonMatch[0]);
@@ -691,13 +738,12 @@ export class QualityGateRunner {
         suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
       };
     } catch (err) {
-      qgLog.error(`[QualityGates] AI review "${stage}" failed:`, err);
-      return {
-        score: 100,
-        passed: true,
-        issues: [],
-        suggestions: [`AI review stage "${stage}" encountered an error - manual review recommended`],
-      };
+      const errorDetails = this.serializeError(err);
+      qgLog.error(`[QualityGates] AI review "${stage}" failed:`, errorDetails);
+      return this.createStageFailureResult(
+        `AI review stage "${stage}" encountered an error: ${errorDetails.message}`,
+        ['Verify provider credentials and model compatibility for this review stage'],
+      );
     }
   }
 
@@ -751,12 +797,10 @@ ${diff.slice(0, 50000)}
       const responseText = await this.callReviewModel(systemPrompt, userMessage, config, reviewProvider);
       const parsed = this.parseJsonObject(responseText);
       if (!parsed || !Array.isArray(parsed.coverage)) {
-        return {
-          score: 70,
-          passed: true,
-          issues: ['Spec compliance review returned an unexpected response format'],
-          suggestions: ['Run a manual requirement-by-requirement verification'],
-        };
+        return this.createStageFailureResult(
+          'Spec compliance review returned an unexpected response format',
+          ['Ensure the review model returns valid JSON and rerun spec compliance checks'],
+        );
       }
 
       const totalRequirements = spec.requirements.length;
@@ -803,13 +847,12 @@ ${diff.slice(0, 50000)}
         suggestions,
       };
     } catch (err) {
-      qgLog.error('[QualityGates] Spec compliance review failed:', err);
-      return {
-        score: 80,
-        passed: true,
-        issues: ['Spec compliance stage encountered an error — manual review recommended'],
-        suggestions: [],
-      };
+      const errorDetails = this.serializeError(err);
+      qgLog.error('[QualityGates] Spec compliance review failed:', errorDetails);
+      return this.createStageFailureResult(
+        `Spec compliance stage encountered an error: ${errorDetails.message}`,
+        ['Fix the review model/provider setup and rerun spec compliance checks'],
+      );
     }
   }
 
@@ -856,12 +899,10 @@ ${diff.slice(0, 50000)}
       const responseText = await this.callReviewModel(systemPrompt, userMessage, config, reviewProvider);
       const parsed = this.parseJsonObject(responseText);
       if (!parsed || !Array.isArray(parsed.traceability)) {
-        return {
-          score: 70,
-          passed: true,
-          issues: ['Traceability review returned an unexpected response format'],
-          suggestions: ['Add explicit requirement ID references near implementation and tests'],
-        };
+        return this.createStageFailureResult(
+          'Traceability review returned an unexpected response format',
+          ['Ensure the review model returns valid JSON and rerun traceability checks'],
+        );
       }
 
       const rows = parsed.traceability as Array<{
@@ -925,13 +966,12 @@ ${diff.slice(0, 50000)}
         suggestions,
       };
     } catch (err) {
-      qgLog.error('[QualityGates] Traceability review failed:', err);
-      return {
-        score: 80,
-        passed: true,
-        issues: ['Traceability stage encountered an error — manual review recommended'],
-        suggestions: [],
-      };
+      const errorDetails = this.serializeError(err);
+      qgLog.error('[QualityGates] Traceability review failed:', errorDetails);
+      return this.createStageFailureResult(
+        `Traceability stage encountered an error: ${errorDetails.message}`,
+        ['Fix the review model/provider setup and rerun traceability checks'],
+      );
     }
   }
 
@@ -983,12 +1023,10 @@ ${diff.slice(0, 50000)}
       const responseText = await this.callReviewModel(systemPrompt, userMessage, config, reviewProvider);
       const parsed = this.parseJsonObject(responseText);
       if (!parsed) {
-        return {
-          score: 70,
-          passed: true,
-          issues: ['Rollout safety review returned an unexpected response format'],
-          suggestions: ['Perform manual deployment-readiness review'],
-        };
+        return this.createStageFailureResult(
+          'Rollout safety review returned an unexpected response format',
+          ['Ensure the review model returns valid JSON and rerun rollout safety checks'],
+        );
       }
 
       const reviewScore = Math.max(0, Math.min(100, Number(parsed.score) || 75));
@@ -1022,13 +1060,12 @@ ${diff.slice(0, 50000)}
         suggestions,
       };
     } catch (err) {
-      qgLog.error('[QualityGates] Rollout safety review failed:', err);
-      return {
-        score: 80,
-        passed: true,
-        issues: ['Rollout safety stage encountered an error — manual review recommended'],
-        suggestions: [],
-      };
+      const errorDetails = this.serializeError(err);
+      qgLog.error('[QualityGates] Rollout safety review failed:', errorDetails);
+      return this.createStageFailureResult(
+        `Rollout safety stage encountered an error: ${errorDetails.message}`,
+        ['Fix the review model/provider setup and rerun rollout safety checks'],
+      );
     }
   }
 
@@ -1076,33 +1113,48 @@ ${diff.slice(0, 50000)}
       throw new Error('Moonshot API key not configured — required for quality gate reviews');
     }
 
-    const response = await fetch('https://api.moonshot.cn/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.1,
-        max_tokens: 2000,
-        response_format: { type: 'json_object' },
-      }),
-    });
+    const temperature = model.toLowerCase().includes('k2.5') ? 1 : 0.1;
+    const payload = {
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+      temperature,
+      max_tokens: 2000,
+    };
 
-    if (!response.ok) {
+    const endpoints = [
+      'https://api.moonshot.ai/v1/chat/completions',
+      'https://api.moonshot.cn/v1/chat/completions',
+    ];
+
+    let lastError = 'Unknown Moonshot API error';
+    for (const endpoint of endpoints) {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        const data = await response.json() as {
+          choices: Array<{ message: { content: string } }>;
+        };
+        return data.choices[0]?.message?.content || '{}';
+      }
+
       const errorText = await response.text();
-      throw new Error(`Moonshot API error (${response.status}): ${errorText}`);
+      lastError = `Moonshot API error (${response.status}) @ ${endpoint}: ${errorText}`;
+
+      // 401 is definitive for this key; stop retrying alternate host.
+      if (response.status === 401) break;
     }
 
-    const data = await response.json() as {
-      choices: Array<{ message: { content: string } }>;
-    };
-    return data.choices[0]?.message?.content || '{}';
+    throw new Error(lastError);
   }
 
   /**

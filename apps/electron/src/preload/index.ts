@@ -558,8 +558,8 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_COST, teamId),
   swapTeammateModel: (teamId: string, teammateId: string, newModel: string, newProvider: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_SWAP_MODEL, teamId, teammateId, newModel, newProvider),
-  onAgentTeamEvent: (callback: (event: import('@craft-agent/core/types').TeamActivityEvent) => void) => {
-    const handler = (_event: unknown, data: import('@craft-agent/core/types').TeamActivityEvent) => callback(data)
+  onAgentTeamEvent: (callback: (event: import('@craft-agent/core/types').TeamEvent) => void) => {
+    const handler = (_event: unknown, data: import('@craft-agent/core/types').TeamEvent) => callback(data)
     ipcRenderer.on(IPC_CHANNELS.AGENT_TEAMS_EVENT, handler)
     return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_TEAMS_EVENT, handler)
   },

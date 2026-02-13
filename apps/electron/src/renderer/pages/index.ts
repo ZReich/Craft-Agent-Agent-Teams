@@ -5,6 +5,7 @@
  */
 
 export { default as ChatPage } from './ChatPage'
+export { FocusPage } from './FocusPage'
 export { default as SourceInfoPage } from './SourceInfoPage'
 // Settings pages
 export {

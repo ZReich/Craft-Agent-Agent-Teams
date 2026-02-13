@@ -53,9 +53,9 @@ function getTeammateStatus(meta: SessionMeta | undefined): 'working' | 'idle' | 
 /** Status indicator dot color */
 function statusDotColor(status: 'working' | 'idle' | 'done'): string {
   switch (status) {
-    case 'working': return 'bg-amber-500 animate-pulse'
-    case 'done': return 'bg-green-500'
-    case 'idle': return 'bg-gray-400'
+    case 'working': return 'bg-info animate-pulse'
+    case 'done': return 'bg-success'
+    case 'idle': return 'bg-muted-foreground'
   }
 }
 
@@ -163,18 +163,18 @@ export function TeamStatusBar({
         <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
           {/* Summary counts */}
           {workingCount > 0 && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-info/10 text-info-text font-medium">
               {workingCount} working
             </span>
           )}
           {doneCount > 0 && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-green-500/10 text-green-600 dark:text-green-400">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-success/10 text-success-text font-medium">
               {doneCount} done
             </span>
           )}
 
           <span
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full"
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium"
             style={{ backgroundColor: `${teamColor}15`, color: teamColor }}
           >
             {teammates.length} teammate{teammates.length !== 1 ? 's' : ''}
@@ -243,7 +243,7 @@ export function TeamStatusBar({
       )}
 
       {showSpawnWarning && (
-        <div className="px-4 py-2 border-t border-border/50 text-xs text-amber-700 dark:text-amber-300 bg-amber-500/10">
+        <div className="px-4 py-2 border-t border-border/50 text-xs text-info-text bg-info/10">
           No teammates have spawned yet. If delegation is expected, ensure the lead agent calls Task (team_name optional).
         </div>
       )}
@@ -273,7 +273,7 @@ export function TeamStatusBar({
                   <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', statusDotColor(teammate.status))} />
                   {teammate.name}
                   {teammate.isProcessing && (
-                    <Loader2 className="h-3 w-3 animate-spin text-amber-500" />
+                    <Loader2 className="h-3 w-3 animate-spin text-info" />
                   )}
                 </button>
               ))}

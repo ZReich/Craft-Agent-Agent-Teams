@@ -15,4 +15,9 @@ describe('resolveReviewProvider', () => {
     expect(resolveReviewProvider('claude-opus-4-6')).toBe('anthropic');
     expect(resolveReviewProvider('claude-sonnet-4-5-20250929')).toBe('anthropic');
   });
+
+  it('does not let fallback override Claude model provider', () => {
+    expect(resolveReviewProvider('claude-opus-4-6', 'moonshot')).toBe('anthropic');
+    expect(resolveReviewProvider('claude-opus-4-6', 'openai')).toBe('anthropic');
+  });
 });

@@ -13,6 +13,7 @@ import type {
   ContentBadge,
   ToolDisplayMeta,
   SpecComplianceReport,
+  Spec,
 } from '@craft-agent/core/types';
 
 // Import mode types from dedicated subpath export (avoids pulling in SDK)
@@ -36,6 +37,7 @@ export type {
   ContentBadge,
   ToolDisplayMeta,
   SpecComplianceReport,
+  Spec,
 };
 
 // Import and re-export auth types for onboarding
@@ -126,6 +128,7 @@ import type {
   TeamActivityEvent,
   TeamActivityType,
   TeamCostSummary,
+  TeamEvent,
   QualityGateStageName,
   QualityGateStageResult,
   TestStageResult,
@@ -170,6 +173,7 @@ export type {
   TeamActivityEvent,
   TeamActivityType,
   TeamCostSummary,
+  TeamEvent,
 };
 
 
@@ -1390,7 +1394,7 @@ export interface ElectronAPI {
   updateTeamTask(teamId: string, taskId: string, status: string, assignee?: string): Promise<void>
   getTeamCost(teamId: string): Promise<TeamCostSummary>
   swapTeammateModel(teamId: string, teammateId: string, newModel: string, newProvider: string): Promise<AgentTeammate>
-  onAgentTeamEvent(callback: (event: TeamActivityEvent) => void): () => void
+  onAgentTeamEvent(callback: (event: TeamEvent) => void): () => void
   getTeamMessages(teamId: string): Promise<TeammateMessage[]>
   getTeamActivity(teamId: string): Promise<TeamActivityEvent[]>
   getTeamSpec(teamId: string): Promise<import('@craft-agent/core/types').Spec | undefined>
@@ -1610,6 +1614,21 @@ export interface SkillsNavigationState {
 }
 
 /**
+ * Focus navigation state - full-screen focused view with timeline and context
+ */
+export interface FocusNavigationState {
+  navigator: 'focus'
+  /** Selected session in focus mode */
+  details: { type: 'session'; sessionId: string }
+  /** Right context pane visibility */
+  contextPaneVisible?: boolean
+  /** Timeline drawer visibility */
+  timelineDrawerVisible?: boolean
+  /** Optional right sidebar panel state */
+  rightSidebar?: RightSidebarPanel
+}
+
+/**
  * Unified navigation state - single source of truth for all 3 panels
  *
  * From this state we can derive:
@@ -1622,6 +1641,7 @@ export type NavigationState =
   | SourcesNavigationState
   | SettingsNavigationState
   | SkillsNavigationState
+  | FocusNavigationState
 
 /**
  * Type guard to check if state is sessions navigation
@@ -1652,6 +1672,13 @@ export const isSkillsNavigation = (
 ): state is SkillsNavigationState => state.navigator === 'skills'
 
 /**
+ * Type guard to check if state is focus navigation
+ */
+export const isFocusNavigation = (
+  state: NavigationState
+): state is FocusNavigationState => state.navigator === 'focus'
+
+/**
  * Default navigation state - allSessions with no selection
  */
 export const DEFAULT_NAVIGATION_STATE: NavigationState = {
@@ -1679,7 +1706,10 @@ export const getNavigationStateKey = (state: NavigationState): string => {
   if (state.navigator === 'settings') {
     return `settings:${state.subpage}`
   }
-  // Chats
+  if (state.navigator === 'focus') {
+    return `focus/${state.details.sessionId}`
+  }
+  // Chats (SessionsNavigationState)
   const f = state.filter
   let base: string
   if (f.kind === 'state') base = `state:${f.stateId}`

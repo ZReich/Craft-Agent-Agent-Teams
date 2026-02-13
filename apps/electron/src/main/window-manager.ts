@@ -235,6 +235,29 @@ export class WindowManager {
       }
     })
 
+    // Dev resilience: if renderer crashes while agents are running, recover the UI
+    // in-place instead of letting the app silently end up with no visible windows.
+    window.webContents.on('render-process-gone', (_event, details) => {
+      windowLog.error('Renderer process gone:', details)
+
+      // "clean-exit" is intentional (normal close/navigation), no recovery needed.
+      if (details.reason === 'clean-exit') return
+      if (window.isDestroyed()) return
+
+      const query: Record<string, string> = { workspaceId }
+      if (focused) query.focused = 'true'
+
+      setTimeout(() => {
+        if (window.isDestroyed()) return
+        if (VITE_DEV_SERVER_URL) {
+          const params = new URLSearchParams(query).toString()
+          window.loadURL(`${VITE_DEV_SERVER_URL}?${params}`)
+        } else {
+          window.loadFile(join(__dirname, 'renderer/index.html'), { query })
+        }
+      }, 300)
+    })
+
     // If an initial deep link was provided, navigate to it after the window is ready
     if (initialDeepLink) {
       window.once('ready-to-show', () => {

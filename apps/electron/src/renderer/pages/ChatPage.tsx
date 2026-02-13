@@ -24,14 +24,19 @@ import { routes } from '@/lib/navigate'
 import { getPathBasename } from '@/lib/platform'
 import { ensureSessionMessagesLoadedAtom, loadedSessionsAtom, sessionAtomFamily, sessionMetaMapAtom, updateSessionMetaAtom, updateSessionAtom } from '@/atoms/sessions'
 import { getSessionTitle } from '@/utils/session'
-import type { AgentTeam, Session, TeamActivityEvent, TeamCostSummary, TeamTask, TeammateMessage } from '../../shared/types'
-import type { Spec, SpecComplianceReport } from '@craft-agent/core/types'
+import type { AgentTeam, Session, TeamActivityEvent, TeamCostSummary, TeamTask, TeammateMessage, TeammateMessageType, MessageRole } from '../../shared/types'
+import type { Spec, SpecComplianceReport, SpecRequirement } from '@craft-agent/core/types'
 // Model resolution: connection.defaultModel (no hardcoded defaults)
 import { resolveEffectiveConnectionSlug, isSessionConnectionUnavailable } from '@config/llm-connections'
 
 export interface ChatPageProps {
   sessionId: string
 }
+
+type SpecRequirementSummary = Pick<SpecRequirement, 'id' | 'description' | 'priority' | 'status' | 'linkedTaskIds' | 'linkedTestPatterns'>
+
+const mapMessageRoleToTeammateMessageType = (role: MessageRole): TeammateMessageType =>
+  role === 'plan' ? 'plan-submission' : 'message'
 
 const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   // Diagnostic: mark when component runs
@@ -285,14 +290,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const [teamMailboxMessages, setTeamMailboxMessages] = React.useState<TeammateMessage[]>([])
   const [teamStatus, setTeamStatus] = React.useState<AgentTeam | undefined>(undefined)
   const [teamSpec, setTeamSpec] = React.useState<Spec | undefined>(undefined)
-  const [specRequirements, setSpecRequirements] = React.useState<Array<{
-    id: string
-    description: string
-    priority: 'critical' | 'high' | 'medium' | 'low'
-    status: 'pending' | 'in-progress' | 'implemented' | 'verified'
-    linkedTaskIds?: string[]
-    linkedTestPatterns?: string[]
-  }>>([])
+  const [specRequirements, setSpecRequirements] = React.useState<SpecRequirementSummary[]>([])
   const [specTraceabilityMap, setSpecTraceabilityMap] = React.useState<Array<{
     requirementId: string
     files: string[]
@@ -300,6 +298,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     tasks: string[]
     tickets: string[]
   }>>([])
+  const lastTeamRealtimeEventAtRef = React.useRef(0)
+  const teamReloadTimerRef = React.useRef<number | null>(null)
 
   const specLabel = React.useMemo(() => {
     if (!teamSpec) return undefined
@@ -337,15 +337,18 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const teamMessages = React.useMemo<TeammateMessage[]>(() => {
     const sessionMessages = teamSessions.flatMap((teamSession) => (
       (teamSession.messages ?? [])
-        .filter((msg) => msg.role !== 'tool' && msg.role !== 'system')
-        .map((msg) => ({
-          id: msg.id,
-          from: teamSession.id,
-          to: teamSession.id,
-          content: msg.content,
-          timestamp: new Date(msg.timestamp).toISOString(),
-          type: msg.role === 'plan' ? 'plan-submission' : 'message',
-        }))
+        .filter((msg) => msg.role !== 'tool')
+        .map((msg): TeammateMessage => {
+          const messageType = mapMessageRoleToTeammateMessageType(msg.role)
+          return {
+            id: msg.id,
+            from: teamSession.id,
+            to: teamSession.id,
+            content: msg.content,
+            timestamp: new Date(msg.timestamp).toISOString(),
+            type: messageType,
+          }
+        })
     ))
 
     const combined = [...teamMailboxMessages, ...sessionMessages]
@@ -358,15 +361,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     const traceability = latestReport?.traceabilityMap ?? []
     const coverage = latestReport?.requirementsCoverage ?? []
 
-    const requirementMap = new Map<string, typeof coverage[number]>()
-    coverage.forEach((entry) => {
-      requirementMap.set(entry.requirementId, entry)
-    })
-
-    const requirements = (spec?.requirements?.length
+    const requirements: SpecRequirementSummary[] = spec?.requirements?.length
       ? spec.requirements.map((req) => {
-        const coverageEntry = requirementMap.get(req.id)
-        const trace = traceability.find(t => t.requirementId === req.id)
+        const trace = traceability.find((t) => t.requirementId === req.id)
         return {
           id: req.id,
           description: req.description,
@@ -376,15 +373,22 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
           linkedTestPatterns: trace?.tests ?? req.linkedTestPatterns,
         }
       })
-      : coverage.map((entry) => ({
-        id: entry.requirementId,
-        description: entry.notes || `Requirement ${entry.requirementId}`,
-        priority: 'medium' as const,
-        status: entry.coverage === 'full' ? 'verified' : entry.coverage === 'partial' ? 'in-progress' : 'pending',
-        linkedTaskIds: traceability.find(t => t.requirementId === entry.requirementId)?.tasks ?? [],
-        linkedTestPatterns: entry.referencedInTests ?? [],
-      }))
-    )
+      : coverage.map((entry) => {
+        const trace = traceability.find((t) => t.requirementId === entry.requirementId)
+        const status: SpecRequirementSummary['status'] = entry.coverage === 'full'
+          ? 'verified'
+          : entry.coverage === 'partial'
+            ? 'in-progress'
+            : 'pending'
+        return {
+          id: entry.requirementId,
+          description: entry.notes || `Requirement ${entry.requirementId}`,
+          priority: 'medium',
+          status,
+          linkedTaskIds: trace?.tasks ?? [],
+          linkedTestPatterns: entry.referencedInTests ?? [],
+        }
+      })
 
     const traceabilityMap = traceability.length > 0
       ? traceability
@@ -430,6 +434,14 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     }
   }, [session?.teamId, session?.sddComplianceReports, deriveSpecData])
 
+  const scheduleTeamDataReload = React.useCallback((delayMs = 800) => {
+    if (teamReloadTimerRef.current) return
+    teamReloadTimerRef.current = window.setTimeout(() => {
+      teamReloadTimerRef.current = null
+      void loadTeamData()
+    }, delayMs)
+  }, [loadTeamData])
+
   React.useEffect(() => {
     if (!showTeamDashboard || !session?.teamId) return
     setTeamActivityEvents([])
@@ -440,17 +452,25 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 
     let isActive = true
     const refreshInterval = window.setInterval(() => {
-      if (isActive) void loadTeamData()
-    }, 15000)
+      if (!isActive) return
+      const sinceLastRealtime = Date.now() - lastTeamRealtimeEventAtRef.current
+      // Fallback safety sync only when realtime has been quiet for a while.
+      if (sinceLastRealtime > 45000) {
+        void loadTeamData()
+      }
+    }, 60000)
 
     const cleanup = window.electronAPI.onAgentTeamEvent?.((event) => {
       if (!isActive) return
       if (event.teamId && event.teamId !== session.teamId) return
-      setTeamActivityEvents((prev) => [...prev, event])
-      if (event.type.startsWith('task-')) {
-        void loadTeamData()
+      lastTeamRealtimeEventAtRef.current = Date.now()
+      if (event.type === 'activity:logged') {
+        setTeamActivityEvents((prev) => [...prev, event.payload.activity].slice(-1500))
       }
-      if (event.type === 'message-sent') {
+      if (event.type.startsWith('task:')) {
+        scheduleTeamDataReload()
+      }
+      if (event.type === 'message:sent' && session.teamId) {
         void window.electronAPI.getTeamMessages(session.teamId).then(setTeamMailboxMessages)
       }
     })
@@ -458,9 +478,13 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     return () => {
       isActive = false
       window.clearInterval(refreshInterval)
+      if (teamReloadTimerRef.current) {
+        window.clearTimeout(teamReloadTimerRef.current)
+        teamReloadTimerRef.current = null
+      }
       cleanup?.()
     }
-  }, [showTeamDashboard, session?.teamId, teamSessionIds, ensureMessagesLoaded, loadTeamData])
+  }, [showTeamDashboard, session?.teamId, teamSessionIds, ensureMessagesLoaded, loadTeamData, scheduleTeamDataReload])
 
   React.useEffect(() => {
     if (!showTeamDashboard) return
@@ -899,3 +923,4 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 })
 
 export default ChatPage
+
