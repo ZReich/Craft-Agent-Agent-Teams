@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useAction, useActionLabel } from "@/actions"
 import { formatDistanceToNow, formatDistanceToNowStrict, isToday, isYesterday, format, startOfDay } from "date-fns"
 import type { Locale } from "date-fns"
-import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive, ChevronDown, ChevronRight, Users } from "lucide-react"
+import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive,  Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
@@ -161,31 +161,22 @@ interface TeamGroupProps {
 }
 
 function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSessionItem }: TeamGroupProps) {
-  const teamId = lead.teamId || lead.id
   const teamColor = lead.teamColor || '#7c3aed'
-
-  // Expanded only when not collapsed.
-  // This allows older active teams to stay minimized when a new team is spawned.
-  const isManuallyCollapsed = collapsedTeams.has(teamId)
-  const isExpanded = !isManuallyCollapsed
 
   const workingCount = teammates.filter(t => t.isProcessing).length
   const doneCount = teammates.filter(t => !t.isProcessing).length
 
   return (
     <div className="team-group">
-      {/* Team lead row with collapse toggle */}
+      {/* Team lead — only entry shown in sidebar. Teammates visible in dashboard only. */}
       <div
         style={{ borderLeft: `4px solid ${teamColor}`, backgroundColor: `${teamColor}08` }}
       >
-        {/* Collapse toggle bar */}
-        <button
-          type="button"
-          onClick={() => onToggleCollapse(teamId)}
-          className="w-full flex items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+        {/* Team status bar (non-interactive, just shows stats) */}
+        <div
+          className="w-full flex items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground"
           style={{ color: teamColor }}
         >
-          {isExpanded ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />}
           <Users className="h-3 w-3 shrink-0" />
           <span className="font-medium">Team</span>
           <span className="text-muted-foreground mx-0.5">&middot;</span>
@@ -201,24 +192,10 @@ function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSe
               All done
             </span>
           )}
-        </button>
+        </div>
         {/* Lead session item */}
         {renderSessionItem(lead, true)}
       </div>
-
-      {/* Teammate sessions — collapsible */}
-      {isExpanded && teammates.length > 0 && (
-        <div
-          className="ml-3"
-          style={{ borderLeft: `2px solid ${teamColor}30` }}
-        >
-          {teammates.map((teammate, idx) => (
-            <div key={teammate.id}>
-              {renderSessionItem(teammate, idx === 0)}
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   )
 }

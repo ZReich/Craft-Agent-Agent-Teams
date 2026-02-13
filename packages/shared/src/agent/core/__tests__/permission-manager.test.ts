@@ -4,30 +4,37 @@
  * Tests the centralized permission evaluation system used by both
  * ClaudeAgent and CodexAgent.
  */
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { PermissionManager } from '../permission-manager.ts';
-import { initializeModeState, cleanupModeState } from '../../mode-manager.ts';
+import { cleanupModeState } from '../../mode-manager.ts';
 
-// Test session ID
-const TEST_SESSION_ID = 'test-session-12345';
+// Test session ID base (actual ID is randomized per test to avoid cross-suite bleed)
+const TEST_SESSION_ID_BASE = 'test-session-12345';
 
 describe('PermissionManager', () => {
   let permissionManager: PermissionManager;
+  let testSessionId: string;
 
   beforeEach(() => {
-    // Clean up any previous mode state
-    cleanupModeState(TEST_SESSION_ID);
+    testSessionId = `${TEST_SESSION_ID_BASE}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Initialize mode state for test session
-    initializeModeState(TEST_SESSION_ID, 'ask');
+    // Clean up any previous mode state
+    cleanupModeState(testSessionId);
 
     // Create a fresh PermissionManager
     permissionManager = new PermissionManager({
       workspaceId: 'test-workspace',
-      sessionId: TEST_SESSION_ID,
+      sessionId: testSessionId,
       workingDirectory: '/test/workspace',
       plansFolderPath: '/test/workspace/plans',
     });
+
+    // Ensure deterministic starting mode for each test
+    permissionManager.setPermissionMode('ask');
+  });
+
+  afterEach(() => {
+    cleanupModeState(testSessionId);
   });
 
   describe('Permission Mode Management', () => {
@@ -193,7 +200,7 @@ describe('PermissionManager', () => {
     });
 
     it('should return the session ID', () => {
-      expect(permissionManager.getSessionId()).toBe(TEST_SESSION_ID);
+      expect(permissionManager.getSessionId()).toBe(testSessionId);
     });
   });
 });

@@ -5,6 +5,7 @@
  */
 
 import type { AgentEvent } from '@craft-agent/core/types';
+import { randomUUID } from 'node:crypto';
 import type { BackendConfig, ChatOptions } from '../backend/types.ts';
 import { AbortReason } from '../backend/types.ts';
 import type { Workspace } from '../../config/storage.ts';
@@ -38,7 +39,7 @@ export function createMockWorkspace(overrides: Partial<Workspace> = {}): Workspa
  */
 export function createMockSession(overrides: Partial<Session> = {}): Session {
   return {
-    id: 'test-session-id',
+    id: `test-session-${randomUUID()}`,
     name: 'Test Session',
     workspaceRootPath: '/test/workspace',
     createdAt: Date.now(),

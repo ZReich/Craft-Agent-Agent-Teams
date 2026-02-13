@@ -7,23 +7,19 @@ import { HookSystem } from './hook-system.ts';
 import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-
-// Mock command-executor to avoid real shell execution
-vi.mock('./command-executor.ts', () => ({
-  executeCommand: vi.fn().mockResolvedValue({ success: true, stdout: 'ok', stderr: '', blocked: false }),
-  resolvePermissionsConfig: vi.fn().mockReturnValue({}),
-}));
-
-import { executeCommand } from './command-executor.ts';
-const mockedExecuteCommand = vi.mocked(executeCommand);
+import * as commandExecutor from './command-executor.ts';
 
 describe('HookSystem.buildSdkHooks', () => {
   let testDir: string;
+  let mockedExecuteCommand: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     testDir = join(tmpdir(), `buildSdkHooks-test-${Date.now()}`);
     mkdirSync(testDir, { recursive: true });
     vi.clearAllMocks();
+    mockedExecuteCommand = vi
+      .spyOn(commandExecutor, 'executeCommand')
+      .mockResolvedValue({ success: true, stdout: 'ok', stderr: '', blocked: false });
   });
 
   afterEach(() => {
@@ -129,7 +125,7 @@ describe('HookSystem.buildSdkHooks', () => {
     const hookFn = result.PreToolUse![0]!.hooks[0]!;
 
     const hookResult = await hookFn(
-      { tool_name: 'Bash' },
+      { hook_event_name: 'PreToolUse', tool_name: 'Bash' },
       'tool-use-123',
       { signal: undefined }
     );
@@ -159,7 +155,7 @@ describe('HookSystem.buildSdkHooks', () => {
     const result = system.buildSdkHooks();
     const hookFn = result.PreToolUse![0]!.hooks[0]!;
 
-    await hookFn({ tool_name: 'Bash' }, 'tool-use-123', { signal: undefined });
+    await hookFn({ hook_event_name: 'PreToolUse', tool_name: 'Bash' }, 'tool-use-123', { signal: undefined });
 
     expect(mockedExecuteCommand).toHaveBeenCalledWith('echo safe', expect.objectContaining({
       permissionMode: 'safe',
@@ -180,7 +176,7 @@ describe('HookSystem.buildSdkHooks', () => {
     const hookFn = result.PreToolUse![0]!.hooks[0]!;
 
     const hookResult = await hookFn(
-      { tool_name: 'Bash' },
+      { hook_event_name: 'PreToolUse', tool_name: 'Bash' },
       'tool-use-123',
       { signal: undefined }
     );

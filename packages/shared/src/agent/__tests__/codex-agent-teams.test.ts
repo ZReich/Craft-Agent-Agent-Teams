@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
 
 // Mock mode-manager — its transitive dep on incr-regex-package fails under
 // Node 22 CJS/ESM interop (incr-regex-package is CJS in packages/shared/node_modules,
@@ -74,6 +74,12 @@ async function callPreToolUse(agent: CodexAgent, params: Record<string, unknown>
 }
 
 describe('CodexAgent agent teams interception', () => {
+  afterAll(() => {
+    vi.doUnmock('../mode-manager.ts');
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
   // ──────────────────────────────────────────────
   // 1. Task spawn via raw toolName (custom type)
   // ──────────────────────────────────────────────

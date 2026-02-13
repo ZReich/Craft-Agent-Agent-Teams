@@ -5,7 +5,7 @@
  * Tests model/thinking configuration, permission mode, source management,
  * and lifecycle management.
  */
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   TestAgent,
   createMockBackendConfig,

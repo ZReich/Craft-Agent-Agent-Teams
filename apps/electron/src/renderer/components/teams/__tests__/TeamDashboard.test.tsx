@@ -11,8 +11,12 @@
  * @vitest-environment jsdom
  */
 
-import { describe, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, within, cleanup, act } from '@testing-library/react';
+import { describe, it, vi, beforeEach, afterEach, expect } from 'vitest';
+import * as matchers from '@testing-library/jest-dom/matchers';
+import { render, screen, fireEvent, within, cleanup, act, waitFor } from '@testing-library/react';
+
+// Extend expect with jest-dom matchers (explicit wiring for fork worker reliability)
+expect.extend(matchers);
 import { Provider, createStore } from 'jotai';
 import { sessionMetaMapAtom } from '@/atoms/sessions';
 import { TeamDashboard, type TeamDashboardProps } from '../TeamDashboard';
@@ -26,6 +30,20 @@ vi.mock('react-pdf', () => ({
   pdfjs: { GlobalWorkerOptions: {} },
 }));
 vi.mock('pdfjs-dist/build/pdf.mjs', () => ({}));
+
+// Mock useTeamEvents hook to avoid the @craft-agent/core/types transitive import tree
+// that causes vitest fork workers to crash on Windows (OOM in child_process)
+vi.mock('@/hooks/useTeamEvents', () => ({
+  useTeamStateSync: () => ({
+    status: 'disconnected' as const,
+    lastEvent: null,
+    sequence: 0,
+    on: vi.fn(),
+    off: vi.fn(),
+    reconnect: vi.fn(),
+    isSubscribed: false,
+  }),
+}));
 
 // Mock DOMMatrix
 if (!globalThis.DOMMatrix) {
@@ -218,6 +236,19 @@ describe('TeamDashboard - Phase 1 Tests', () => {
     return { ...utils, store };
   }
 
+  async function switchToFocusView() {
+    const focusTab = screen.getByRole('tab', { name: /Focus View/i });
+    await waitFor(() => expect(focusTab).not.toBeDisabled());
+    fireEvent.click(focusTab);
+
+    if (!screen.queryByRole('button', { name: /^Teammate$/i })) {
+      const leadCard = screen.getByRole('button', { name: /Lead Agent/i });
+      fireEvent.click(leadCard);
+    }
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Teammate$/i })).toBeInTheDocument());
+  }
+
   describe('Empty State Rendering', () => {
     it('shows empty state when session has no teamId', () => {
       const session = createMockSession({ teamId: undefined, isTeamLead: false });
@@ -278,7 +309,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
   });
 
   describe('Routing State - Tab Switching', () => {
-    it('defaults to teammate tab on render', () => {
+    it('defaults to teammate tab on render', async () => {
       const session = createMockSession();
 
       const teammates = [
@@ -291,12 +322,14 @@ describe('TeamDashboard - Phase 1 Tests', () => {
         initialSessionMeta: metaMap,
       });
 
+      // Team dashboard defaults to Command Center; switch to focus to inspect tab state
+      await switchToFocusView();
       const teammateTab = screen.getByRole('button', { name: /^Teammate$/i });
       expect(teammateTab).toHaveClass(/bg-foreground/); // Active tab styling
     });
 
     
-    it('switches to focus view and displays tabs', () => {
+    it('switches to focus view and displays tabs', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -310,8 +343,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       });
 
       // Switch to focus view
-      const focusButton = screen.getByRole('button', { name: /Focus View/i });
-      fireEvent.click(focusButton);
+      await switchToFocusView();
 
       // Now tabs should be visible
       expect(screen.getByRole('button', { name: /^Teammate$/i })).toBeInTheDocument();
@@ -319,7 +351,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
     });
 
 
-    it('switches to activity tab when clicked', () => {
+    it('switches to activity tab when clicked', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -344,7 +376,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view first
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Then switch to activity tab
       const activityTab = screen.getByRole('button', { name: /Activity/i });
@@ -354,7 +386,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(screen.getByTestId('activity-feed')).toBeInTheDocument();
     });
 
-    it('switches to spec coverage tab when clicked', () => {
+    it('switches to spec coverage tab when clicked', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -368,7 +400,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view first
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Then switch to spec coverage tab
       const specTab = screen.getByRole('button', { name: /Spec Coverage/i });
@@ -378,7 +410,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(screen.getByTestId('spec-coverage')).toBeInTheDocument();
     });
 
-    it('switches to traceability tab when clicked', () => {
+    it('switches to traceability tab when clicked', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -392,7 +424,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view first
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Then switch to traceability tab
       const traceabilityTab = screen.getByRole('button', { name: /Traceability/i });
@@ -402,7 +434,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(screen.getByTestId('traceability')).toBeInTheDocument();
     });
 
-    it('maintains tab state across re-renders', () => {
+    it('maintains tab state across re-renders', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -415,7 +447,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Switch to activity tab
       const activityTab = screen.getByRole('button', { name: /Activity/i });
@@ -439,7 +471,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
   });
 
   describe('Card Render Behavior - Teammate Display', () => {
-    it('renders all teammates from session metadata', () => {
+    it('renders all teammates from session metadata', async () => {
       const session = createMockSession({
         teammateSessionIds: ['teammate-1', 'teammate-2', 'teammate-3'],
       });
@@ -459,7 +491,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see sidebar
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       const sidebar = screen.getByTestId('teammate-sidebar');
       teammates.forEach(teammate => {
@@ -467,7 +499,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       });
     });
 
-    it('correctly identifies and displays the lead teammate', () => {
+    it('correctly identifies and displays the lead teammate', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -482,7 +514,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see sidebar
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Lead should be rendered first
       const sidebar = screen.getByTestId('teammate-sidebar');
@@ -490,7 +522,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(teammateButtons[0]).toHaveTextContent('Lead Agent');
     });
 
-    it('displays teammate status correctly', () => {
+    it('displays teammate status correctly', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -548,7 +580,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see sidebar
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       const sidebar = screen.getByTestId('teammate-sidebar');
       expect(within(sidebar).getByTestId('teammate-teammate-1')).toBeInTheDocument();
@@ -557,7 +589,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
   });
 
   describe('No-Duplication Assertions', () => {
-    it('ensures each teammate appears exactly once in the sidebar', () => {
+    it('ensures each teammate appears exactly once in the sidebar', async () => {
       const session = createMockSession({
         teammateSessionIds: ['teammate-1', 'teammate-2'],
       });
@@ -576,7 +608,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see sidebar
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       const sidebar = screen.getByTestId('teammate-sidebar');
       const teammateButtons = within(sidebar).getAllByRole('button');
@@ -590,7 +622,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(uniqueNames.size).toBe(names.length);
     });
 
-    it('does not duplicate teammates when session metadata updates', () => {
+    it('does not duplicate teammates when session metadata updates', async () => {
       const session = createMockSession({
         teammateSessionIds: ['teammate-1'],
       });
@@ -608,7 +640,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see sidebar
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Update metadata for teammate-1 (simulating status change)
       const updatedMetaMap = new Map(metaMap);
@@ -622,6 +654,8 @@ describe('TeamDashboard - Phase 1 Tests', () => {
         store.set(sessionMetaMapAtom, updatedMetaMap);
       });
 
+      // Focus view contains the teammate sidebar
+      await switchToFocusView();
       const sidebar = screen.getByTestId('teammate-sidebar');
       const teammateButtons = within(sidebar).getAllByRole('button');
 
@@ -634,7 +668,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(uniqueIds.size).toBe(ids.length);
     });
 
-    it('does not show duplicate teammates when teammate list includes lead session', () => {
+    it('does not show duplicate teammates when teammate list includes lead session', async () => {
       const session = createMockSession({
         id: 'session-1',
         teammateSessionIds: ['teammate-1', 'session-1'], // Incorrectly includes self
@@ -653,7 +687,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see sidebar
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       const sidebar = screen.getByTestId('teammate-sidebar');
       const leadButtons = within(sidebar).getAllByText('Lead Agent');
@@ -714,7 +748,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
   });
 
   describe('Compact Sidebar Mode', () => {
-    it('starts with normal sidebar in focus view', () => {
+    it('starts with normal sidebar in focus view', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -728,7 +762,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       // Initially shows normal sidebar in focus view
       expect(screen.getByTestId('teammate-sidebar')).toBeInTheDocument();
@@ -737,7 +771,7 @@ describe('TeamDashboard - Phase 1 Tests', () => {
   });
 
   describe('Activity Events Display', () => {
-    it('shows activity event count in tab badge', () => {
+    it('shows activity event count in tab badge', async () => {
       const session = createMockSession();
       const teammates = [
         createMockTeammate('session-1', 'Lead Agent', true),
@@ -777,10 +811,13 @@ describe('TeamDashboard - Phase 1 Tests', () => {
 
       
       // Switch to focus view to see tabs
-      fireEvent.click(screen.getByRole('button', { name: /Focus View/i }));
+      await switchToFocusView();
 
       const activityTab = screen.getByRole('button', { name: /Activity/i });
       expect(activityTab).toHaveTextContent('3');
     });
   });
 });
+
+
+

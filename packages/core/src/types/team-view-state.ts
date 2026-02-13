@@ -7,7 +7,16 @@
  * Phase 1: Foundations for dashboard state management
  */
 
-import type { AgentTeam, AgentTeammate, TeamTask, TeammateMessage, TeamActivityEvent, TeamCostSummary } from './agent-teams.ts';
+import type {
+  AgentTeam,
+  AgentTeammate,
+  TeamTask,
+  TeammateMessage,
+  TeamActivityEvent,
+  TeamCostSummary,
+  TeamTaskStatus,
+  TeamActivityType,
+} from './agent-teams.ts';
 
 // ============================================================
 // Dashboard View Configuration
@@ -25,7 +34,7 @@ export interface TaskFilter {
   /** Show only tasks assigned to a specific teammate */
   assignee?: string;
   /** Show only tasks with these statuses */
-  statuses?: Array<'pending' | 'in_progress' | 'completed' | 'blocked' | 'failed'>;
+  statuses?: TeamTaskStatus[];
   /** Search query for task title/description */
   search?: string;
 }
@@ -37,7 +46,7 @@ export interface ActivityFilter {
   /** Show only activities from a specific teammate */
   teammateId?: string;
   /** Show only specific activity types */
-  types?: string[];
+  types?: TeamActivityType[];
   /** Time range for activities (ISO timestamps) */
   since?: string;
 }

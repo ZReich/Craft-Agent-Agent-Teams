@@ -7,7 +7,7 @@
  * - Handle malformed JSON gracefully
  */
 
-import { describe, test, expect, beforeEach, mock, spyOn } from 'bun:test';
+import { describe, test, expect, beforeEach, vi } from 'vitest';
 import {
   SourceCredentialManager,
   isMultiHeaderCredential,
@@ -41,12 +41,9 @@ function createMockSource(overrides: Partial<FolderSourceConfig> = {}): LoadedSo
 
 describe('getApiCredential with multi-header sources', () => {
   let credManager: SourceCredentialManager;
-  let mockGet: ReturnType<typeof mock>;
-
   beforeEach(() => {
     credManager = new SourceCredentialManager();
-    // Reset mocks
-    mockGet = mock(() => null);
+    vi.clearAllMocks();
   });
 
   test('should return MultiHeaderCredential when source has headerNames and credential is valid JSON', async () => {
@@ -65,7 +62,7 @@ describe('getApiCredential with multi-header sources', () => {
     });
 
     // Mock the credential manager's load method
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue({
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue({
       value: storedCredential,
     });
 
@@ -89,7 +86,7 @@ describe('getApiCredential with multi-header sources', () => {
       },
     });
 
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue({
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue({
       value: 'simple-api-key',
     });
 
@@ -116,7 +113,7 @@ describe('getApiCredential with multi-header sources', () => {
       // Missing DD-APPLICATION-KEY
     });
 
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue({
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue({
       value: storedCredential,
     });
 
@@ -138,7 +135,7 @@ describe('getApiCredential with multi-header sources', () => {
     });
 
     // Malformed JSON - not valid
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue({
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue({
       value: 'not-valid-json{{{',
     });
 
@@ -159,7 +156,7 @@ describe('getApiCredential with multi-header sources', () => {
       },
     });
 
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue(null);
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue(null);
 
     const result = await credManager.getApiCredential(source);
 
@@ -177,7 +174,7 @@ describe('getApiCredential with multi-header sources', () => {
       },
     });
 
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue({
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue({
       value: '',
     });
 
@@ -209,7 +206,7 @@ describe('getApiCredential basic auth parsing', () => {
       password: 'testpass',
     });
 
-    const loadSpy = spyOn(credManager, 'load').mockResolvedValue({
+    const loadSpy = vi.spyOn(credManager, 'load').mockResolvedValue({
       value: storedCredential,
     });
 

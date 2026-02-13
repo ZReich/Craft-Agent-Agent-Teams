@@ -186,6 +186,69 @@ export class QualityGateRunner {
     };
   }
 
+  private createStageSkippedResult(reason: string, suggestions: string[] = []): QualityGateStageResult {
+    return {
+      score: 100,
+      passed: true,
+      issues: [],
+      suggestions: [reason, ...suggestions],
+    };
+  }
+
+  private async hasReviewProviderAccess(reviewProvider: ReviewProvider): Promise<boolean> {
+    if (reviewProvider === 'moonshot') {
+      return Boolean(await this.apiKeyProvider.getMoonshotApiKey());
+    }
+    if (reviewProvider === 'openai') {
+      const cfg = await this.apiKeyProvider.getOpenAiConfig();
+      return Boolean(cfg?.apiKey);
+    }
+    return Boolean(await this.apiKeyProvider.getAnthropicApiKey());
+  }
+
+  private isModelCompatibleWithProvider(model: string, provider: ReviewProvider): boolean {
+    const lower = model.toLowerCase();
+    if (provider === 'moonshot') return lower.startsWith('kimi-');
+    if (provider === 'openai') return lower.startsWith('gpt-') || lower.startsWith('openai/');
+    return lower.startsWith('claude-') || lower.startsWith('anthropic/');
+  }
+
+  private getFallbackReviewModel(provider: ReviewProvider, preferredModel: string): string {
+    if (this.isModelCompatibleWithProvider(preferredModel, provider)) {
+      return preferredModel;
+    }
+    if (provider === 'moonshot') return 'kimi-k2.5';
+    if (provider === 'openai') return 'gpt-5';
+    return 'claude-sonnet-4-5-20250929';
+  }
+
+  private async resolveReviewExecutionConfig(
+    preferredProvider: ReviewProvider,
+    preferredModel: string,
+  ): Promise<{ provider: ReviewProvider; model: string; warning?: string } | { error: string }> {
+    if (await this.hasReviewProviderAccess(preferredProvider)) {
+      return {
+        provider: preferredProvider,
+        model: this.getFallbackReviewModel(preferredProvider, preferredModel),
+      };
+    }
+
+    const fallbackOrder: ReviewProvider[] = ['moonshot', 'anthropic', 'openai'];
+    for (const candidate of fallbackOrder) {
+      if (candidate === preferredProvider) continue;
+      if (await this.hasReviewProviderAccess(candidate)) {
+        const candidateModel = this.getFallbackReviewModel(candidate, preferredModel);
+        return {
+          provider: candidate,
+          model: candidateModel,
+          warning: `Preferred review provider "${preferredProvider}" is unavailable; falling back to "${candidate}" with model "${candidateModel}".`,
+        };
+      }
+    }
+
+    return { error: 'No review provider credentials are configured (Moonshot, Anthropic, or OpenAI).' };
+  }
+
   private async validateReviewProviderAccess(reviewProvider: ReviewProvider): Promise<string | null> {
     if (reviewProvider === 'moonshot') {
       const key = await this.apiKeyProvider.getMoonshotApiKey();
@@ -211,7 +274,10 @@ export class QualityGateRunner {
     spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>,
   ): Promise<QualityGateResult> {
     qgLog.info('[QualityGates] Starting pipeline run');
-    const reviewProvider = resolveReviewProvider(config.reviewModel, config.reviewProvider);
+    const preferredReviewProvider = resolveReviewProvider(config.reviewModel, config.reviewProvider);
+    let activeReviewProvider = preferredReviewProvider;
+    let activeReviewModel = config.reviewModel;
+    let resultConfig: QualityGateConfig = config;
     const activeSpec = spec ?? taskContext.spec;
 
     const stages: QualityGateResult['stages'] = {
@@ -238,11 +304,11 @@ export class QualityGateRunner {
     // Early exit if binary gates fail — no point running AI reviews
     if (config.stages.syntax.enabled && !stages.syntax.passed) {
       qgLog.info('[QualityGates] Syntax check failed, skipping AI reviews');
-      return this.buildResult(stages, config, reviewProvider);
+      return this.buildResult(stages, resultConfig, activeReviewProvider);
     }
     if (config.stages.tests.enabled && !stages.tests.passed) {
       qgLog.info('[QualityGates] Tests failed, skipping AI reviews');
-      return this.buildResult(stages, config, reviewProvider);
+      return this.buildResult(stages, resultConfig, activeReviewProvider);
     }
 
     // TDD enforcement: if enabled and task is a feature, check test-first discipline
@@ -253,7 +319,7 @@ export class QualityGateRunner {
         qgLog.info('[QualityGates] TDD enforcement failed — no test files in diff');
         // Inject TDD failure into the completeness stage
         stages.completeness = tddResult;
-        return this.buildResult(stages, config, reviewProvider);
+        return this.buildResult(stages, resultConfig, activeReviewProvider);
       }
     }
 
@@ -261,37 +327,47 @@ export class QualityGateRunner {
     type AIReviewStage = 'architecture' | 'simplicity' | 'errors' | 'completeness';
     const aiStages: AIReviewStage[] = ['architecture', 'simplicity', 'errors', 'completeness'];
     const enabledAiStages = aiStages.filter(s => config.stages[s].enabled);
+    let aiReviewUnavailable = false;
+    let aiUnavailableReason: string | null = null;
 
     if (enabledAiStages.length > 0) {
-      const providerAccessError = await this.validateReviewProviderAccess(reviewProvider);
-      if (providerAccessError) {
-        qgLog.error('[QualityGates] Review provider preflight failed:', providerAccessError);
+      const executionConfig = await this.resolveReviewExecutionConfig(preferredReviewProvider, config.reviewModel);
+      if ('error' in executionConfig) {
+        qgLog.error('[QualityGates] Review provider preflight failed:', executionConfig.error);
+        aiReviewUnavailable = true;
+        aiUnavailableReason = executionConfig.error;
         for (const stage of enabledAiStages) {
-          stages[stage] = this.createStageFailureResult(
-            providerAccessError,
-            ['Configure valid credentials for the selected model/provider and retry quality gates'],
+          stages[stage] = this.createStageSkippedResult(
+            executionConfig.error,
+            ['Configure valid credentials for Moonshot, Anthropic, or OpenAI to enable AI review stages'],
           );
         }
-        return this.buildResult(stages, config, reviewProvider);
-      }
+      } else {
+        activeReviewProvider = executionConfig.provider;
+        activeReviewModel = executionConfig.model;
+        resultConfig = { ...config, reviewModel: activeReviewModel, reviewProvider: activeReviewProvider };
+        if (executionConfig.warning) {
+          qgLog.warn(`[QualityGates] ${executionConfig.warning}`);
+        }
 
-      qgLog.info(`[QualityGates] Running ${enabledAiStages.length} AI review stages in parallel`);
-      const aiResults = await Promise.allSettled(
-        enabledAiStages.map(stage => this.runAIReview(stage, diff, taskContext, config, reviewProvider))
-      );
+        qgLog.info(`[QualityGates] Running ${enabledAiStages.length} AI review stages in parallel`);
+        const aiResults = await Promise.allSettled(
+          enabledAiStages.map(stage => this.runAIReview(stage, diff, taskContext, resultConfig, activeReviewProvider))
+        );
 
-      for (let i = 0; i < enabledAiStages.length; i++) {
-        const stageName = enabledAiStages[i];
-        const result = aiResults[i];
-        if (result.status === 'fulfilled') {
-          stages[stageName] = result.value;
-        } else {
-          const errorDetails = this.serializeError(result.reason);
-          qgLog.error(`[QualityGates] AI review stage "${stageName}" failed:`, errorDetails);
-          stages[stageName] = this.createStageFailureResult(
-            `AI review stage "${stageName}" failed: ${errorDetails.message}`,
-            ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
-          );
+        for (let i = 0; i < enabledAiStages.length; i++) {
+          const stageName = enabledAiStages[i];
+          const result = aiResults[i];
+          if (result.status === 'fulfilled') {
+            stages[stageName] = result.value;
+          } else {
+            const errorDetails = this.serializeError(result.reason);
+            qgLog.error(`[QualityGates] AI review stage "${stageName}" failed:`, errorDetails);
+            stages[stageName] = this.createStageFailureResult(
+              `AI review stage "${stageName}" failed: ${errorDetails.message}`,
+              ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
+            );
+          }
         }
       }
     }
@@ -300,12 +376,35 @@ export class QualityGateRunner {
     if (activeSpec && activeSpec.requirements.length > 0) {
       qgLog.info('[QualityGates] Running SDD review stages');
 
+      if (aiReviewUnavailable) {
+        const reason = aiUnavailableReason ?? 'AI review stages unavailable due to missing provider credentials';
+        if (config.stages.spec_compliance.enabled) {
+          stages.spec_compliance = this.createStageSkippedResult(
+            reason,
+            ['Configure review model credentials to run spec compliance checks'],
+          );
+        }
+        if (config.stages.traceability.enabled) {
+          stages.traceability = this.createStageSkippedResult(
+            reason,
+            ['Configure review model credentials to run traceability checks'],
+          );
+        }
+        if (config.stages.rollout_safety.enabled) {
+          stages.rollout_safety = this.createStageSkippedResult(
+            reason,
+            ['Configure review model credentials to run rollout safety checks'],
+          );
+        }
+        return this.buildResult(stages, resultConfig, activeReviewProvider);
+      }
+
       if (config.stages.spec_compliance.enabled) {
-        stages.spec_compliance = await this.runSpecComplianceReview(diff, taskContext, activeSpec, config, reviewProvider);
+        stages.spec_compliance = await this.runSpecComplianceReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
       }
 
       if (config.stages.traceability.enabled) {
-        stages.traceability = await this.runTraceabilityReview(diff, taskContext, activeSpec, config, reviewProvider);
+        stages.traceability = await this.runTraceabilityReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
       }
 
       const shouldRunRolloutSafety =
@@ -313,13 +412,31 @@ export class QualityGateRunner {
         Boolean(activeSpec.rolloutPlan || activeSpec.rollbackPlan || activeSpec.observabilityPlan);
 
       if (shouldRunRolloutSafety) {
-        stages.rollout_safety = await this.runRolloutSafetyReview(diff, taskContext, activeSpec, config, reviewProvider);
+        stages.rollout_safety = await this.runRolloutSafetyReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
       }
     } else {
       qgLog.info('[QualityGates] No spec provided; skipping SDD review stages');
     }
 
-    return this.buildResult(stages, config, reviewProvider);
+    return this.buildResult(stages, resultConfig, activeReviewProvider);
+  }
+
+  /**
+   * Progressive pipeline entrypoint.
+   * Keeps compatibility with callers that explicitly request progressive mode.
+   *
+   * The underlying runPipeline already executes progressively:
+   * - syntax/tests first
+   * - early return on binary failures
+   * - AI stages only when binary gates pass
+   */
+  async runProgressive(
+    diff: string,
+    taskContext: TaskContext,
+    config: QualityGateConfig,
+    spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>,
+  ): Promise<QualityGateResult> {
+    return this.runPipeline(diff, taskContext, config, spec);
   }
 
   /**

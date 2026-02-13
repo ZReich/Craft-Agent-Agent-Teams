@@ -109,7 +109,7 @@ export interface TeamTask {
   createdBy?: string;
 }
 
-export type TeamTaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'failed';
+export type TeamTaskStatus = 'pending' | 'in_progress' | 'in_review' | 'completed' | 'blocked' | 'failed';
 
 // ============================================================
 // Messaging Types
@@ -389,12 +389,23 @@ export type TeamActivityType =
   | 'task-claimed'
   | 'task-completed'
   | 'task-failed'
+  | 'task-in-review'
+  | 'quality-gate-passed'
+  | 'quality-gate-failed'
+  | 'review-feedback-sent'
   | 'message-sent'
   | 'plan-submitted'
   | 'plan-approved'
   | 'plan-rejected'
   | 'model-swapped'
   | 'escalation'
+  | 'integration-check-started'
+  | 'integration-check-passed'
+  | 'integration-check-failed'
+  | 'stall-detected'
+  | 'file-conflict'
+  | 'checkpoint-created'
+  | 'checkpoint-rollback'
   | 'cost-warning'
   | 'error';
 

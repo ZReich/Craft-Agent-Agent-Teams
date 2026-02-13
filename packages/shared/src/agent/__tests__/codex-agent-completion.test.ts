@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 
 // Mock mode-manager (same pattern as codex-agent-teams.test.ts)
 vi.mock('../mode-manager.ts', () => ({
@@ -84,6 +84,12 @@ function simulateTurnCompleted(agent: CodexAgent, turnId: string = 'turn-test-1'
 }
 
 describe('Agent completion behavior with teams', () => {
+  afterAll(() => {
+    vi.doUnmock('../mode-manager.ts');
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
   // Implements REQ-001: Lead does not emit complete event when team is active
   it('does not emit complete event when team is active (REQ-001)', async () => {
     const agent = createAgent();

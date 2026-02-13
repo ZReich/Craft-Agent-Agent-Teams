@@ -82,6 +82,8 @@ import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skill
 import type { ToolDisplayMeta, QualityGateConfig, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
 import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
+import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/diff-collector'
+import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
 import { resolveTeamModelForRole } from '@craft-agent/shared/agent-teams/model-resolution'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
@@ -199,6 +201,14 @@ function resolveConnectionForModel(options: {
   }
 
   return undefined
+}
+
+const VALID_TEAM_ROLES: ReadonlySet<TeamRole> = new Set(['lead', 'head', 'worker', 'reviewer', 'escalation'])
+
+function normalizeTeamRole(rawRole?: string): TeamRole {
+  if (!rawRole) return 'worker'
+  if (VALID_TEAM_ROLES.has(rawRole as TeamRole)) return rawRole as TeamRole
+  return 'worker'
 }
 
 /**
@@ -477,6 +487,24 @@ export function buildTeammatePromptWithCompactSpec(
     return `${prompt}\n\n<compact_spec>\n${compactSpecContext}\n</compact_spec>`
   }
   return prompt
+}
+
+export function resolveQualityGateReviewInput(
+  reviewDiff: Pick<ReviewDiff, 'unifiedDiff'> | null,
+): { reviewInput: string; usesGitDiff: boolean; failureReason?: string } {
+  const unifiedDiff = reviewDiff?.unifiedDiff?.trim() ?? ''
+  if (unifiedDiff.length > 0) {
+    return {
+      reviewInput: reviewDiff!.unifiedDiff,
+      usesGitDiff: true,
+    }
+  }
+
+  return {
+    reviewInput: '',
+    usesGitDiff: false,
+    failureReason: 'No verifiable git diff was found for this teammate run. Quality gates require real code diffs and cannot rely on assistant prose alone.',
+  }
 }
 
 /**
@@ -1315,6 +1343,11 @@ export class SessionManager {
   // Quality gate runner (lazy-initialized) and cycle tracking
   private qualityGateRunner: QualityGateRunner | null = null
   private qualityGateCycles: Map<string, number> = new Map()
+
+  // Teammate health monitor — detects stalls, error loops, retry storms
+  private healthMonitor = new TeammateHealthMonitor()
+  private healthMonitorTeams = new Set<string>() // teams with active monitoring
+  private teamStatusIntervals = new Map<string, NodeJS.Timeout>() // periodic status checks
   private usagePersistenceByWorkspace: Map<string, UsagePersistence> = new Map()
   private usageAlertCheckerByWorkspace: Map<string, UsageAlertChecker> = new Map()
   private emittedUsageAlertKeys: Set<string> = new Set()
@@ -1345,6 +1378,85 @@ export class SessionManager {
       })
     }
     return this.qualityGateRunner
+  }
+
+  /**
+   * Start health monitoring for a team.
+   * Registers event listeners for health issues and sets up periodic status check-ins.
+   */
+  private startTeamHealthMonitoring(teamId: string, leadSessionId: string): void {
+    if (this.healthMonitorTeams.has(teamId)) return
+    this.healthMonitorTeams.add(teamId)
+
+    this.healthMonitor.startMonitoring(teamId)
+
+    // Relay health alerts to the lead session
+    const alertHandler = (issue: HealthIssue): void => {
+      const typeLabel = issue.type === 'stall' ? 'STALL'
+        : issue.type === 'error-loop' ? 'ERROR LOOP'
+        : issue.type === 'retry-storm' ? 'RETRY STORM'
+        : 'CONTEXT EXHAUSTION'
+      const alertMessage = `[Health Alert — ${typeLabel}] ${issue.teammateName}: ${issue.details}`
+      setTimeout(async () => {
+        try {
+          await this.sendMessage(leadSessionId, alertMessage)
+        } catch (err) {
+          sessionLog.error('[AgentTeams] Failed to send health alert to lead:', err)
+        }
+      }, 100)
+    }
+    this.healthMonitor.on('health:stall', alertHandler)
+    this.healthMonitor.on('health:error-loop', alertHandler)
+    this.healthMonitor.on('health:retry-storm', alertHandler)
+    this.healthMonitor.on('health:context-exhaustion', alertHandler)
+
+    // Periodic team status check-in (every 2 minutes)
+    const statusInterval = setInterval(async () => {
+      const health = this.healthMonitor.getTeamHealth(teamId)
+      if (health.length === 0) return
+
+      const lead = this.sessions.get(leadSessionId)
+      if (!lead || !lead.isTeamLead) {
+        // Lead gone — stop periodic checks
+        clearInterval(statusInterval)
+        this.teamStatusIntervals.delete(teamId)
+        return
+      }
+
+      const lines = health.map(h => {
+        const elapsed = Date.now() - new Date(h.lastActivityAt).getTime()
+        const elapsedStr = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s ago` : `${Math.round(elapsed / 60000)}m ago`
+        const task = h.currentTaskId ? `working on ${h.currentTaskId}` : 'idle'
+        const issues = h.issues.length > 0 ? ` [${h.issues.length} issue(s)]` : ''
+        return `- ${h.teammateName}: ${task} (last activity: ${elapsedStr})${issues}`
+      })
+
+      const statusMessage = `[Team Status Check-In]\n${lines.join('\n')}`
+      try {
+        await this.sendMessage(leadSessionId, statusMessage)
+      } catch (err) {
+        sessionLog.error('[AgentTeams] Failed to send periodic team status:', err)
+      }
+    }, 2 * 60 * 1000)
+
+    if (typeof statusInterval.unref === 'function') {
+      statusInterval.unref()
+    }
+    this.teamStatusIntervals.set(teamId, statusInterval)
+  }
+
+  /**
+   * Stop health monitoring for a team.
+   */
+  private stopTeamHealthMonitoring(teamId: string): void {
+    this.healthMonitor.stopMonitoring(teamId)
+    this.healthMonitorTeams.delete(teamId)
+
+    const statusInterval = this.teamStatusIntervals.get(teamId)
+    if (statusInterval) {
+      clearInterval(statusInterval)
+      this.teamStatusIntervals.delete(teamId)
+    }
   }
 
   setWindowManager(wm: WindowManager): void {
@@ -2659,6 +2771,29 @@ export class SessionManager {
   }
 
   /**
+   * Refresh in-memory agent instances for a workspace so runtime callbacks
+   * (including agent teams interception hooks) reflect latest settings.
+   */
+  refreshWorkspaceAgentRuntime(workspaceId: string, reason: string): void {
+    let refreshed = 0
+    let skipped = 0
+
+    for (const managed of this.sessions.values()) {
+      if (managed.workspace.id !== workspaceId) continue
+      if (managed.isProcessing) {
+        skipped++
+        continue
+      }
+      if (managed.agent) {
+        managed.agent = null
+        refreshed++
+      }
+    }
+
+    sessionLog.info(`[AgentTeams] Runtime refresh for workspace ${workspaceId} (${reason}) refreshed=${refreshed} skipped_processing=${skipped}`)
+  }
+
+  /**
    * Get a single session by ID with all messages loaded.
    * Used for lazy loading session messages when session is selected.
    * Messages are loaded from disk on first access to reduce memory usage.
@@ -3078,7 +3213,10 @@ export class SessionManager {
     if (parent.sddEnabled && !parent.activeSpecId) {
       throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
     }
-    const teammateRole: TeamRole = params.role ?? 'worker'
+    const teammateRole = normalizeTeamRole(params.role)
+    if (params.role && params.role !== teammateRole) {
+      sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested for ${params.teammateName}; defaulting to "${teammateRole}"`)
+    }
     // Implements REQ-002: honor workspace role model defaults and ignore conflicting overrides
     const requestedModel = params.model?.trim()
     const normalizedRequestedModel = requestedModel && requestedModel !== 'auto'
@@ -3104,6 +3242,8 @@ export class SessionManager {
       )
     }
 
+    sessionLog.info(`[AgentTeams] Resolved teammate spawn: name=${params.teammateName} role=${teammateRole} model=${teammateModel}`)
+
     // Implements REQ-004: choose a provider/connection compatible with the resolved model
     const teammateConnectionSlug = resolveConnectionForModel({
       model: teammateModel,
@@ -3128,12 +3268,14 @@ export class SessionManager {
       )
     }
 
+    sessionLog.info(`[AgentTeams] Using connection "${teammateConnection}" (${resolvedConnection.providerType}) for teammate "${params.teammateName}"`)
+
 
     const teammateSession = await this.createSession(params.workspaceId, {
       teamId: params.teamId,
       parentSessionId: params.parentSessionId,
       teammateName: params.teammateName,
-      teammateRole: params.role,
+      teammateRole,
       teamColor,
       permissionMode: 'allow-all',
       workingDirectory: parent.workingDirectory,
@@ -3171,6 +3313,13 @@ export class SessionManager {
       teammateSession.id,
       params.teammateName
     )
+
+    // Start health monitoring for this team (no-op if already started)
+    this.startTeamHealthMonitoring(resolvedTeamId, params.parentSessionId)
+    this.healthMonitor.recordActivity(resolvedTeamId, teammateSession.id, params.teammateName, {
+      type: 'task_update',
+      taskId: params.teammateName,
+    })
 
     // Build compact spec context + task metadata for teammates when SDD is enabled
     let compactSpecContext: string | null = null
@@ -3237,6 +3386,12 @@ export class SessionManager {
           sessionLog.error(`[AgentTeams] Failed to interrupt teammate ${teammateId}:`, err)
         }
       }
+    }
+
+    // Stop health monitoring for this team
+    if (lead.teamId) {
+      const resolvedTeamId = teamManager.resolveTeamId(lead.teamId)
+      this.stopTeamHealthMonitoring(resolvedTeamId)
     }
 
     // Clear team state on lead
@@ -3572,7 +3727,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              role: params.role ?? 'worker',
+              role: (params.role as TeamRole | undefined) ?? 'worker',
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -3923,7 +4078,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              role: params.role ?? 'worker',
+              role: (params.role as TeamRole | undefined) ?? 'worker',
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -5759,6 +5914,23 @@ export class SessionManager {
           }
         }
 
+        // Feed tool events to health monitor for teammate sessions
+        if (managed.parentSessionId && managed.teammateName && managed.teamId) {
+          const hmTeamId = teamManager.resolveTeamId(managed.teamId)
+          if (event.type === 'tool_start') {
+            this.healthMonitor.recordActivity(hmTeamId, managed.id, managed.teammateName, {
+              type: 'tool_call',
+              toolName: event.toolName,
+            })
+          } else if (event.type === 'tool_result') {
+            this.healthMonitor.recordActivity(hmTeamId, managed.id, managed.teammateName, {
+              type: 'tool_result',
+              toolName: event.toolName,
+              error: event.isError,
+            })
+          }
+        }
+
         // Process the event first
         this.processEvent(managed, event)
 
@@ -6202,7 +6374,38 @@ export class SessionManager {
 
           try {
             const spec = managed.teamId ? teamManager.getTeamSpec(teamManager.resolveTeamId(managed.teamId)) : undefined
-            const result = await runner.runPipeline(resultContent, taskContext, qgConfig, spec)
+            const reviewDiff = managed.workingDirectory
+              ? await DiffCollector.collectWorkingDiff(managed.workingDirectory)
+              : null
+            const reviewInput = resolveQualityGateReviewInput(reviewDiff)
+
+            if (!reviewInput.usesGitDiff) {
+              sessionLog.warn(`[AgentTeams] Quality gate blocked for "${teammateName}" due to missing diff evidence`)
+              if (currentCycle >= qgConfig.maxReviewCycles) {
+                this.qualityGateCycles.delete(cycleKey)
+                setTimeout(async () => {
+                  try {
+                    const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (QUALITY GATE: ESCALATED after ${currentCycle} cycles):\n\n${resultContent}\n\n---\n\n${reviewInput.failureReason}\n\nAction required: ensure teammate changes are present in the git working tree before re-running quality gates.`
+                    await this.sendMessage(managed.parentSessionId!, relayMessage)
+                    await this.autoArchiveCompletedTeammateSession(sessionId)
+                  } catch (err) {
+                    sessionLog.error(`[AgentTeams] Failed to relay missing-diff escalation from ${teammateName}:`, err)
+                  }
+                }, 200)
+              } else {
+                setTimeout(async () => {
+                  try {
+                    const feedbackMessage = `[Quality Gate Review — Cycle ${currentCycle}/${qgConfig.maxReviewCycles}]\n\nYour work did not pass the quality gate.\n\n${reviewInput.failureReason}\n\nPlease make sure your implementation is actually written to files in the working directory, then try again.`
+                    await this.sendMessage(sessionId, feedbackMessage)
+                  } catch (err) {
+                    sessionLog.error(`[AgentTeams] Failed to send missing-diff feedback to ${teammateName}:`, err)
+                  }
+                }, 200)
+              }
+            }
+
+            if (reviewInput.usesGitDiff) {
+              const result = await runner.runProgressive(reviewInput.reviewInput, taskContext, qgConfig, spec)
             result.cycleCount = currentCycle
             result.maxCycles = qgConfig.maxReviewCycles
 
@@ -6282,6 +6485,7 @@ export class SessionManager {
                   sessionLog.error(`[AgentTeams] Failed to send quality gate feedback to ${teammateName}:`, err)
                 }
               }, 200)
+            }
             }
           } catch (err) {
             // Quality gate pipeline itself errored — don't block relay, just warn

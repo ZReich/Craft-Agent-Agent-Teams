@@ -1982,6 +1982,9 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
     // Save the config
     saveWorkspaceConfig(workspace.rootPath, config)
+    if (key === 'agentTeamsEnabled' || key in agentTeamsKeyMap) {
+      sessionManager.refreshWorkspaceAgentRuntime(workspaceId, `workspaceSetting:${key}`)
+    }
     ipcLog.info(`Workspace setting updated: ${key} = ${JSON.stringify(value)}`)
   })
 
@@ -3755,6 +3758,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
     const { setAgentTeamsEnabled } = await import('@craft-agent/shared/workspaces')
     setAgentTeamsEnabled(workspace.rootPath, enabled)
+    sessionManager.refreshWorkspaceAgentRuntime(workspaceId, `agentTeamsEnabled=${enabled}`)
     ipcLog.info(`Agent teams ${enabled ? 'enabled' : 'disabled'} for workspace ${workspaceId}`)
   })
 
@@ -3841,6 +3845,12 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     parentSessionId?: string;
     workspaceId?: string;
   }) => {
+    const validRoles = new Set(['lead', 'head', 'worker', 'reviewer', 'escalation'])
+    const normalizedRole = validRoles.has(options.role) ? options.role : 'worker'
+    if (options.role !== normalizedRole) {
+      ipcLog.warn(`[agent teams] Invalid role "${options.role}" for teammate "${options.name}", defaulting to "${normalizedRole}"`)
+    }
+
     // Find the lead session for this team
     const leadSession = sessionManager.findLeadSessionForTeam(options.teamId)
     if (!leadSession) {
@@ -3854,7 +3864,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       teammateName: options.name,
       prompt: '',
       model: options.model,
-      role: (options.role as import('@craft-agent/core/types').TeamRole) ?? 'worker',
+      role: normalizedRole as import('@craft-agent/core/types').TeamRole,
     })
 
     ipcLog.info(`Teammate spawned via SessionManager: ${teammateSession.id} (${options.name}, role: ${options.role})`)

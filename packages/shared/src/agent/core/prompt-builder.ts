@@ -152,6 +152,7 @@ You have MCP tools available from the "session" server for managing agent teams.
 Use the **Task** MCP tool to spawn a teammate agent:
 - team_name: string (required — team identifier, e.g. "my-team")
 - name: string (required — teammate name, e.g. "researcher")
+- role: "head" | "worker" | "reviewer" | "escalation" (required when role intent is known)
 - prompt: string (required — task instructions for the teammate)
 - model: string (optional — model override)
 
@@ -160,7 +161,7 @@ If agent teams are enabled and you create a plan/spec, you MUST either:
 - Explicitly state in the chat that no team is needed and why.
 
 Example: To spawn a researcher teammate, call the Task tool with:
-  team_name: "project-team", name: "researcher", prompt: "Research the API docs and summarize the endpoints"
+  team_name: "project-team", name: "researcher", role: "worker", prompt: "Research the API docs and summarize the endpoints"
 
 ## Model Selection Note
 Workspace settings control teammate models. Do not override the \`model\` field unless the user explicitly requests a different model.
@@ -187,6 +188,7 @@ enabled: true
 To spawn teammates, call the Task tool with:
 - team_name: string (team id/name)
 - name: string (teammate name)
+- role: "head" | "worker" | "reviewer" | "escalation" (required when role intent is known)
 - prompt: string (task to perform)
 - model: string (optional)
 Use SendMessage to message teammates (type: message | broadcast | shutdown_request).

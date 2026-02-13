@@ -7,7 +7,7 @@
 
 import * as React from 'react'
 import { useState, useCallback } from 'react'
-import { ChevronUp, ChevronDown, CheckCircle2, Circle, Loader2, AlertCircle, Ban } from 'lucide-react'
+import { ChevronUp, ChevronDown, CheckCircle2, Circle, Loader2, AlertCircle, Ban, SearchCheck } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -30,6 +30,7 @@ const STATUS_CONFIG: Record<TeamTaskStatus, {
 }> = {
   pending: { icon: Circle, label: 'Pending', className: 'text-muted-foreground' },
   in_progress: { icon: Loader2, label: 'In Progress', className: 'text-blue-500' },
+  in_review: { icon: SearchCheck, label: 'In Review', className: 'text-purple-500' },
   completed: { icon: CheckCircle2, label: 'Done', className: 'text-green-500' },
   blocked: { icon: Ban, label: 'Blocked', className: 'text-yellow-500' },
   failed: { icon: AlertCircle, label: 'Failed', className: 'text-destructive' },

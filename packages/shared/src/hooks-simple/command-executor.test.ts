@@ -6,6 +6,8 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import {
   isCommandAllowed,
   executeCommand,
@@ -14,7 +16,7 @@ import {
 
 // Helper to get a resolved permissions config for /tmp workspace
 function getTestConfig() {
-  return resolvePermissionsConfig({ workspaceRootPath: '/tmp' });
+  return resolvePermissionsConfig({ workspaceRootPath: tmpdir() });
 }
 
 describe('command-executor', () => {
@@ -70,20 +72,21 @@ describe('command-executor', () => {
 
   describe('resolvePermissionsConfig', () => {
     it('should return a config when given a valid context', () => {
-      const config = resolvePermissionsConfig({ workspaceRootPath: '/tmp' });
+      const config = resolvePermissionsConfig({ workspaceRootPath: tmpdir() });
       expect(config).not.toBeNull();
     });
   });
 
   describe('executeCommand', () => {
     it('should execute a simple allowed command', async () => {
-      const result = await executeCommand('ls /tmp', {
+      const result = await executeCommand('git status --short', {
         env: { ...process.env as Record<string, string> },
-        permissionsContext: { workspaceRootPath: '/tmp' },
+        cwd: process.cwd(),
+        permissionsContext: { workspaceRootPath: tmpdir() },
       });
       expect(result.success).toBe(true);
       expect(result.blocked).toBeUndefined();
-    });
+    }, 20000);
 
     it('should block commands when no permissions context provided', async () => {
       const result = await executeCommand('echo hello', {
@@ -97,7 +100,7 @@ describe('command-executor', () => {
     it('should block disallowed commands and not execute them', async () => {
       const result = await executeCommand('rm -rf /', {
         env: { ...process.env as Record<string, string> },
-        permissionsContext: { workspaceRootPath: '/tmp' },
+        permissionsContext: { workspaceRootPath: tmpdir() },
       });
       expect(result.success).toBe(false);
       expect(result.blocked).toBe(true);
@@ -124,7 +127,7 @@ describe('command-executor', () => {
       await executeCommand('echo test', {
         env: { ...process.env as Record<string, string> },
         permissionMode: 'allow-all',
-        permissionsContext: { workspaceRootPath: '/tmp' },
+        permissionsContext: { workspaceRootPath: tmpdir() },
       });
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('WARNING: Executing command in allow-all mode')
@@ -144,19 +147,20 @@ describe('command-executor', () => {
 
     it('should respect the cwd option', async () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const result = await executeCommand('pwd', {
+      const cwd = resolve(tmpdir());
+      const result = await executeCommand('node -e "console.log(process.cwd())"', {
         env: { ...process.env as Record<string, string> },
-        cwd: '/tmp',
+        cwd,
         permissionMode: 'allow-all',
       });
       expect(result.success).toBe(true);
-      expect(result.stdout).toMatch(/\/tmp/);
+      expect(result.stdout).toContain(cwd);
       warnSpy.mockRestore();
     });
 
     it('should respect the timeout option', async () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const result = await executeCommand('sleep 10', {
+      const result = await executeCommand('node -e "setTimeout(() => {}, 10000)"', {
         env: { ...process.env as Record<string, string> },
         timeout: 100,
         permissionMode: 'allow-all',
@@ -167,7 +171,7 @@ describe('command-executor', () => {
 
     it('should pass environment variables to the command', async () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const result = await executeCommand('echo $MY_TEST_VAR', {
+      const result = await executeCommand('node -e "console.log(process.env.MY_TEST_VAR)"', {
         env: { ...process.env as Record<string, string>, MY_TEST_VAR: 'test_value_123' },
         permissionMode: 'allow-all',
       });
@@ -178,7 +182,7 @@ describe('command-executor', () => {
 
     it('should trim stdout and stderr', async () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const result = await executeCommand('echo "  hello  "', {
+      const result = await executeCommand('node -e "console.log(\'  hello  \')"', {
         env: { ...process.env as Record<string, string> },
         permissionMode: 'allow-all',
       });

@@ -4,7 +4,7 @@
  */
 
 import { spawn, type Subprocess } from "bun";
-import { existsSync, rmSync, cpSync, readFileSync, statSync, mkdirSync } from "fs";
+import { existsSync, rmSync, cpSync, copyFileSync, readFileSync, statSync, mkdirSync } from "fs";
 import { join, basename } from "path";
 import * as esbuild from "esbuild";
 
@@ -148,42 +148,49 @@ function copyResources(): void {
 }
 
 // Build MCP servers for Codex sessions (one-time, no watch needed)
+// Falls back to pre-built bundles from resources if source is not available (e.g., OSS fork)
 async function buildMcpServers(): Promise<void> {
   console.log("🌉 Building MCP servers for Codex sessions...");
 
-  // Ensure dist directories exist
-  const sessionDistDir = join(SESSION_SERVER_DIR, "dist");
-  const bridgeDistDir = join(BRIDGE_SERVER_DIR, "dist");
-  if (!existsSync(sessionDistDir)) mkdirSync(sessionDistDir, { recursive: true });
-  if (!existsSync(bridgeDistDir)) mkdirSync(bridgeDistDir, { recursive: true });
+  const servers = [
+    {
+      name: "Session MCP server",
+      sourceDir: join(SESSION_SERVER_DIR, "src"),
+      entry: "packages/session-mcp-server/src/index.ts",
+      output: SESSION_SERVER_OUTPUT,
+      outputDir: join(SESSION_SERVER_DIR, "dist"),
+      prebuilt: join(ELECTRON_DIR, "resources/session-mcp-server/index.js"),
+    },
+    {
+      name: "Bridge MCP server",
+      sourceDir: join(BRIDGE_SERVER_DIR, "src"),
+      entry: "packages/bridge-mcp-server/src/index.ts",
+      output: BRIDGE_SERVER_OUTPUT,
+      outputDir: join(BRIDGE_SERVER_DIR, "dist"),
+      prebuilt: join(ELECTRON_DIR, "resources/bridge-mcp-server/index.js"),
+    },
+  ];
 
-  // Build both servers in parallel
-  const [sessionResult, bridgeResult] = await Promise.all([
-    runEsbuild(
-      "packages/session-mcp-server/src/index.ts",
-      "packages/session-mcp-server/dist/index.js",
-      {},
-      { packagesExternal: true }
-    ),
-    runEsbuild(
-      "packages/bridge-mcp-server/src/index.ts",
-      "packages/bridge-mcp-server/dist/index.js",
-      {},
-      { packagesExternal: true }
-    ),
-  ]);
+  for (const server of servers) {
+    if (!existsSync(server.outputDir)) mkdirSync(server.outputDir, { recursive: true });
 
-  if (!sessionResult.success) {
-    console.error("❌ Session MCP server build failed:", sessionResult.error);
-    process.exit(1);
+    if (existsSync(server.sourceDir)) {
+      // Source available — build from source
+      const result = await runEsbuild(server.entry, server.output.replace(ROOT_DIR + "/", "").replace(ROOT_DIR + "\\", ""), {}, { packagesExternal: true });
+      if (!result.success) {
+        console.error(`❌ ${server.name} build failed:`, result.error);
+        process.exit(1);
+      }
+      console.log(`✅ ${server.name} built from source`);
+    } else if (existsSync(server.prebuilt)) {
+      // Source not available — copy pre-built bundle from resources
+      copyFileSync(server.prebuilt, server.output);
+      console.log(`✅ ${server.name} copied from pre-built resources`);
+    } else {
+      console.error(`❌ ${server.name}: no source and no pre-built bundle available`);
+      process.exit(1);
+    }
   }
-  console.log("✅ Session MCP server built");
-
-  if (!bridgeResult.success) {
-    console.error("❌ Bridge MCP server build failed:", bridgeResult.error);
-    process.exit(1);
-  }
-  console.log("✅ Bridge MCP server built");
 }
 
 // Get OAuth defines for esbuild API
@@ -314,6 +321,23 @@ async function main(): Promise<void> {
 
   // Build MCP servers for Codex sessions
   await buildMcpServers();
+
+  // Build Copilot network interceptor (CJS bundle loaded via --require into Copilot CLI subprocess)
+  const interceptorSource = join(ROOT_DIR, "packages/shared/src/copilot-network-interceptor.ts");
+  const interceptorOutput = join(DIST_DIR, "copilot-interceptor.cjs");
+  if (existsSync(interceptorSource)) {
+    const interceptorResult = await runEsbuild(
+      "packages/shared/src/copilot-network-interceptor.ts",
+      "apps/electron/dist/copilot-interceptor.cjs"
+    );
+    if (interceptorResult.success) {
+      console.log("✅ Copilot interceptor built");
+    } else {
+      console.warn("⚠️ Copilot interceptor build failed (non-fatal):", interceptorResult.error);
+    }
+  } else {
+    console.log("⏭️ Copilot interceptor source not found, skipping");
+  }
 
   const vitePort = process.env.CRAFT_VITE_PORT || "5173";
   const oauthDefines = getOAuthDefines();

@@ -1171,6 +1171,9 @@ export class CodexAgent extends BaseAgent {
       if (!explicitTeamName) {
         this.debug(`[AgentTeams] No team_name provided; defaulting to "${teamName}"`);
       }
+      if (!role) {
+        this.debug(`[AgentTeams] No role provided for teammate "${teammateName}"; defaulting to worker at session manager`);
+      }
 
       this.debug(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}" via MCP`);
 

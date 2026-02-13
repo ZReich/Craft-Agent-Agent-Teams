@@ -72,10 +72,12 @@ export function TeamCard({
       type="button"
       onClick={onClick}
       className={cn(
-        'group relative flex flex-col p-4 rounded-lg border border-border bg-card text-left transition-all hover:shadow-md hover:border-foreground/20',
-        isSelected && 'ring-2 ring-primary border-primary',
+        'group relative flex flex-col p-4 rounded-lg bg-background text-left transition-all shadow-tinted hover:shadow-middle',
+        isSelected && 'ring-2 ring-accent',
+        teamStatus === 'working' && 'bg-accent/[0.03]',
         className
       )}
+      style={{ '--shadow-color': 'var(--accent-rgb)' } as React.CSSProperties}
     >
       {/* Status indicator */}
       <div className="absolute top-3 right-3">
@@ -118,11 +120,16 @@ export function TeamCard({
           </div>
         )}
 
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <span className={cn('capitalize', statusConfig.className)}>
-            {statusConfig.label}
-          </span>
-        </div>
+        <Badge
+          variant={teamStatus === 'error' ? 'destructive' : 'secondary'}
+          className={cn(
+            'text-[10px]',
+            teamStatus === 'working' && 'bg-success/10 text-success-text border-transparent',
+            teamStatus === 'planning' && 'bg-info/10 text-info-text border-transparent',
+          )}
+        >
+          {statusConfig.label}
+        </Badge>
       </div>
     </button>
   )

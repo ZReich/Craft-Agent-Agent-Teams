@@ -571,6 +571,36 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     }
   }, [session?.teamId])
 
+  const handleCleanupTeam = React.useCallback(async () => {
+    if (!session?.teamId || !window.electronAPI) return
+    try {
+      await window.electronAPI.cleanupAgentTeam(session.teamId)
+      setShowTeamDashboard(false)
+      await loadTeamData()
+      toast.success('Team ended')
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to end team:', error)
+      toast.error('Failed to end team', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, loadTeamData])
+
+  const handleShutdownTeammate = React.useCallback(async (teammateId: string) => {
+    if (!session?.teamId || !window.electronAPI) return
+    try {
+      await window.electronAPI.shutdownTeammate(session.teamId, teammateId)
+      await window.electronAPI.cancelProcessing(teammateId, true).catch(() => undefined)
+      await loadTeamData()
+      toast.success('Teammate stopped')
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to stop teammate:', error)
+      toast.error('Failed to stop teammate', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, loadTeamData])
+
   const handleRequirementStatusChange = React.useCallback(async (requirementId: string, status: 'pending' | 'in-progress' | 'implemented' | 'verified') => {
     if (!session?.id || !window.electronAPI?.updateSDDRequirementStatus) return
     try {
@@ -855,6 +885,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
               activityEvents={teamActivityEvents}
               cost={teamCost}
               onSendMessage={handleSendTeamMessage}
+              onCleanupTeam={handleCleanupTeam}
+              onShutdownTeammate={handleShutdownTeammate}
               specRequirements={specRequirements}
               specTraceabilityMap={specTraceabilityMap}
               onSpecRequirementStatusChange={handleRequirementStatusChange}

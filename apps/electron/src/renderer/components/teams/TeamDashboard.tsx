@@ -14,10 +14,13 @@
  */
 
 import * as React from 'react'
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useAtomValue } from 'jotai'
 import { Plus, Activity, FileCheck2, GitBranch, LayoutGrid, Focus, Send } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { sessionMetaMapAtom } from '@/atoms/sessions'
 import type { SessionMeta } from '@/atoms/sessions'
@@ -50,6 +53,9 @@ import { useTeamStateSync } from '@/hooks/useTeamEvents'
 
 const MAX_REALTIME_MESSAGES = 2000
 const MAX_REALTIME_ACTIVITY = 1500
+const EMPTY_TASKS: TeamTask[] = []
+const EMPTY_MESSAGES: TeammateMessage[] = []
+const EMPTY_ACTIVITY: TeamActivityEvent[] = []
 
 /**
  * Derive an AgentTeammateStatus from a teammate's SessionMeta
@@ -146,9 +152,9 @@ export interface TeamDashboardProps {
 export function TeamDashboard({
   session,
   teamStatus,
-  tasks = [],
-  messages = [],
-  activityEvents = [],
+  tasks = EMPTY_TASKS,
+  messages = EMPTY_MESSAGES,
+  activityEvents = EMPTY_ACTIVITY,
   cost,
   qualityReports,
   onCreateTeam,
@@ -267,18 +273,22 @@ export function TeamDashboard({
   const teammates: AgentTeammate[] = useMemo(() => {
     const teammateIds = session.teammateSessionIds || []
     const result: AgentTeammate[] = []
+    const seenIds = new Set<string>()
 
     // Add the lead session itself as the first teammate
     const leadMeta = sessionMetaMap.get(session.id)
     if (leadMeta) {
       result.push(sessionMetaToTeammate(leadMeta, true))
+      seenIds.add(session.id)
     }
 
     // Add each teammate session
     for (const id of teammateIds) {
+      if (seenIds.has(id)) continue
       const meta = sessionMetaMap.get(id)
       if (meta) {
         result.push(sessionMetaToTeammate(meta, false))
+        seenIds.add(id)
       }
     }
 
@@ -318,8 +328,13 @@ export function TeamDashboard({
     delegateMode: teamStatus?.delegateMode ?? false,
   }), [teamStatus, session.id, session.teamId, session.name, session.isProcessing, session.createdAt, teammatesWithTasks])
 
-  // Auto-select the lead teammate when team changes
+  // Auto-select the lead teammate on initial mount or when switching to a different team
+  const prevSessionIdRef = useRef<string | null>(null)
   useEffect(() => {
+    const isNewTeam = prevSessionIdRef.current !== session.id
+    prevSessionIdRef.current = session.id
+    if (!isNewTeam) return
+
     if (teammates.length > 0) {
       const lead = teammates.find(m => m.isLead)
       setSelectedTeammateId(lead?.id || teammates[0].id)
@@ -442,33 +457,24 @@ export function TeamDashboard({
         }}
       />
 
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-background/40">
-        <p className="text-xs text-muted-foreground">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border">
+        <p className="text-sm text-muted-foreground">
           {viewMode === 'overview'
             ? 'Command Center: monitor all teammates and send quick replies'
             : `Focus View: ${selectedTeammate?.name ?? 'Teammate'}`}
         </p>
-        <div className="flex items-center gap-1">
-          <Button
-            size="sm"
-            variant={viewMode === 'overview' ? 'secondary' : 'ghost'}
-            className="h-7 text-xs gap-1.5"
-            onClick={() => setViewMode('overview')}
-          >
-            <LayoutGrid className="size-3" />
-            Command Center
-          </Button>
-          <Button
-            size="sm"
-            variant={viewMode === 'focus' ? 'secondary' : 'ghost'}
-            className="h-7 text-xs gap-1.5"
-            onClick={() => setViewMode('focus')}
-            disabled={!selectedTeammateId}
-          >
-            <Focus className="size-3" />
-            Focus View
-          </Button>
-        </div>
+        <Tabs value={viewMode} onValueChange={(v) => setViewMode(v as 'overview' | 'focus')}>
+          <TabsList className="h-8">
+            <TabsTrigger value="overview" className="text-xs gap-1.5 h-7 px-3">
+              <LayoutGrid className="size-3" />
+              Command Center
+            </TabsTrigger>
+            <TabsTrigger value="focus" className="text-xs gap-1.5 h-7 px-3" disabled={!selectedTeammateId}>
+              <Focus className="size-3" />
+              Focus View
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
       </div>
 
       {/* Main content area */}
@@ -482,7 +488,11 @@ export function TeamDashboard({
               return (
                 <div
                   key={teammate.id}
-                  className="rounded-lg border border-border bg-background/70 p-3 shadow-sm hover:shadow-md transition-shadow"
+                  className={cn(
+                    'rounded-lg p-3 shadow-tinted transition-shadow hover:shadow-middle',
+                    teammate.status === 'working' ? 'bg-accent/[0.03]' : 'bg-background'
+                  )}
+                  style={{ '--shadow-color': 'var(--accent-rgb)' } as React.CSSProperties}
                 >
                   <button
                     type="button"
@@ -498,41 +508,48 @@ export function TeamDashboard({
                         <h3 className="text-sm font-semibold truncate">{teammate.name}</h3>
                         <p className="text-[11px] text-muted-foreground truncate">{teammate.model}</p>
                       </div>
-                      <span
+                      <Badge
+                        variant={teammate.status === 'error' ? 'destructive' : 'secondary'}
                         className={cn(
-                          'text-[10px] px-2 py-0.5 rounded-full border',
-                          teammate.status === 'working'
-                            ? 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20'
-                            : teammate.status === 'error'
-                              ? 'bg-red-500/10 text-red-600 border-red-500/20'
-                              : teammate.status === 'planning'
-                                ? 'bg-amber-500/10 text-amber-600 border-amber-500/20'
-                                : 'bg-foreground/5 text-muted-foreground border-border'
+                          'text-[10px] px-2 py-0.5',
+                          teammate.status === 'working' && 'bg-success/10 text-success-text border-transparent',
+                          teammate.status === 'planning' && 'bg-info/10 text-info-text border-transparent',
                         )}
                       >
                         {teammate.status}
-                      </span>
+                      </Badge>
                     </div>
                     <p className="mt-2 text-[11px] text-muted-foreground">{activeCount} active tasks</p>
                   </button>
 
-                  <div className="mt-3 rounded-md border border-border/70 bg-foreground/[0.02] p-2 min-h-20 space-y-1">
+                  <div className="mt-3 rounded-md bg-foreground/[0.02] p-2 min-h-20 space-y-1.5 shadow-thin">
                     {recent.length === 0 ? (
                       <p className="text-xs text-muted-foreground">No recent messages</p>
                     ) : (
-                      recent.map((msg) => (
-                        <div key={msg.id} className="text-xs leading-snug">
-                          <span className="font-medium text-foreground/85 mr-1">
-                            {msg.from === teammate.id ? teammate.name : msg.from === 'user' ? 'You' : msg.from}:
-                          </span>
-                          <span className="text-muted-foreground">{msg.content.slice(0, 90)}</span>
-                        </div>
-                      ))
+                      recent.map((msg) => {
+                        const isFromTeammate = msg.from === teammate.id
+                        return (
+                          <div
+                            key={msg.id}
+                            className={cn(
+                              'text-xs leading-snug rounded-md px-2 py-1',
+                              isFromTeammate
+                                ? 'bg-background shadow-minimal'
+                                : 'bg-foreground/[0.04]'
+                            )}
+                          >
+                            <span className="font-medium text-foreground/85 mr-1">
+                              {isFromTeammate ? teammate.name : msg.from === 'user' ? 'You' : msg.from}:
+                            </span>
+                            <span className="text-muted-foreground">{msg.content.slice(0, 90)}</span>
+                          </div>
+                        )
+                      })
                     )}
                   </div>
 
                   <div className="mt-3 flex items-center gap-2">
-                    <input
+                    <Input
                       value={draft}
                       onChange={(e) => setQuickReplyByTeammate(prev => ({ ...prev, [teammate.id]: e.target.value }))}
                       onKeyDown={(e) => {
@@ -541,13 +558,14 @@ export function TeamDashboard({
                           handleQuickReplySend(teammate.id)
                         }
                       }}
-                      className="h-8 flex-1 rounded-md border border-border bg-background px-2 text-xs"
+                      className="h-8 flex-1 text-xs"
                       placeholder={`Quick reply to ${teammate.name}...`}
                       aria-label={`Quick reply to ${teammate.name}`}
                     />
                     <Button
-                      size="sm"
-                      className="h-8 px-2"
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0 size-8"
                       onClick={() => handleQuickReplySend(teammate.id)}
                       disabled={!draft.trim()}
                     >

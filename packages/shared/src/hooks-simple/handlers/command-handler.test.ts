@@ -4,18 +4,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WorkspaceEventBus } from '../event-bus.ts';
-import { CommandHandler } from './command-handler.ts';
 import type { HooksConfigProvider, CommandHandlerOptions } from './types.ts';
 import type { HookMatcher, HookEvent } from '../index.ts';
+import * as commandExecutor from '../command-executor.ts';
+import { CommandHandler } from './command-handler.ts';
 
-// Mock command-executor to avoid real shell execution
-vi.mock('../command-executor.ts', () => ({
-  executeCommand: vi.fn().mockResolvedValue({ success: true, stdout: 'ok', stderr: '', blocked: false }),
-}));
-
-import { executeCommand } from '../command-executor.ts';
-
-const mockedExecuteCommand = vi.mocked(executeCommand);
+let mockedExecuteCommand: ReturnType<typeof vi.fn>;
 
 // Helper to create a mock HooksConfigProvider
 function createMockConfigProvider(matchersByEvent: Partial<Record<HookEvent, HookMatcher[]>> = {}): HooksConfigProvider {
@@ -41,6 +35,9 @@ describe('CommandHandler', () => {
   beforeEach(() => {
     bus = new WorkspaceEventBus('test-workspace');
     vi.clearAllMocks();
+    mockedExecuteCommand = vi
+      .spyOn(commandExecutor, 'executeCommand')
+      .mockResolvedValue({ success: true, stdout: 'ok', stderr: '', blocked: false });
   });
 
   afterEach(() => {

@@ -20,6 +20,7 @@ import {
   ThumbsDown,
   DollarSign,
   AlertTriangle,
+  SearchCheck,
 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
@@ -38,14 +39,25 @@ const EVENT_CONFIG: Record<TeamActivityType, {
   'teammate-spawned': { icon: UserPlus, color: 'text-green-500' },
   'teammate-shutdown': { icon: UserMinus, color: 'text-muted-foreground' },
   'task-claimed': { icon: ClipboardList, color: 'text-blue-500' },
+  'task-in-review': { icon: SearchCheck, color: 'text-purple-500' },
   'task-completed': { icon: CheckCircle2, color: 'text-green-500' },
   'task-failed': { icon: AlertCircle, color: 'text-destructive' },
+  'quality-gate-passed': { icon: CheckCircle2, color: 'text-green-500' },
+  'quality-gate-failed': { icon: AlertCircle, color: 'text-destructive' },
+  'review-feedback-sent': { icon: MessageSquare, color: 'text-amber-500' },
   'message-sent': { icon: MessageSquare, color: 'text-foreground/70' },
   'plan-submitted': { icon: ClipboardList, color: 'text-purple-500' },
   'plan-approved': { icon: ThumbsUp, color: 'text-green-500' },
   'plan-rejected': { icon: ThumbsDown, color: 'text-yellow-500' },
   'model-swapped': { icon: RefreshCw, color: 'text-blue-500' },
   'escalation': { icon: ArrowUpCircle, color: 'text-yellow-500' },
+  'integration-check-started': { icon: RefreshCw, color: 'text-blue-500' },
+  'integration-check-passed': { icon: CheckCircle2, color: 'text-green-500' },
+  'integration-check-failed': { icon: AlertCircle, color: 'text-destructive' },
+  'stall-detected': { icon: AlertTriangle, color: 'text-yellow-500' },
+  'file-conflict': { icon: AlertTriangle, color: 'text-orange-500' },
+  'checkpoint-created': { icon: ClipboardList, color: 'text-cyan-500' },
+  'checkpoint-rollback': { icon: RefreshCw, color: 'text-orange-500' },
   'cost-warning': { icon: DollarSign, color: 'text-yellow-500' },
   'error': { icon: AlertTriangle, color: 'text-destructive' },
 }
@@ -59,7 +71,21 @@ const FILTER_OPTIONS: { id: FilterType; label: string }[] = [
   { id: 'system', label: 'System' },
 ]
 
-const TASK_TYPES = new Set<TeamActivityType>(['task-claimed', 'task-completed', 'task-failed'])
+const TASK_TYPES = new Set<TeamActivityType>([
+  'task-claimed',
+  'task-in-review',
+  'task-completed',
+  'task-failed',
+  'quality-gate-passed',
+  'quality-gate-failed',
+  'review-feedback-sent',
+  'integration-check-started',
+  'integration-check-passed',
+  'integration-check-failed',
+  'file-conflict',
+  'checkpoint-created',
+  'checkpoint-rollback',
+])
 const MESSAGE_TYPES = new Set<TeamActivityType>(['message-sent', 'plan-submitted', 'plan-approved', 'plan-rejected'])
 
 export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {

@@ -932,12 +932,25 @@ export class ClaudeAgent extends BaseAgent {
               // --- Task tool: Spawn teammate as a separate session ---
               if (toolName === 'Task' && this.onTeammateSpawnRequested) {
                 const toolInput = input.tool_input as Record<string, unknown>;
-                if (toolInput.team_name && typeof toolInput.team_name === 'string') {
-                  const teamName = toolInput.team_name;
+                const explicitTeamName = typeof toolInput.team_name === 'string'
+                  ? toolInput.team_name
+                  : typeof toolInput.teamName === 'string'
+                    ? toolInput.teamName
+                    : undefined;
+                const teamName = explicitTeamName || this.activeTeamName || this.config.session?.id;
+
+                if (teamName) {
                   const teammateName = (toolInput.name as string) || `teammate-${Date.now()}`;
                   const prompt = (toolInput.prompt as string) || '';
                   const model = toolInput.model as string | undefined;
                   const role = toolInput.role as string | undefined;
+
+                  if (!explicitTeamName) {
+                    this.onDebug?.(`[AgentTeams] No team_name provided; defaulting to "${teamName}"`);
+                  }
+                  if (!role) {
+                    this.onDebug?.(`[AgentTeams] No role provided for teammate "${teammateName}"; defaulting to worker at session manager`);
+                  }
 
                   // CRITICAL: Set activeTeamName/Count NOW (before returning synthetic result)
                   // This ensures the keep-alive check at completion time sees an active team.

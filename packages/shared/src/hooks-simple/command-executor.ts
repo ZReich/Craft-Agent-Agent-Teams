@@ -150,7 +150,9 @@ export async function executeCommand(
       env: options.env,
       timeout: options.timeout ?? 60000,
       cwd: options.cwd,
-      shell: '/bin/bash',
+      // Use bash on Unix-like systems; on Windows, rely on Node's default shell.
+      // Avoiding env-specific shell paths keeps behavior stable across test environments.
+      shell: process.platform === 'win32' ? undefined : '/bin/bash',
     });
     return {
       success: true,

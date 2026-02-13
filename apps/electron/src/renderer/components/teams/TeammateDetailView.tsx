@@ -185,32 +185,37 @@ export function TeammateDetailView({
               </p>
             </div>
           ) : (
-            relevantMessages.map((msg) => (
-              <div
-                key={msg.id}
-                className={cn(
-                  'rounded-lg px-3 py-2 text-sm',
-                  msg.from === teammate.id
-                    ? 'bg-foreground/5'
-                    : 'bg-blue-500/5 border border-blue-500/10'
-                )}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-xs font-medium">
-                    {msg.from === teammate.id ? teammate.name : msg.from === 'user' ? 'You' : msg.from}
-                  </span>
-                  <span className="text-[10px] text-muted-foreground">
-                    {new Date(msg.timestamp).toLocaleTimeString()}
-                  </span>
-                  {msg.type !== 'message' && (
-                    <Badge variant="secondary" className="text-[10px] px-1 py-0 h-4">
-                      {msg.type}
-                    </Badge>
-                  )}
+            relevantMessages.map((msg) => {
+              const isFromTeammate = msg.from === teammate.id
+              return (
+                <div key={msg.id} className={cn('flex', isFromTeammate ? 'justify-start' : 'justify-end')}>
+                  <div className={cn(
+                    'max-w-[85%] rounded-lg px-3 py-2 text-sm',
+                    isFromTeammate
+                      ? 'bg-background shadow-minimal'
+                      : 'bg-foreground text-background'
+                  )}>
+                    <div className={cn('flex items-center gap-2 mb-1', !isFromTeammate && 'text-background/70')}>
+                      <span className="text-xs font-medium">
+                        {isFromTeammate ? teammate.name : msg.from === 'user' ? 'You' : msg.from}
+                      </span>
+                      <span className={cn('text-[10px]', isFromTeammate ? 'text-muted-foreground' : 'text-background/50')}>
+                        {new Date(msg.timestamp).toLocaleTimeString()}
+                      </span>
+                      {msg.type !== 'message' && (
+                        <Badge variant="secondary" className={cn(
+                          'text-[10px] px-1 py-0 h-4',
+                          !isFromTeammate && 'bg-background/20 text-background border-transparent'
+                        )}>
+                          {msg.type}
+                        </Badge>
+                      )}
+                    </div>
+                    <p className={cn('whitespace-pre-wrap', isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>{msg.content}</p>
+                  </div>
                 </div>
-                <p className="whitespace-pre-wrap text-foreground/80">{msg.content}</p>
-                </div>
-            ))
+              )
+            })
           )}
           <div ref={endRef} />
         </div>

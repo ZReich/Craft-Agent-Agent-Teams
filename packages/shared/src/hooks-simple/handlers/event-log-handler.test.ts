@@ -5,30 +5,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WorkspaceEventBus } from '../event-bus.ts';
 import { EventLogHandler } from './event-log-handler.ts';
+import { HookEventLogger } from '../event-logger.ts';
 import type { EventLogHandlerOptions } from './types.ts';
-
-// Track mock logger instances for assertions
-let mockLoggerInstances: Array<{
-  log: ReturnType<typeof vi.fn>;
-  getLogPath: ReturnType<typeof vi.fn>;
-  dispose: ReturnType<typeof vi.fn>;
-  onEventLost?: (events: string[], error: Error) => void;
-}> = [];
-
-// Mock the event logger to avoid real file I/O
-vi.mock('../event-logger.ts', () => {
-  class MockHookEventLogger {
-    log = vi.fn();
-    getLogPath = vi.fn().mockReturnValue('/tmp/test-workspace/events.jsonl');
-    dispose = vi.fn().mockResolvedValue(undefined);
-    onEventLost?: (events: string[], error: Error) => void;
-
-    constructor(_workspaceRootPath: string) {
-      mockLoggerInstances.push(this);
-    }
-  }
-  return { HookEventLogger: MockHookEventLogger };
-});
 
 // Helper to create default options
 function createOptions(overrides: Partial<EventLogHandlerOptions> = {}): EventLogHandlerOptions {
@@ -41,11 +19,14 @@ function createOptions(overrides: Partial<EventLogHandlerOptions> = {}): EventLo
 
 describe('EventLogHandler', () => {
   let bus: WorkspaceEventBus;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let disposeSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     bus = new WorkspaceEventBus('test-workspace');
-    mockLoggerInstances = [];
     vi.clearAllMocks();
+    logSpy = vi.spyOn(HookEventLogger.prototype, 'log').mockImplementation(() => {});
+    disposeSpy = vi.spyOn(HookEventLogger.prototype, 'dispose').mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -64,9 +45,8 @@ describe('EventLogHandler', () => {
         label: 'test-label',
       });
 
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.log).toHaveBeenCalledTimes(1);
-      expect(loggerInstance.log).toHaveBeenCalledWith(expect.objectContaining({
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(logSpy).toHaveBeenCalledWith(expect.objectContaining({
         type: 'LabelAdd',
         workspaceId: 'test-workspace',
       }));
@@ -90,8 +70,7 @@ describe('EventLogHandler', () => {
         label: 'second',
       });
 
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.log).toHaveBeenCalledTimes(2);
+      expect(logSpy).toHaveBeenCalledTimes(2);
 
       await handler.dispose();
     });
@@ -107,8 +86,7 @@ describe('EventLogHandler', () => {
         label: 'test',
       });
 
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.log).toHaveBeenCalledWith(expect.objectContaining({
+      expect(logSpy).toHaveBeenCalledWith(expect.objectContaining({
         sessionId: 'session-123',
       }));
 
@@ -127,8 +105,7 @@ describe('EventLogHandler', () => {
         newMode: 'safe',
       });
 
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.log).toHaveBeenCalledWith(expect.objectContaining({
+      expect(logSpy).toHaveBeenCalledWith(expect.objectContaining({
         type: 'PermissionModeChange',
         data: expect.objectContaining({
           oldMode: 'ask',
@@ -143,7 +120,7 @@ describe('EventLogHandler', () => {
   describe('log path', () => {
     it('should expose the log path from the underlying logger', () => {
       const handler = new EventLogHandler(createOptions());
-      expect(handler.getLogPath()).toBe('/tmp/test-workspace/events.jsonl');
+      expect(handler.getLogPath().replaceAll('\\', '/')).toContain('/tmp/test-workspace/events.jsonl');
     });
   });
 
@@ -151,9 +128,8 @@ describe('EventLogHandler', () => {
     it('should forward onEventLost callback to the logger', () => {
       const onEventLost = vi.fn();
       const handler = new EventLogHandler(createOptions({ onEventLost }));
-
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.onEventLost).toBe(onEventLost);
+      const logger = (handler as unknown as { logger: HookEventLogger }).logger;
+      expect(logger.onEventLost).toBe(onEventLost);
 
       handler.dispose();
     });
@@ -175,8 +151,7 @@ describe('EventLogHandler', () => {
 
       await handler.dispose();
 
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.dispose).toHaveBeenCalledTimes(1);
+      expect(disposeSpy).toHaveBeenCalledTimes(1);
     });
 
     it('should not process events after disposal', async () => {
@@ -190,8 +165,7 @@ describe('EventLogHandler', () => {
         label: 'test',
       });
 
-      const loggerInstance = mockLoggerInstances[0]!;
-      expect(loggerInstance.log).not.toHaveBeenCalled();
+      expect(logSpy).not.toHaveBeenCalled();
     });
   });
 });

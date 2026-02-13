@@ -54,7 +54,7 @@ export function TeamHeader({
         <Badge variant="outline" className={cn('text-[11px] px-2 py-0.5 font-medium', statusInfo.className)}>
           {statusInfo.label}
         </Badge>
-        <div className="flex items-center gap-1 text-xs text-muted-foreground">
+        <div className="flex items-center gap-1 text-xs text-muted-foreground tabular-nums">
           <Users className="size-3" />
           <span>{activeCount}/{team.members.length}</span>
         </div>
@@ -111,7 +111,7 @@ export function TeamHeader({
 
         {/* Cost */}
         {cost && (
-          <div className="flex items-center gap-1 text-xs text-muted-foreground">
+          <div className="flex items-center gap-1 text-xs text-muted-foreground tabular-nums">
             <DollarSign className="size-3" />
             <span>${cost.totalCostUsd.toFixed(2)}</span>
           </div>

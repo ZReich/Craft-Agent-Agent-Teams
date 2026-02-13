@@ -228,6 +228,60 @@ export interface CostWarningEvent extends TeamEventEnvelope<{
 }
 
 // ============================================================
+// Quality Gate Events
+// ============================================================
+
+/**
+ * Quality gate review started for a task
+ */
+export interface QualityGateStartedEvent extends TeamEventEnvelope<{
+  taskId: string;
+  teammateId: string;
+  cycleNumber: number;
+  stages: string[];
+}> {
+  type: 'quality-gate:started';
+}
+
+/**
+ * Quality gate review completed for a task
+ */
+export interface QualityGateCompletedEvent extends TeamEventEnvelope<{
+  taskId: string;
+  teammateId: string;
+  passed: boolean;
+  aggregateScore: number;
+  cycleNumber: number;
+  feedbackSent: boolean;
+  escalated: boolean;
+}> {
+  type: 'quality-gate:completed';
+}
+
+/**
+ * Integration check started (after all tasks pass)
+ */
+export interface IntegrationCheckStartedEvent extends TeamEventEnvelope<{
+  taskCount: number;
+  teammateCount: number;
+}> {
+  type: 'integration:started';
+}
+
+/**
+ * Integration check completed
+ */
+export interface IntegrationCheckCompletedEvent extends TeamEventEnvelope<{
+  passed: boolean;
+  typeErrors: number;
+  testsFailed: number;
+  conflictFiles: string[];
+  brokenBy?: string[];
+}> {
+  type: 'integration:completed';
+}
+
+// ============================================================
 // Error Events
 // ============================================================
 
@@ -268,6 +322,10 @@ export type TeamEvent =
   | ActivityLoggedEvent
   | CostUpdatedEvent
   | CostWarningEvent
+  | QualityGateStartedEvent
+  | QualityGateCompletedEvent
+  | IntegrationCheckStartedEvent
+  | IntegrationCheckCompletedEvent
   | TeamErrorEvent;
 
 // ============================================================

@@ -25,6 +25,7 @@ import type {
   Spec,
   DRIAssignment,
 } from '@craft-agent/core/types';
+import type { ReviewLoopOrchestrator } from '../agent-teams/review-loop';
 
 // ============================================================
 // Types
@@ -82,6 +83,23 @@ export class AgentTeamManager extends EventEmitter {
   private teamSpecs = new Map<string, Spec>();  // teamId → active spec
   private teamDRIAssignments = new Map<string, DRIAssignment[]>();  // teamId → DRI assignments
   private synthesisRequested = new Set<string>();  // teamIds that already emitted synthesis request
+
+  /** Review loop orchestrator — when set, task completions are routed through quality gates */
+  private reviewLoop: ReviewLoopOrchestrator | null = null;
+
+  /**
+   * Attach a review loop orchestrator.
+   * When attached, task completions from teammates are intercepted and routed
+   * through quality gate review before being accepted as truly "completed."
+   */
+  setReviewLoop(reviewLoop: ReviewLoopOrchestrator | null): void {
+    this.reviewLoop = reviewLoop;
+  }
+
+  /** Get the attached review loop (if any) */
+  getReviewLoop(): ReviewLoopOrchestrator | null {
+    return this.reviewLoop;
+  }
 
   private pushCapped<T>(arr: T[], item: T, max: number): void {
     arr.push(item);
@@ -156,6 +174,9 @@ export class AgentTeamManager extends EventEmitter {
     this.emit('team:updated', team);
     this.emit('team:cleanup', teamId);
     this.addActivity(teamId, 'teammate-shutdown', 'Team cleaned up', undefined, undefined);
+
+    // Clean up review loop state for this team
+    this.reviewLoop?.cleanup(teamId);
 
     // Release hot runtime memory immediately after cleanup.
     this.tasks.delete(teamId);
@@ -335,11 +356,43 @@ export class AgentTeamManager extends EventEmitter {
     return task;
   }
 
-  /** Update task status */
-  updateTaskStatus(teamId: string, taskId: string, status: TeamTaskStatus, assignee?: string): void {
+  /**
+   * Update task status.
+   *
+   * When a review loop is attached and a task is marked 'completed' by a teammate,
+   * the task is intercepted and routed to quality gate review ('in_review') instead.
+   * The review loop will call back to set the final 'completed' status after passing.
+   *
+   * @param options.bypassReviewLoop - Set to true to skip review loop interception
+   *   (used internally by the review loop itself when a task passes quality gates)
+   */
+  updateTaskStatus(
+    teamId: string,
+    taskId: string,
+    status: TeamTaskStatus,
+    assignee?: string,
+    options?: { bypassReviewLoop?: boolean },
+  ): void {
     const teamTasks = this.tasks.get(teamId) || [];
     const task = teamTasks.find(t => t.id === taskId);
     if (!task) return;
+
+    // --- Review Loop Interception ---
+    // When a teammate marks a task "completed" and a review loop is attached,
+    // route through quality gates instead of accepting immediately.
+    if (
+      status === 'completed' &&
+      this.reviewLoop &&
+      !options?.bypassReviewLoop &&
+      task.assignee // only intercept teammate tasks (not lead/system tasks)
+    ) {
+      task.status = 'in_review';
+      this.emit('task:updated', task);
+      this.tasks.set(teamId, this.trimTasks(teamTasks));
+      this.addActivity(teamId, 'task-in-review', `Task "${task.title}" → quality gate review`, undefined, undefined, taskId);
+      this.reviewLoop.enqueueReview(teamId, taskId, task);
+      return;
+    }
 
     task.status = status;
     if (assignee !== undefined) task.assignee = assignee;
@@ -351,6 +404,7 @@ export class AgentTeamManager extends EventEmitter {
     // Add activity
     const activityType: TeamActivityType = status === 'completed' ? 'task-completed'
       : status === 'in_progress' ? 'task-claimed'
+      : status === 'in_review' ? 'task-in-review'
       : status === 'failed' ? 'task-failed'
       : 'task-claimed';
     this.addActivity(teamId, activityType, `Task "${task.title}" → ${status}`, undefined, undefined, taskId);

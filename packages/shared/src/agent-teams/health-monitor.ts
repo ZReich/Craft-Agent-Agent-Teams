@@ -1,0 +1,409 @@
+/**
+ * Teammate Health Monitor
+ *
+ * Monitors teammate health by detecting stalls, error loops, retry storms,
+ * and context exhaustion. Runs periodic checks and emits events when issues
+ * are detected so the team lead can intervene.
+ *
+ * This module uses only Node.js built-ins (EventEmitter, timers).
+ */
+
+import { EventEmitter } from 'events';
+
+// ============================================================
+// Configuration
+// ============================================================
+
+export interface HealthMonitorConfig {
+  /** Time with no activity before a teammate is considered stalled (ms). Default: 5 * 60 * 1000 (5 min) */
+  stallTimeoutMs: number;
+  /** Number of consecutive errors on same tool before flagging error loop. Default: 3 */
+  errorLoopThreshold: number;
+  /** Number of identical/similar tool calls before flagging retry storm. Default: 5 */
+  retryStormThreshold: number;
+  /** How often to run health checks (ms). Default: 30 * 1000 (30 sec) */
+  checkIntervalMs: number;
+  /** Context window usage percentage that triggers a warning. Default: 0.85 (85%) */
+  contextWarningThreshold: number;
+}
+
+export const DEFAULT_HEALTH_CONFIG: HealthMonitorConfig = {
+  stallTimeoutMs: 5 * 60 * 1000,
+  errorLoopThreshold: 3,
+  retryStormThreshold: 5,
+  checkIntervalMs: 30 * 1000,
+  contextWarningThreshold: 0.85,
+};
+
+// ============================================================
+// Types
+// ============================================================
+
+export type HealthIssueType = 'stall' | 'error-loop' | 'retry-storm' | 'context-exhaustion';
+
+export interface HealthIssue {
+  type: HealthIssueType;
+  teammateId: string;
+  teammateName: string;
+  taskId?: string;
+  details: string;
+  detectedAt: string;
+  /** How long the issue has persisted (ms) */
+  duration?: number;
+}
+
+export interface TeammateHealthState {
+  teammateId: string;
+  teammateName: string;
+  lastActivityAt: string;
+  currentTaskId?: string;
+  consecutiveErrors: number;
+  lastErrorTool?: string;
+  recentToolCalls: Array<{ tool: string; input: string; timestamp: string }>;
+  contextUsage?: number; // 0-1 percentage
+  issues: HealthIssue[];
+}
+
+export interface TeammateActivity {
+  type: 'tool_call' | 'tool_result' | 'message' | 'task_update';
+  toolName?: string;
+  toolInput?: string;
+  error?: boolean;
+  taskId?: string;
+}
+
+// ============================================================
+// Constants
+// ============================================================
+
+/** Maximum number of recent tool calls to retain per teammate */
+const MAX_RECENT_TOOL_CALLS = 20;
+
+/** Minimum interval between emitting the same issue type for the same teammate (ms) */
+const DEBOUNCE_INTERVAL_MS = 2 * 60 * 1000;
+
+// ============================================================
+// TeammateHealthMonitor
+// ============================================================
+
+export class TeammateHealthMonitor extends EventEmitter {
+  private readonly config: HealthMonitorConfig;
+
+  /** teamId -> teammateId -> health state */
+  private readonly states: Map<string, Map<string, TeammateHealthState>> = new Map();
+
+  /** teamId -> interval handle */
+  private readonly intervals: Map<string, NodeJS.Timeout> = new Map();
+
+  /** issueKey -> last emitted timestamp (for debouncing) */
+  private readonly lastEmitted: Map<string, number> = new Map();
+
+  constructor(config?: Partial<HealthMonitorConfig>) {
+    super();
+    this.config = { ...DEFAULT_HEALTH_CONFIG, ...config };
+  }
+
+  // ============================================================
+  // Monitoring Lifecycle
+  // ============================================================
+
+  /**
+   * Start periodic health checks for a team.
+   * If monitoring is already active for this team, this is a no-op.
+   */
+  startMonitoring(teamId: string): void {
+    if (this.intervals.has(teamId)) return;
+
+    const interval = setInterval(() => {
+      this.checkHealth(teamId);
+    }, this.config.checkIntervalMs);
+
+    // Ensure the interval does not prevent process exit
+    if (typeof interval.unref === 'function') {
+      interval.unref();
+    }
+
+    this.intervals.set(teamId, interval);
+
+    if (!this.states.has(teamId)) {
+      this.states.set(teamId, new Map());
+    }
+  }
+
+  /**
+   * Stop periodic health checks for a team.
+   */
+  stopMonitoring(teamId: string): void {
+    const interval = this.intervals.get(teamId);
+    if (interval) {
+      clearInterval(interval);
+      this.intervals.delete(teamId);
+    }
+  }
+
+  // ============================================================
+  // Activity Recording
+  // ============================================================
+
+  /**
+   * Record an activity event for a teammate.
+   * Called by the agent/session manager whenever a tool call, result, message,
+   * or task update happens.
+   */
+  recordActivity(
+    teamId: string,
+    teammateId: string,
+    teammateName: string,
+    activity: TeammateActivity,
+  ): void {
+    const state = this.ensureState(teamId, teammateId, teammateName);
+    const now = new Date().toISOString();
+
+    state.lastActivityAt = now;
+
+    // Track task assignment
+    if (activity.taskId) {
+      state.currentTaskId = activity.taskId;
+    }
+
+    // Track tool calls in the ring buffer
+    if (activity.type === 'tool_call' && activity.toolName) {
+      state.recentToolCalls.push({
+        tool: activity.toolName,
+        input: activity.toolInput ?? '',
+        timestamp: now,
+      });
+
+      // Ring buffer: keep only the last N entries
+      if (state.recentToolCalls.length > MAX_RECENT_TOOL_CALLS) {
+        state.recentToolCalls.splice(0, state.recentToolCalls.length - MAX_RECENT_TOOL_CALLS);
+      }
+    }
+
+    // Track consecutive errors
+    if (activity.type === 'tool_result') {
+      if (activity.error && activity.toolName) {
+        if (state.lastErrorTool === activity.toolName) {
+          state.consecutiveErrors++;
+        } else {
+          state.consecutiveErrors = 1;
+          state.lastErrorTool = activity.toolName;
+        }
+      } else {
+        // Successful result resets the error counter
+        state.consecutiveErrors = 0;
+        state.lastErrorTool = undefined;
+      }
+    }
+  }
+
+  /**
+   * Update the context window usage percentage for a teammate.
+   * @param usage A value between 0 and 1 representing percentage used.
+   */
+  recordContextUsage(teamId: string, teammateId: string, usage: number): void {
+    const teamStates = this.states.get(teamId);
+    if (!teamStates) return;
+
+    const state = teamStates.get(teammateId);
+    if (!state) return;
+
+    state.contextUsage = Math.max(0, Math.min(1, usage));
+  }
+
+  // ============================================================
+  // Health Queries
+  // ============================================================
+
+  /**
+   * Get the current health state for a specific teammate.
+   */
+  getHealth(teamId: string, teammateId: string): TeammateHealthState | undefined {
+    return this.states.get(teamId)?.get(teammateId);
+  }
+
+  /**
+   * Get health states for all teammates in a team.
+   */
+  getTeamHealth(teamId: string): TeammateHealthState[] {
+    const teamStates = this.states.get(teamId);
+    if (!teamStates) return [];
+    return Array.from(teamStates.values());
+  }
+
+  // ============================================================
+  // Health Check Logic (Private)
+  // ============================================================
+
+  /**
+   * Run health checks for all teammates in a team.
+   * Detects stalls, error loops, retry storms, and context exhaustion.
+   */
+  private checkHealth(teamId: string): void {
+    const teamStates = this.states.get(teamId);
+    if (!teamStates) return;
+
+    const now = Date.now();
+
+    for (const state of teamStates.values()) {
+      // --- Stall check ---
+      if (state.currentTaskId) {
+        const lastActivity = new Date(state.lastActivityAt).getTime();
+        const elapsed = now - lastActivity;
+
+        if (elapsed > this.config.stallTimeoutMs) {
+          this.emitIssue(teamId, {
+            type: 'stall',
+            teammateId: state.teammateId,
+            teammateName: state.teammateName,
+            taskId: state.currentTaskId,
+            details: `No activity for ${Math.round(elapsed / 1000)}s while working on task ${state.currentTaskId}`,
+            detectedAt: new Date().toISOString(),
+            duration: elapsed,
+          });
+        }
+      }
+
+      // --- Error loop check ---
+      if (
+        state.consecutiveErrors >= this.config.errorLoopThreshold &&
+        state.lastErrorTool
+      ) {
+        this.emitIssue(teamId, {
+          type: 'error-loop',
+          teammateId: state.teammateId,
+          teammateName: state.teammateName,
+          taskId: state.currentTaskId,
+          details: `${state.consecutiveErrors} consecutive errors on tool "${state.lastErrorTool}"`,
+          detectedAt: new Date().toISOString(),
+        });
+      }
+
+      // --- Retry storm check ---
+      this.checkRetryStorm(teamId, state);
+
+      // --- Context exhaustion check ---
+      if (
+        state.contextUsage !== undefined &&
+        state.contextUsage >= this.config.contextWarningThreshold
+      ) {
+        this.emitIssue(teamId, {
+          type: 'context-exhaustion',
+          teammateId: state.teammateId,
+          teammateName: state.teammateName,
+          taskId: state.currentTaskId,
+          details: `Context window usage at ${Math.round(state.contextUsage * 100)}% (threshold: ${Math.round(this.config.contextWarningThreshold * 100)}%)`,
+          detectedAt: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Check for retry storms: multiple similar tool calls in recent history.
+   */
+  private checkRetryStorm(teamId: string, state: TeammateHealthState): void {
+    const calls = state.recentToolCalls;
+    if (calls.length < this.config.retryStormThreshold) return;
+
+    // Check the most recent N calls
+    const recentSlice = calls.slice(-this.config.retryStormThreshold);
+    const firstCall = recentSlice[0];
+    if (!firstCall) return;
+
+    // All calls must be the same tool with similar input (first 100 chars)
+    const firstTool = firstCall.tool;
+    const inputPrefix = firstCall.input.slice(0, 100);
+    const allSimilar = recentSlice.every(
+      (call) => call.tool === firstTool && call.input.slice(0, 100) === inputPrefix,
+    );
+
+    if (allSimilar) {
+      this.emitIssue(teamId, {
+        type: 'retry-storm',
+        teammateId: state.teammateId,
+        teammateName: state.teammateName,
+        taskId: state.currentTaskId,
+        details: `${recentSlice.length} similar calls to "${firstTool}" detected`,
+        detectedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  // ============================================================
+  // Event Emission (with debouncing)
+  // ============================================================
+
+  /**
+   * Emit a health issue event, respecting the debounce interval.
+   * Also records the issue on the teammate's state.
+   */
+  private emitIssue(teamId: string, issue: HealthIssue): void {
+    const issueKey = `${teamId}:${issue.teammateId}:${issue.type}`;
+    const now = Date.now();
+    const lastTime = this.lastEmitted.get(issueKey);
+
+    if (lastTime && now - lastTime < DEBOUNCE_INTERVAL_MS) {
+      return; // Debounced — don't re-emit
+    }
+
+    this.lastEmitted.set(issueKey, now);
+
+    // Record on the teammate's state
+    const state = this.states.get(teamId)?.get(issue.teammateId);
+    if (state) {
+      state.issues.push(issue);
+    }
+
+    this.emit(`health:${issue.type}`, issue);
+  }
+
+  // ============================================================
+  // Internal Helpers
+  // ============================================================
+
+  /**
+   * Ensure a TeammateHealthState exists for the given teammate, creating one if needed.
+   */
+  private ensureState(
+    teamId: string,
+    teammateId: string,
+    teammateName: string,
+  ): TeammateHealthState {
+    if (!this.states.has(teamId)) {
+      this.states.set(teamId, new Map());
+    }
+
+    const teamStates = this.states.get(teamId)!;
+
+    if (!teamStates.has(teammateId)) {
+      teamStates.set(teammateId, {
+        teammateId,
+        teammateName,
+        lastActivityAt: new Date().toISOString(),
+        consecutiveErrors: 0,
+        recentToolCalls: [],
+        issues: [],
+      });
+    }
+
+    return teamStates.get(teammateId)!;
+  }
+
+  // ============================================================
+  // Cleanup
+  // ============================================================
+
+  /**
+   * Dispose of the monitor: clear all intervals and internal state.
+   */
+  dispose(): void {
+    for (const interval of this.intervals.values()) {
+      clearInterval(interval);
+    }
+    this.intervals.clear();
+    this.states.clear();
+    this.lastEmitted.clear();
+    this.removeAllListeners();
+  }
+}

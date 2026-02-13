@@ -12,6 +12,7 @@
 import * as React from 'react'
 import { useState, useEffect, useCallback } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
+import { Info } from 'lucide-react'
 import { PanelHeader } from '@/components/app-shell/PanelHeader'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { HeaderMenu } from '@/components/ui/HeaderMenu'
@@ -559,49 +560,60 @@ export default function AgentTeamsSettingsPage() {
                       </SettingsRadioGroup>
                     </SettingsSection>
 
-                    {/* Per-Role Model Assignment */}
-                    <SettingsSection
-                      title="Role Models"
-                      description="Model assigned to each role in the team hierarchy"
-                    >
-                      <SettingsCard>
-                        <SettingsMenuSelectRow
-                          label="Lead"
-                          description="Orchestrator that plans work and delegates"
-                          value={leadModel}
-                          onValueChange={handleLeadChange}
-                          options={roleModelOptions}
-                        />
-                        <SettingsMenuSelectRow
-                          label="Head"
-                          description="Coordinates sub-teams or complex sub-tasks"
-                          value={headModel}
-                          onValueChange={handleHeadChange}
-                          options={roleModelOptions}
-                        />
-                        <SettingsMenuSelectRow
-                          label="Worker"
-                          description="Executes individual tasks"
-                          value={workerModel}
-                          onValueChange={handleWorkerChange}
-                          options={roleModelOptions}
-                        />
-                        <SettingsMenuSelectRow
-                          label="Reviewer"
-                          description="Reviews teammate output in quality gates"
-                          value={reviewerModel}
-                          onValueChange={handleReviewerChange}
-                          options={reviewModelOptions}
-                        />
-                        <SettingsMenuSelectRow
-                          label="Escalation"
-                          description="Handles worker failures or review rejections"
-                          value={escalationModel}
-                          onValueChange={handleEscalationChange}
-                          options={roleModelOptions}
-                        />
-                      </SettingsCard>
-                    </SettingsSection>
+                    {/* Per-role model assignment is only shown for Custom preset */}
+                    {selectedPreset === 'custom' && (
+                      <SettingsSection
+                        title="Role Models"
+                        description="Model assigned to each role in the team hierarchy"
+                      >
+                        <SettingsCard>
+                          <div className="px-4 py-3 border-b border-border/60 bg-foreground/[0.02]">
+                            <div className="flex items-start gap-2">
+                              <Info className="size-4 mt-0.5 text-muted-foreground shrink-0" />
+                              <div className="space-y-1">
+                                <p className="text-xs font-medium">Suggested defaults for speed + quality</p>
+                                <p className="text-xs text-muted-foreground">Lead: Opus/Codex (planning) · Head: Sonnet/Codex (coordination) · Worker: Sonnet/Haiku/Kimi (throughput) · Reviewer: Sonnet/Kimi (fast checks) · Escalation: Opus/Codex (hard blockers).</p>
+                              </div>
+                            </div>
+                          </div>
+                          <SettingsMenuSelectRow
+                            label="Lead"
+                            description="Orchestrator that plans work and delegates"
+                            value={leadModel}
+                            onValueChange={handleLeadChange}
+                            options={roleModelOptions}
+                          />
+                          <SettingsMenuSelectRow
+                            label="Head"
+                            description="Coordinates sub-teams or complex sub-tasks"
+                            value={headModel}
+                            onValueChange={handleHeadChange}
+                            options={roleModelOptions}
+                          />
+                          <SettingsMenuSelectRow
+                            label="Worker"
+                            description="Executes individual tasks"
+                            value={workerModel}
+                            onValueChange={handleWorkerChange}
+                            options={roleModelOptions}
+                          />
+                          <SettingsMenuSelectRow
+                            label="Reviewer"
+                            description="Reviews teammate output in quality gates"
+                            value={reviewerModel}
+                            onValueChange={handleReviewerChange}
+                            options={reviewModelOptions}
+                          />
+                          <SettingsMenuSelectRow
+                            label="Escalation"
+                            description="Handles worker failures or review rejections"
+                            value={escalationModel}
+                            onValueChange={handleEscalationChange}
+                            options={roleModelOptions}
+                          />
+                        </SettingsCard>
+                      </SettingsSection>
+                    )}
 
                     {(codexSelected && !hasCodexConnection) && (
                       <SettingsSection

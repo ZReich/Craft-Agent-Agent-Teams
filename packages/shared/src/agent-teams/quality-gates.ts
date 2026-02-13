@@ -24,7 +24,7 @@ import { resolveReviewProvider } from './review-provider';
 export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
   enabled: true,
   passThreshold: 90,
-  maxReviewCycles: 5,
+  maxReviewCycles: 3,
   enforceTDD: true,
   reviewModel: 'kimi-k2.5',
   reviewProvider: 'moonshot',
@@ -278,6 +278,11 @@ export function mergeQualityGateConfig(
   // If a review model was set without an explicit provider, infer it
   if (!userConfig.reviewProvider && merged.reviewModel) {
     merged.reviewProvider = resolveReviewProvider(merged.reviewModel);
+  }
+
+  // Keep escalation provider aligned with escalation model unless user explicitly set it.
+  if (!userConfig.escalationProvider && merged.escalationModel) {
+    merged.escalationProvider = resolveReviewProvider(merged.escalationModel);
   }
 
   return merged;
