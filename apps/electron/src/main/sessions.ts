@@ -98,7 +98,7 @@ import { listLabels } from '@craft-agent/shared/labels/storage'
 import { extractLabelId } from '@craft-agent/shared/labels'
 import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
 import { calculateTokenCostUsd, inferProviderFromModel, type UsageProvider } from '@craft-agent/shared/usage'
-import { buildTeammateCodename, buildTeamCodename, teammateMatchesTargetName } from './teammate-codenames'
+import { buildTeammateCodename, buildTeamCodename, isLeadTargetName, teammateMatchesTargetName } from './teammate-codenames'
 import { UsagePersistence, UsageAlertChecker } from '@craft-agent/shared/usage'
 import type { SessionUsage as PersistedSessionUsage, UsageAlert, UsageAlertThresholds } from '@craft-agent/core'
 import type { FSWatcher } from 'fs'
@@ -325,6 +325,67 @@ function formatHealthAlertMessage(issue: HealthIssue): string {
     `### ⚠️ Team Health Alert (${typeLabel})`,
     `Teammate: ${issue.teammateName}`,
     `Issue: ${issue.details}`,
+  ].join('\n')
+}
+
+function formatHealthAlertSummaryMessage(issues: HealthIssue[]): string {
+  if (issues.length === 0) {
+    return '### ⚠️ Team Health Summary\nNo active issues.'
+  }
+
+  type GroupKey = string
+  type Group = {
+    teammateName: string
+    type: HealthIssue['type']
+    count: number
+    latestDetails: string
+  }
+
+  const groups = new Map<GroupKey, Group>()
+  for (const issue of issues) {
+    const key = `${issue.teammateId}:${issue.type}`
+    const existing = groups.get(key)
+    if (existing) {
+      existing.count += 1
+      existing.latestDetails = issue.details
+    } else {
+      groups.set(key, {
+        teammateName: issue.teammateName,
+        type: issue.type,
+        count: 1,
+        latestDetails: issue.details,
+      })
+    }
+  }
+
+  const typeLabel = (type: HealthIssue['type']): string => {
+    if (type === 'stall') return 'STALL'
+    if (type === 'error-loop') return 'ERROR LOOP'
+    if (type === 'retry-storm') return 'RETRY STORM'
+    return 'CONTEXT EXHAUSTION'
+  }
+
+  const lines = Array.from(groups.values()).map(group =>
+    `- ${group.teammateName}: ${typeLabel(group.type)} x${group.count} (latest: ${group.latestDetails})`
+  )
+
+  return [
+    `### ⚠️ Team Health Summary`,
+    `Window issues: ${issues.length}`,
+    ...lines,
+  ].join('\n')
+}
+
+function buildTeamDeliveryMetadata(options: {
+  outputPresent: boolean
+  receiverId: string
+}): string {
+  return [
+    '### Delivery Metadata',
+    `- delivery_status: delivered`,
+    `- ack_received: true`,
+    `- receiver_id: ${options.receiverId}`,
+    `- output_present: ${options.outputPresent ? 'true' : 'false'}`,
   ].join('\n')
 }
 
@@ -1498,6 +1559,10 @@ export class SessionManager {
   private healthMonitorTeams = new Set<string>() // teams with active monitoring
   private teamStatusIntervals = new Map<string, NodeJS.Timeout>() // periodic status checks
   private teamHealthAlertHandlers = new Map<string, (issue: HealthIssue) => void>()
+  // Implements REQ-003: aggregate health alerts to prevent retry-storm chat spam
+  private pendingTeamHealthAlerts = new Map<string, HealthIssue[]>()
+  private teamHealthAlertFlushTimers = new Map<string, NodeJS.Timeout>()
+  private readonly teamHealthAlertFlushMs = 90 * 1000
   private teammateKickoffTimers = new Map<string, NodeJS.Timeout>()
   private usagePersistenceByWorkspace: Map<string, UsagePersistence> = new Map()
   private usageAlertCheckerByWorkspace: Map<string, UsageAlertChecker> = new Map()
@@ -1532,6 +1597,39 @@ export class SessionManager {
   }
 
   /**
+   * Buffer health alerts and flush as a compact summary to avoid alert storms.
+   * Implements REQ-003: reduce noisy repeated health notifications.
+   */
+  private queueTeamHealthAlert(teamId: string, leadSessionId: string, issue: HealthIssue): void {
+    const queue = this.pendingTeamHealthAlerts.get(teamId) ?? []
+    queue.push(issue)
+    if (queue.length > 50) {
+      queue.splice(0, queue.length - 50)
+    }
+    this.pendingTeamHealthAlerts.set(teamId, queue)
+
+    if (this.teamHealthAlertFlushTimers.has(teamId)) return
+
+    const timer = setTimeout(async () => {
+      this.teamHealthAlertFlushTimers.delete(teamId)
+      const buffered = this.pendingTeamHealthAlerts.get(teamId) ?? []
+      this.pendingTeamHealthAlerts.delete(teamId)
+      if (buffered.length === 0) return
+      try {
+        await this.sendMessage(leadSessionId, formatHealthAlertSummaryMessage(buffered))
+      } catch (err) {
+        sessionLog.error('[AgentTeams] Failed to send aggregated health summary to lead:', err)
+      }
+    }, this.teamHealthAlertFlushMs)
+
+    if (typeof timer.unref === 'function') {
+      timer.unref()
+    }
+
+    this.teamHealthAlertFlushTimers.set(teamId, timer)
+  }
+
+  /**
    * Start health monitoring for a team.
    * Registers event listeners for health issues and sets up periodic status check-ins.
    */
@@ -1548,14 +1646,7 @@ export class SessionManager {
       if (!teammate) return
       const teammateTeamId = teammate.teamId ? teamManager.resolveTeamId(teammate.teamId) : undefined
       if (teammateTeamId !== teamId) return
-      const alertMessage = formatHealthAlertMessage(issue)
-      setTimeout(async () => {
-        try {
-          await this.sendMessage(leadSessionId, alertMessage)
-        } catch (err) {
-          sessionLog.error('[AgentTeams] Failed to send health alert to lead:', err)
-        }
-      }, 100)
+      this.queueTeamHealthAlert(teamId, leadSessionId, issue)
 
       // Broadcast health issue to the dashboard for inline card badges
       if (this.windowManager) {
@@ -1651,6 +1742,13 @@ export class SessionManager {
       clearInterval(statusInterval)
       this.teamStatusIntervals.delete(teamId)
     }
+
+    const flushTimer = this.teamHealthAlertFlushTimers.get(teamId)
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      this.teamHealthAlertFlushTimers.delete(teamId)
+    }
+    this.pendingTeamHealthAlerts.delete(teamId)
   }
 
   /**
@@ -4538,6 +4636,20 @@ export class SessionManager {
               return { delivered: delivered > 0, error: delivered === 0 ? 'No teammates found' : undefined }
             }
 
+            // Implements REQ-001/REQ-002: normalize lead recipient aliases so worker -> lead
+            // delivery succeeds without spawning inbox workaround sessions.
+            if (
+              managed.parentSessionId &&
+              isLeadTargetName(params.targetName || '', managed.teamId)
+            ) {
+              try {
+                await this.sendMessage(managed.parentSessionId, `[Team Result] ${params.content}`)
+                return { delivered: true }
+              } catch (err) {
+                return { delivered: false, error: String(err) }
+              }
+            }
+
             for (const tid of teammateIds) {
               const teammate = this.sessions.get(tid)
               if (teammateMatchesTargetName(teammate?.teammateName, teammate?.name, params.targetName)) {
@@ -4553,7 +4665,10 @@ export class SessionManager {
                 }
               }
             }
-            return { delivered: false, error: `Teammate "${params.targetName}" not found` }
+            const fallbackHint = managed.parentSessionId
+              ? `Teammate "${params.targetName}" not found. Use "team-lead" to reach the lead.`
+              : `Teammate "${params.targetName}" not found`
+            return { delivered: false, error: fallbackHint }
           } : undefined,
           // Critical: Immediately persist SDK session ID when captured to prevent loss on crash.
           onSdkSessionIdUpdate: (sdkSessionId: string) => {
@@ -4888,6 +5003,20 @@ export class SessionManager {
               return { delivered: delivered > 0, error: delivered === 0 ? 'No teammates found' : undefined }
             }
 
+            // Implements REQ-001/REQ-002: normalize lead recipient aliases so worker -> lead
+            // delivery succeeds without spawning inbox workaround sessions.
+            if (
+              managed.parentSessionId &&
+              isLeadTargetName(params.targetName || '', managed.teamId)
+            ) {
+              try {
+                await this.sendMessage(managed.parentSessionId, `[Team Result] ${params.content}`)
+                return { delivered: true }
+              } catch (err) {
+                return { delivered: false, error: String(err) }
+              }
+            }
+
             // Direct message: find teammate by name
             for (const tid of teammateIds) {
               const teammate = this.sessions.get(tid)
@@ -4905,7 +5034,10 @@ export class SessionManager {
                 }
               }
             }
-            return { delivered: false, error: `Teammate "${params.targetName}" not found` }
+            const fallbackHint = managed.parentSessionId
+              ? `Teammate "${params.targetName}" not found. Use "team-lead" to reach the lead.`
+              : `Teammate "${params.targetName}" not found`
+            return { delivered: false, error: fallbackHint }
           } : undefined,
         })
         sessionLog.info(`Created Claude agent for session ${managed.id}${managed.sdkSessionId ? ' (resuming)' : ''}`)
@@ -7220,9 +7352,17 @@ export class SessionManager {
           const lastAssistantMsg = [...managed.messages].reverse().find(m =>
             m.role === 'assistant' && !m.isIntermediate
           )
-          const resultContent = lastAssistantMsg?.content || '(No output produced)'
+          // Implements REQ-002: explicit output semantics for teammate completion relay.
+          const outputPresent = Boolean(lastAssistantMsg?.content?.trim())
+          const resultContent = outputPresent
+            ? (lastAssistantMsg?.content ?? '')
+            : '_No assistant output captured from teammate session._'
           const teammateName = managed.teammateName
           const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId)
+          const deliveryMeta = buildTeamDeliveryMetadata({
+            outputPresent,
+            receiverId: managed.parentSessionId!,
+          })
 
           // Load quality gate config from workspace
           const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
@@ -7262,6 +7402,8 @@ export class SessionManager {
                   try {
                     const relayMessage = [
                       `## Team Result - ${teammateName}`,
+                      '',
+                      deliveryMeta,
                       '',
                       '### Quality Gate Escalated',
                       `Cycle: ${currentCycle}/${qgConfig.maxReviewCycles}`,
@@ -7329,6 +7471,8 @@ export class SessionManager {
                   const relayMessage = [
                     `## Team Result - ${teammateName}`,
                     '',
+                    deliveryMeta,
+                    '',
                     leadQualitySummary,
                     '',
                     successReport,
@@ -7389,6 +7533,8 @@ export class SessionManager {
                 try {
                   const relayMessage = [
                     `## Team Result - ${teammateName}`,
+                    '',
+                    deliveryMeta,
                     '',
                     leadQualitySummary,
                     '',
@@ -7451,7 +7597,13 @@ export class SessionManager {
             // Fallback: relay without quality report
             setTimeout(async () => {
               try {
-                const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (quality gate skipped due to error):\n\n${resultContent}`
+                const relayMessage = [
+                  `[Team Result] Teammate "${teammateName}" has completed their work (quality gate skipped due to error):`,
+                  '',
+                  deliveryMeta,
+                  '',
+                  resultContent,
+                ].join('\n')
                 await this.sendMessage(managed.parentSessionId!, relayMessage)
                 await this.autoArchiveCompletedTeammateSession(sessionId)
               } catch (relayErr) {
@@ -7467,7 +7619,13 @@ export class SessionManager {
 
           setTimeout(async () => {
             try {
-              const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}`
+              const relayMessage = [
+                `[Team Result] Teammate "${teammateName}" has completed their work:`,
+                '',
+                deliveryMeta,
+                '',
+                resultContent,
+              ].join('\n')
               await this.sendMessage(managed.parentSessionId!, relayMessage)
               await this.autoArchiveCompletedTeammateSession(sessionId)
 

@@ -97,20 +97,82 @@ export function teammateMatchesTargetName(
   sessionName: string | undefined,
   targetName: string
 ): boolean {
-  const target = targetName.trim().toLowerCase()
-  if (!target) return false
+  const rawTarget = targetName.trim().toLowerCase()
+  if (!rawTarget) return false
 
   const teammate = teammateName?.trim().toLowerCase() ?? ''
   const session = sessionName?.trim().toLowerCase() ?? ''
 
-  // Exact match on either field
-  if (teammate === target || session === target) return true
+  const normalizedKey = (value: string): string =>
+    value
+      .toLowerCase()
+      .replace(/@[^\\s]+$/g, '') // drop @team suffix for alias matching
+      .replace(/[^a-z0-9]+/g, '')
 
-  // Match inside parentheses or brackets: "Worker Neon Falcon (custom-name)"
-  if (teammate.includes(`(${target})`) || teammate.includes(`[${target}]`)) return true
+  const targetCandidates = new Set<string>([
+    rawTarget,
+    rawTarget.replace(/^@+/, ''),
+  ])
 
-  // Word boundary regex match
-  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const boundary = new RegExp(`(?:^|\\W)${escaped}(?:\\W|$)`, 'i')
-  return boundary.test(teammate)
+  // If target includes team suffix (e.g. worker@team), also match local part.
+  if (rawTarget.includes('@')) {
+    targetCandidates.add(rawTarget.split('@')[0] ?? rawTarget)
+  }
+
+  const teammateCandidates = [teammate, session].filter(Boolean)
+
+  for (const target of targetCandidates) {
+    const trimmedTarget = target.trim()
+    if (!trimmedTarget) continue
+
+    // Exact match on either field
+    if (teammateCandidates.some(candidate => candidate === trimmedTarget)) return true
+
+    // Normalized exact match (handles -, _, spaces, and @team suffix variance)
+    const normalizedTarget = normalizedKey(trimmedTarget)
+    if (normalizedTarget && teammateCandidates.some(candidate => normalizedKey(candidate) === normalizedTarget)) {
+      return true
+    }
+
+    // Match inside parentheses or brackets: "Worker Neon Falcon (custom-name)"
+    if (teammate.includes(`(${trimmedTarget})`) || teammate.includes(`[${trimmedTarget}]`)) return true
+
+    // Word boundary regex match
+    const escaped = trimmedTarget.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const boundary = new RegExp(`(?:^|\\W)${escaped}(?:\\W|$)`, 'i')
+    if (boundary.test(teammate) || boundary.test(session)) return true
+  }
+
+  return false
+}
+
+/**
+ * Detect whether a SendMessage target should resolve to the team lead.
+ *
+ * Implements REQ-001/REQ-002: normalize lead recipient aliases so workers can
+ * reliably deliver results without retry storms due to naming variants.
+ */
+export function isLeadTargetName(targetName: string, teamName?: string): boolean {
+  const raw = targetName.trim().toLowerCase()
+  if (!raw) return false
+
+  const local = raw.includes('@') ? (raw.split('@')[0] ?? raw) : raw
+  const normalized = local.replace(/[^a-z0-9]+/g, '')
+
+  if (normalized === 'lead' || normalized === 'teamlead' || normalized === 'orchestratorlead') {
+    return true
+  }
+
+  // Handle variants like team_lead_food_debate / team-lead-food-debate.
+  if (normalized.startsWith('teamlead')) {
+    return true
+  }
+
+  if (!teamName) return false
+
+  const teamNorm = teamName.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  if (!teamNorm) return false
+
+  // Handle local targets like "leadfooddebate" or "teamleadfooddebate".
+  return normalized === `lead${teamNorm}` || normalized === `teamlead${teamNorm}`
 }

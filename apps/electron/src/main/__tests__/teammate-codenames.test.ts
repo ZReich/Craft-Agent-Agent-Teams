@@ -9,6 +9,7 @@ import {
   buildTeammateCodename,
   buildTeamCodename,
   teammateMatchesTargetName,
+  isLeadTargetName,
   roleLabel,
   CODENAME_ADJECTIVES,
   CODENAME_NOUNS,
@@ -346,5 +347,42 @@ describe('teammateMatchesTargetName', () => {
     it('does not match substring inside compound word', () => {
       expect(teammateMatchesTargetName('Superworker', undefined, 'worker')).toBe(false)
     })
+
+    it('matches @team suffix aliases to local teammate names', () => {
+      expect(teammateMatchesTargetName('taco-champion', undefined, 'taco-champion@food-debate')).toBe(true)
+      expect(teammateMatchesTargetName('pizza_champion', undefined, 'pizza-champion@food-debate')).toBe(true)
+    })
+
+    it('matches normalized separator variants', () => {
+      expect(teammateMatchesTargetName('team_lead_food_debate', undefined, 'team-lead-food-debate')).toBe(true)
+      expect(teammateMatchesTargetName('worker-neon-falcon', undefined, 'worker_neon_falcon')).toBe(true)
+    })
+  })
+})
+
+// ============================================================================
+// isLeadTargetName — Canonical lead alias detection
+// ============================================================================
+
+describe('isLeadTargetName', () => {
+  it('matches canonical lead aliases', () => {
+    expect(isLeadTargetName('lead')).toBe(true)
+    expect(isLeadTargetName('team-lead')).toBe(true)
+    expect(isLeadTargetName('team_lead')).toBe(true)
+  })
+
+  it('matches lead aliases with @team suffix', () => {
+    expect(isLeadTargetName('team-lead@food-debate')).toBe(true)
+    expect(isLeadTargetName('lead@food-debate')).toBe(true)
+  })
+
+  it('matches expanded lead aliases containing team name', () => {
+    expect(isLeadTargetName('team_lead_food_debate', 'food-debate')).toBe(true)
+    expect(isLeadTargetName('lead_food_debate', 'food-debate')).toBe(true)
+  })
+
+  it('does not match worker aliases', () => {
+    expect(isLeadTargetName('taco-champion')).toBe(false)
+    expect(isLeadTargetName('pizza-champion@food-debate')).toBe(false)
   })
 })
