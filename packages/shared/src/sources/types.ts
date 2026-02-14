@@ -13,6 +13,8 @@
 /**
  * Source types - how we connect to the source
  */
+
+import { isSourceUsable } from './storage.ts';
 export type SourceType = 'mcp' | 'api' | 'local';
 
 /**
@@ -187,16 +189,17 @@ export function isApiOAuthProvider(provider: string | undefined): provider is Ap
  * Only returns true if the source is authenticated (has tokens to refresh).
  */
 export function isOAuthSource(source: LoadedSource): boolean {
-  if (!source.config.isAuthenticated) return false;
+  const { config } = source;
+  if (!isSourceUsable(source)) return false;
 
   // MCP OAuth sources
-  if (source.config.type === 'mcp') {
-    return source.config.mcp?.authType === 'oauth';
+  if (config.type === 'mcp') {
+    return config.mcp?.authType === 'oauth';
   }
 
   // API OAuth sources (Google, Slack, Microsoft)
-  if (source.config.type === 'api') {
-    return isApiOAuthProvider(source.config.provider);
+  if (config.type === 'api') {
+    return isApiOAuthProvider(config.provider);
   }
 
   return false;

@@ -68,9 +68,13 @@ export function useBackgroundTasks({ sessionId }: UseBackgroundTasksOptions): Us
         // Shell may already be gone - that's OK, still remove from UI
       }
     } else {
-      // For agents, we don't have a direct kill mechanism yet
-      // The model would need to use TaskOutput to check status
-      console.warn('Killing agent tasks not yet implemented')
+      // Best-effort: request session cancellation (silent to avoid duplicate toasts).
+      // This cancels active background agent work in the same session.
+      try {
+        await window.electronAPI.cancelProcessing(sessionId, true)
+      } catch {
+        // Agent may already be finished or session may have ended.
+      }
     }
 
     // Always remove from UI after kill attempt

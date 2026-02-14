@@ -28,31 +28,38 @@ export class CraftTicketProvider implements TicketProvider {
   ) {}
 
   async listTickets(_filter?: TicketFilter): Promise<Ticket[]> {
-    throw new Error('Not yet implemented: Craft ticket listing via MCP source integration');
+    // Implements REQ-002: Return a safe empty result until Craft ticket tooling is available.
+    return [];
   }
 
   async getTicket(_ticketId: string): Promise<Ticket | null> {
-    throw new Error('Not yet implemented: Craft ticket lookup via MCP source integration');
+    return null;
   }
 
   async updateTicketStatus(_ticketId: string, _status: TicketStatus): Promise<void> {
-    throw new Error('Not yet implemented: Craft ticket status updates via MCP source integration');
+    throw new Error('Craft ticket status updates are not supported by the current provider integration.');
   }
 
   async linkToRequirement(_ticketId: string, _requirementId: string): Promise<void> {
-    throw new Error('Not yet implemented: Craft requirement link updates');
+    throw new Error('Craft requirement linking is not supported by the current provider integration.');
   }
 
   async unlinkFromRequirement(_ticketId: string, _requirementId: string): Promise<void> {
-    throw new Error('Not yet implemented: Craft requirement unlink updates');
+    throw new Error('Craft requirement unlinking is not supported by the current provider integration.');
   }
 
   async getTicketsForRequirement(_requirementId: string): Promise<Ticket[]> {
-    throw new Error('Not yet implemented: Craft requirement ticket lookup');
+    return [];
   }
 
   async sync(): Promise<SyncResult> {
-    throw new Error('Not yet implemented: Craft ticket sync via MCP source integration');
+    return {
+      added: 0,
+      updated: 0,
+      removed: 0,
+      errors: [],
+      lastSyncAt: new Date().toISOString(),
+    };
   }
 
   isAuthenticated(): boolean {

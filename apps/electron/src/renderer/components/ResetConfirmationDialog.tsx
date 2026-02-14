@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react"
+import { useState, useEffect } from "react"
 import {
   Dialog,
   DialogContent,
@@ -30,16 +30,22 @@ export function ResetConfirmationDialog({
   onCancel,
 }: ResetConfirmationDialogProps) {
   const [answer, setAnswer] = useState("")
+  const [problem, setProblem] = useState(() => {
+    const a = Math.floor(Math.random() * 50) + 10
+    const b = Math.floor(Math.random() * 50) + 10
+    return { a, b, sum: a + b }
+  })
 
   // Register with modal context so X button / Cmd+W closes this dialog first
   useRegisterModal(open, onCancel)
 
   // Generate a random math problem when dialog opens
-  const problem = useMemo(() => {
+  useEffect(() => {
+    if (!open) return
     const a = Math.floor(Math.random() * 50) + 10
     const b = Math.floor(Math.random() * 50) + 10
-    return { a, b, sum: a + b }
-  }, [open]) // Regenerate when dialog opens
+    setProblem({ a, b, sum: a + b })
+  }, [open])
 
   const isCorrect = parseInt(answer) === problem.sum
 

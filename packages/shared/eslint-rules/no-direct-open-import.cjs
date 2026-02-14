@@ -19,6 +19,8 @@
  *   import { openUrl } from '../utils/open-url.ts'
  */
 
+const path = require('node:path')
+
 /** @type {import('eslint').Rule.RuleModule} */
 module.exports = {
   meta: {
@@ -39,7 +41,7 @@ module.exports = {
   create(context) {
     // Allow the centralized wrapper file to import 'open'
     const filename = context.filename || context.getFilename()
-    const basename = filename.split('/').pop() || ''
+    const basename = path.basename(filename)
     if (basename === 'open-url.ts') {
       return {}
     }

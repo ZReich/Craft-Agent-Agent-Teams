@@ -297,7 +297,7 @@ export default function App() {
     // Fallback: no workspaces (shouldn't happen after onboarding)
     setWorkspaces(ws)
     setAppState('ready')
-  }, [])
+  }, [setWindowWorkspaceId])
 
   // Onboarding hook — onConfigSaved fires immediately when billing is saved,
   // ensuring connection state updates before the wizard closes.
@@ -307,7 +307,7 @@ export default function App() {
     initialSetupNeeds: setupNeeds || undefined,
   })
 
-  // Reauth login handler - placeholder (reauth is not currently used)
+  // Reauth login handler
   const handleReauthLogin = useCallback(async () => {
     // Re-check setup needs
     const needs = await window.electronAPI.getSetupNeeds()
@@ -358,7 +358,7 @@ export default function App() {
     }
 
     initialize()
-  }, [])
+  }, [setWindowWorkspaceId])
 
   // Session selection state
   const [sessionSelection, setSession] = useSession()
@@ -398,6 +398,8 @@ export default function App() {
             ultrathinkEnabled: false, // ultrathink is single-shot, never persisted
             permissionMode: s.permissionMode ?? 'ask',
             thinkingLevel: s.thinkingLevel ?? 'think',
+            agentTeamsEnabled: false,
+            yoloModeEnabled: false,
           })
         }
       }
@@ -637,7 +639,7 @@ export default function App() {
     })
 
     return cleanup
-  }, [processAgentEvent, windowWorkspaceId, store, updateSessionDirect, showSessionNotification])
+  }, [processAgentEvent, windowWorkspaceId, store, updateSessionDirect, showSessionNotification, addSession])
 
   // Listen for menu bar events
   useEffect(() => {
@@ -645,7 +647,7 @@ export default function App() {
       setMenuNewChatTrigger(n => n + 1)
     })
     const unsubSettings = window.electronAPI.onMenuOpenSettings(() => {
-      handleOpenSettings()
+      navigate(routes.view.settings())
     })
     const unsubShortcuts = window.electronAPI.onMenuKeyboardShortcuts(() => {
       navigate(routes.view.settings('shortcuts'))
@@ -672,6 +674,8 @@ export default function App() {
           ultrathinkEnabled: false,
           permissionMode: session.permissionMode ?? 'ask',
           thinkingLevel: session.thinkingLevel ?? 'think',
+          agentTeamsEnabled: false,
+          yoloModeEnabled: false,
         })
         return next
       })
@@ -851,7 +855,7 @@ export default function App() {
       }
 
       // Step 3: Check if ultrathink is enabled for this session
-      const isUltrathink = sessionOptions.get(sessionId)?.ultrathinkEnabled ?? false
+      const isUltrathink = sessionOptionsRef.current.get(sessionId)?.ultrathinkEnabled ?? false
 
       // Step 4: Extract badges from mentions (sources/skills) with embedded icons
       // Badges are self-contained for display in UserMessageBubble and viewer
@@ -925,7 +929,12 @@ export default function App() {
 
       // Auto-disable ultrathink after sending (single-shot activation)
       if (isUltrathink) {
-        handleSessionOptionsChange(sessionId, { ultrathinkEnabled: false })
+        setSessionOptions(prev => {
+          const next = new Map(prev)
+          const current = next.get(sessionId) ?? defaultSessionOptions
+          next.set(sessionId, mergeSessionOptions(current, { ultrathinkEnabled: false }))
+          return next
+        })
       }
     } catch (error) {
       console.error('Failed to send message:', error)
@@ -942,7 +951,7 @@ export default function App() {
         ]
       }))
     }
-  }, [sessionOptions, updateSessionById, skills, sources, windowWorkspaceId])
+  }, [updateSessionById, skills, sources, windowWorkspaceSlug])
 
   /**
    * Unified handler for all session option changes.
@@ -966,16 +975,17 @@ export default function App() {
       window.electronAPI.sessionCommand(sessionId, { type: 'setThinkingLevel', level: updates.thinkingLevel })
     }
     // ultrathinkEnabled is UI-only (single-shot), no backend persistence needed
-  }, [sessionOptions])
+  }, [])
 
   // Handle input draft changes per session with debounced persistence
   const draftSaveTimeoutRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
   // Cleanup draft save timers on unmount to prevent memory leaks
   useEffect(() => {
+    const timers = draftSaveTimeoutRef.current
     return () => {
-      draftSaveTimeoutRef.current.forEach(clearTimeout)
-      draftSaveTimeoutRef.current.clear()
+      timers.forEach(clearTimeout)
+      timers.clear()
     }
   }, [])
 
@@ -1160,7 +1170,7 @@ export default function App() {
     } finally {
       setShowResetDialog(false)
     }
-  }, [onboarding, initializeSessions])
+  }, [onboarding, initializeSessions, setWindowWorkspaceId])
 
   // Handle workspace selection
   // - Default: switch workspace in same window (in-window switching)
@@ -1217,7 +1227,7 @@ export default function App() {
       // Note: Sessions and theme will reload automatically due to windowWorkspaceId dependency
       // in useEffect hooks
     }
-  }, [windowWorkspaceId, setSession, store])
+  }, [windowWorkspaceId, setSession, store, setWindowWorkspaceId])
 
   // Handle workspace refresh (e.g., after icon upload)
   const handleRefreshWorkspaces = useCallback(() => {

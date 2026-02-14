@@ -25,6 +25,8 @@
  *   isSourceUsable(source)
  */
 
+const path = require('node:path')
+
 /** @type {import('eslint').Rule.RuleModule} */
 module.exports = {
   meta: {
@@ -52,7 +54,7 @@ module.exports = {
     ]
 
     const filename = context.filename || context.getFilename()
-    const basename = filename.split('/').pop() || ''
+    const basename = path.basename(filename)
 
     // Allow in specific files
     if (allowedFiles.includes(basename)) {

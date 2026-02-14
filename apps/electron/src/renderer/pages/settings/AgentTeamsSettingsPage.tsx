@@ -148,6 +148,7 @@ export default function AgentTeamsSettingsPage() {
   const [qgMaxCycles, setQgMaxCycles] = useState('5')
   const [qgEnforceTDD, setQgEnforceTDD] = useState(true)
   const [qgReviewModel, setQgReviewModel] = useState('kimi-k2.5')
+  const [qgTestScope, setQgTestScope] = useState<'affected' | 'full' | 'none'>('affected')
   const [qgBaselineAwareTests, setQgBaselineAwareTests] = useState(false)
   const [qgKnownFailingTests, setQgKnownFailingTests] = useState('')
   const [qgSyntaxEnabled, setQgSyntaxEnabled] = useState(true)
@@ -223,6 +224,7 @@ export default function AgentTeamsSettingsPage() {
             setReviewerModel(settings.qualityGatesReviewModel)
           }
         }
+        if (settings?.qualityGatesTestScope) setQgTestScope(settings.qualityGatesTestScope as 'affected' | 'full' | 'none')
         if (settings?.qualityGatesBaselineAwareTests !== undefined) setQgBaselineAwareTests(settings.qualityGatesBaselineAwareTests)
         setQgKnownFailingTests(stringifyKnownFailingTests(settings?.qualityGatesKnownFailingTests))
         if (settings?.qualityGatesSyntaxEnabled !== undefined) setQgSyntaxEnabled(settings.qualityGatesSyntaxEnabled)
@@ -476,6 +478,12 @@ export default function AgentTeamsSettingsPage() {
     setReviewerModel(v)
     saveSetting('qualityGatesReviewModel', v)
     saveSetting('agentTeamsReviewerModel', v)
+  }, [saveSetting])
+
+  const handleQgTestScopeChange = useCallback((v: string) => {
+    const scope = v as 'affected' | 'full' | 'none'
+    setQgTestScope(scope)
+    saveSetting('qualityGatesTestScope', scope)
   }, [saveSetting])
 
   const handleQgBaselineAwareTestsToggle = useCallback((enabled: boolean) => {
@@ -912,6 +920,17 @@ export default function AgentTeamsSettingsPage() {
                                 description="Require tests before implementation for feature tasks"
                                 checked={qgEnforceTDD}
                                 onCheckedChange={handleQgTDDToggle}
+                              />
+                              <SettingsMenuSelectRow
+                                label="Test Scope"
+                                description="Which tests to run during per-task quality gates"
+                                value={qgTestScope}
+                                onValueChange={handleQgTestScopeChange}
+                                options={[
+                                  { value: 'affected', label: 'Affected Only', description: 'Tests related to changed files (vitest --changed)' },
+                                  { value: 'full', label: 'Full Suite', description: 'Run the entire test suite on every task' },
+                                  { value: 'none', label: 'Skip Tests', description: 'Disable test execution in quality gates' },
+                                ]}
                               />
                             </SettingsCard>
 

@@ -255,6 +255,7 @@ export class CredentialManager {
     accessToken: string;
     tokenType?: string;
     clientId?: string;
+    expiresAt?: number;
   } | null> {
     const cred = await this.get({ type: 'workspace_oauth', workspaceId });
     if (!cred) return null;
@@ -262,6 +263,7 @@ export class CredentialManager {
       accessToken: cred.value,
       tokenType: cred.tokenType,
       clientId: cred.clientId,
+      expiresAt: cred.expiresAt,
     };
   }
 
@@ -270,6 +272,7 @@ export class CredentialManager {
     accessToken: string;
     tokenType?: string;
     clientId?: string;
+    expiresAt?: number;
   }): Promise<void> {
     await this.set(
       { type: 'workspace_oauth', workspaceId },
@@ -277,6 +280,7 @@ export class CredentialManager {
         value: credentials.accessToken,
         tokenType: credentials.tokenType,
         clientId: credentials.clientId,
+        expiresAt: credentials.expiresAt,
       }
     );
   }

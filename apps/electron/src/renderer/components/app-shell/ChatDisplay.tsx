@@ -186,6 +186,15 @@ interface ChatDisplayProps {
   emptyStateLabel?: string
   /** When true, the session's locked connection has been removed - disables send and shows unavailable state */
   connectionUnavailable?: boolean
+  // Session controls (Agent Teams + YOLO Mode) — Implements REQ-001, REQ-005
+  /** Whether Agent Teams is enabled for this session */
+  agentTeamsEnabled?: boolean
+  /** Callback when Agent Teams toggle changes */
+  onAgentTeamsChange?: (enabled: boolean) => void
+  /** Whether YOLO Mode is enabled for this session */
+  yoloModeEnabled?: boolean
+  /** Callback when YOLO Mode toggle changes */
+  onYoloModeChange?: (enabled: boolean) => void
 }
 
 /**
@@ -365,7 +374,7 @@ function ScrollOnMount({
       targetRef.current?.scrollIntoView({ behavior: 'instant' })
     })
     return () => cancelAnimationFrame(rafId)
-  }, [skip])
+  }, [skip, onScroll, targetRef])
   return null
 }
 
@@ -436,6 +445,11 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   emptyStateLabel,
   // Connection unavailable
   connectionUnavailable = false,
+  // Session controls (Agent Teams + YOLO Mode)
+  agentTeamsEnabled = false,
+  onAgentTeamsChange,
+  yoloModeEnabled = false,
+  onYoloModeChange,
 }, ref) {
   // Input is only disabled when explicitly disabled (e.g., agent needs activation)
   // User can type during streaming - submitting will stop the stream and send
@@ -517,7 +531,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     if (session && !isSearchModeActive && isFocused) {
       textareaRef.current?.focus()
     }
-  }, [session?.id, isFocused, isSearchModeActive])
+  }, [session, textareaRef, isFocused, isSearchModeActive])
 
   // Reset match state when session or search query changes
   useEffect(() => {
@@ -1268,7 +1282,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   const allTurns = React.useMemo(() => {
     if (!session) return []
     return groupMessagesByTurn(session.messages)
-  }, [session?.messages])
+  }, [session])
 
   // Keep ref in sync for scroll handler
   totalTurnCountRef.current = allTurns.length
@@ -1692,6 +1706,10 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                 inputTokens: session.tokenUsage?.inputTokens,
                 contextWindow: session.tokenUsage?.contextWindow,
               }}
+              agentTeamsEnabled={agentTeamsEnabled}
+              onAgentTeamsChange={onAgentTeamsChange}
+              yoloModeEnabled={yoloModeEnabled}
+              onYoloModeChange={onYoloModeChange}
             />
           </div>
           </div>

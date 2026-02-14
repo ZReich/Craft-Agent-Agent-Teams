@@ -134,7 +134,7 @@ describe('CodexAgent.generateTitle() event collection', () => {
       error: { message: 'Rate limit exceeded' },
     })
 
-    expect(promise).rejects.toThrow('Rate limit exceeded')
+    await expect(promise).rejects.toThrow('Rate limit exceeded')
   })
 
   it('rejects on process error', async () => {
@@ -143,7 +143,7 @@ describe('CodexAgent.generateTitle() event collection', () => {
 
     emitter.emit('error', new Error('Process crashed'))
 
-    expect(promise).rejects.toThrow('Process crashed')
+    await expect(promise).rejects.toThrow('Process crashed')
   })
 
   it('removes all listeners after completion', async () => {

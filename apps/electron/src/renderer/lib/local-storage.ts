@@ -2,6 +2,7 @@
  * Centralized localStorage utility for the Electron renderer.
  * Provides type-safe access with consistent key prefixing.
  */
+/* eslint-disable craft-agent/no-localstorage -- Intentional UI-only ephemeral storage utility; migration to preferences API is tracked separately. */
 
 const PREFIX = 'craft-'
 
@@ -56,6 +57,9 @@ export const KEYS = {
 
   // What's New
   whatsNewLastSeenVersion: 'whats-new-last-seen-version',
+
+  // Session Controls — Implements REQ-003: YOLO first-time confirmation
+  yoloConfirmed: 'session-controls-yolo-confirmed',
 } as const
 
 export type StorageKey = typeof KEYS[keyof typeof KEYS]

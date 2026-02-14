@@ -1293,7 +1293,7 @@ export function SessionList({
     }
 
     return { matchingFilterItems: matching, otherResultItems: others, exceededSearchLimit: exceeded }
-  }, [searchFilteredItems, currentFilter, evaluateViews, isSearchMode, statusFilter, labelFilterMap])
+  }, [searchFilteredItems, currentFilter, evaluateViews, isSearchMode, statusFilter, labelFilterMap, searchQuery])
 
   // Reset display limit when search query changes
   useEffect(() => {
@@ -1926,4 +1926,3 @@ export function SessionList({
     </div>
   )
 }
-

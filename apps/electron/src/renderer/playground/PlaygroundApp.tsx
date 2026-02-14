@@ -1,3 +1,4 @@
+/* eslint-disable craft-agent/no-localstorage -- Playground-only persistence for selected component state. */
 import * as React from 'react'
 import { PanelRight } from 'lucide-react'
 import { CraftAgentsSymbol } from '@/components/icons/CraftAgentsSymbol'

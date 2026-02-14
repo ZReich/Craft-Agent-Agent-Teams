@@ -184,11 +184,40 @@ async function checkApiAvailability(): Promise<CheckResult> {
   }
 }
 
-/** Check workspace token expiry - placeholder, always returns valid */
-async function checkWorkspaceToken(_workspaceId: string): Promise<CheckResult> {
-  // Token expiry checking was removed in a refactoring
-  // For now, just assume tokens are valid - the actual API call will fail if expired
-  return { ok: true, detail: '✓ Workspace token: Present' };
+/** Check workspace token presence/expiry for workspace MCP OAuth */
+async function checkWorkspaceToken(workspaceId: string): Promise<CheckResult> {
+  try {
+    const credManager = getCredentialManager();
+    const token = await credManager.getWorkspaceOAuth(workspaceId);
+    if (!token?.accessToken) {
+      return {
+        ok: false,
+        detail: '✗ Workspace token: Missing',
+        failCode: 'token_expired',
+        failTitle: 'Workspace Token Missing',
+        failMessage: 'Workspace authentication token is missing. Please sign in again.',
+      };
+    }
+
+    if (token.expiresAt && Date.now() >= token.expiresAt) {
+      return {
+        ok: false,
+        detail: '✗ Workspace token: Expired',
+        failCode: 'token_expired',
+        failTitle: 'Workspace Token Expired',
+        failMessage: 'Workspace authentication token has expired. Please sign in again.',
+      };
+    }
+
+    if (token.expiresAt) {
+      return { ok: true, detail: `✓ Workspace token: Valid until ${new Date(token.expiresAt).toISOString()}` };
+    }
+
+    return { ok: true, detail: '✓ Workspace token: Present (no expiry metadata)' };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return { ok: true, detail: `✓ Workspace token: Check failed (${msg})` };
+  }
 }
 
 /**
@@ -372,6 +401,11 @@ export async function runErrorDiagnostics(config: DiagnosticConfig): Promise<Dia
   // 3. OAuth token check (only for oauth_token auth)
   if (authType === 'oauth_token') {
     checks.push(withTimeout(checkOAuthToken(), 5000, defaultResult));
+  }
+
+  // 4. Workspace OAuth token check (if workspace context exists)
+  if (workspaceId) {
+    checks.push(withTimeout(checkWorkspaceToken(workspaceId), 3000, defaultResult));
   }
 
   // Run all checks in parallel

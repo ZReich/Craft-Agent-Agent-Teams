@@ -483,8 +483,7 @@ export function validateCodexPath(connection: LlmConnection): { isValid: boolean
   // Check if the custom path exists
   // Dynamic import to avoid bundling fs in browser contexts
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { existsSync } = require('fs');
+        const { existsSync } = require('fs');
     if (!existsSync(connection.codexPath)) {
       return {
         isValid: false,

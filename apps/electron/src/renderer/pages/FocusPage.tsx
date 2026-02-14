@@ -110,7 +110,7 @@ export const FocusPage = React.memo(function FocusPage({
     if (session && isWindowFocused) {
       onSetActiveViewingSession(session.id)
     }
-  }, [session?.id, isWindowFocused, onSetActiveViewingSession])
+  }, [session, isWindowFocused, onSetActiveViewingSession])
 
   // Get pending requests
   const pendingPermission = usePendingPermission(sessionId)
@@ -188,6 +188,27 @@ export const FocusPage = React.memo(function FocusPage({
       window.electronAPI.openSessionInNewWindow(activeWorkspaceId, sessionId)
     }
   }, [sessionId, activeWorkspaceId])
+
+  // Implements REQ-002: Agent Teams toggle handler
+  const handleAgentTeamsChange = React.useCallback((enabled: boolean) => {
+    setOption('agentTeamsEnabled', enabled)
+    if (activeWorkspaceId) {
+      window.electronAPI.setAgentTeamsEnabled(activeWorkspaceId, enabled)
+    }
+  }, [setOption, activeWorkspaceId])
+
+  // Implements REQ-003, REQ-005: YOLO Mode toggle handler
+  const handleYoloModeChange = React.useCallback((enabled: boolean) => {
+    if (enabled) {
+      setOption('preYoloPermissionMode', sessionOpts.permissionMode)
+      setOption('yoloModeEnabled', true)
+      setPermissionMode('allow-all')
+    } else {
+      const restoreMode = sessionOpts.preYoloPermissionMode ?? 'ask'
+      setOption('yoloModeEnabled', false)
+      setPermissionMode(restoreMode)
+    }
+  }, [setOption, setPermissionMode, sessionOpts.permissionMode, sessionOpts.preYoloPermissionMode])
 
   if (!session) {
     return (
@@ -294,6 +315,10 @@ export const FocusPage = React.memo(function FocusPage({
             sources={enabledSources}
             skills={skills}
             workspaceId={activeWorkspaceId || undefined}
+            agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
+            onAgentTeamsChange={handleAgentTeamsChange}
+            yoloModeEnabled={sessionOpts.yoloModeEnabled}
+            onYoloModeChange={handleYoloModeChange}
           />
         </div>
 

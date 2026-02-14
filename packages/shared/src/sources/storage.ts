@@ -361,16 +361,17 @@ export function getEnabledSources(workspaceRootPath: string): LoadedSource[] {
  * to ensure consistent handling of no-auth sources.
  */
 export function isSourceUsable(source: LoadedSource): boolean {
-  if (!source.config.enabled) return false;
+  const { config } = source;
+  if (!config.enabled) return false;
 
   // Get auth type from MCP or API config
-  const authType = source.config.mcp?.authType || source.config.api?.authType;
+  const authType = config.mcp?.authType || config.api?.authType;
 
   // Sources with no auth requirement are always usable when enabled
   if (authType === 'none' || authType === undefined) return true;
 
   // Sources requiring auth must be authenticated
-  return source.config.isAuthenticated === true;
+  return config.isAuthenticated === true;
 }
 
 /**

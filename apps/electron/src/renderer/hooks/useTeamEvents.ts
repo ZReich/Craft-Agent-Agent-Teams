@@ -173,6 +173,7 @@ export function useTeamEvents(
   const [lastEvent, setLastEvent] = useState<TeamEvent | null>(null);
   const [sequence, setSequence] = useState(0);
   const [isSubscribed, setIsSubscribed] = useState(false);
+  const [reconnectNonce, setReconnectNonce] = useState(0);
 
   // Event handler registry
   const handlersRef = useRef(new Map<string, Set<TeamEventHandler>>());
@@ -263,8 +264,6 @@ export function useTeamEvents(
     }
 
     // Real mode - use IPC (if available)
-    // TODO: Phase 1 - Full team event support pending. Current IPC only supports TeamActivityEvent.
-    // For now, use mock mode for testing.
     if (!window.electronAPI?.onAgentTeamEvent) {
       console.warn('[useTeamEvents] Agent team events not available');
       setStatus('error');
@@ -305,7 +304,7 @@ export function useTeamEvents(
         clearTimeout(batchTimerRef.current);
       }
     };
-  }, [teamId, eventTypes, batching, mock, enqueueBatchEvent, dispatchEvent]);
+  }, [teamId, eventTypes, batching, mock, enqueueBatchEvent, dispatchEvent, reconnectNonce]);
 
   // ============================================================
   // Event Subscription API
@@ -324,9 +323,7 @@ export function useTeamEvents(
 
   const reconnect = useCallback(() => {
     setStatus('connecting');
-    // Trigger re-subscription by updating a dependency
-    // (In real implementation, would call IPC to reconnect)
-    setTimeout(() => setStatus('connected'), 100);
+    setReconnectNonce((prev) => prev + 1);
   }, []);
 
   // ============================================================

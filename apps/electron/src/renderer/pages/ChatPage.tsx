@@ -207,6 +207,32 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     }
   }, [sessionId])
 
+  // Implements REQ-002: Agent Teams toggle handler
+  const handleAgentTeamsChange = React.useCallback((enabled: boolean) => {
+    setOption('agentTeamsEnabled', enabled)
+    // Also update workspace-level setting via IPC so the backend knows
+    if (activeWorkspaceId) {
+      window.electronAPI.setAgentTeamsEnabled(activeWorkspaceId, enabled)
+    }
+  }, [setOption, activeWorkspaceId])
+
+  // Implements REQ-003, REQ-005: YOLO Mode toggle handler
+  // When enabled: stores current permission mode, switches to 'allow-all'
+  // When disabled: restores previous permission mode
+  const handleYoloModeChange = React.useCallback((enabled: boolean) => {
+    if (enabled) {
+      // Store current mode before switching, then enable YOLO + Execute
+      setOption('preYoloPermissionMode', sessionOpts.permissionMode)
+      setOption('yoloModeEnabled', true)
+      setPermissionMode('allow-all')
+    } else {
+      // Restore previous permission mode
+      const restoreMode = sessionOpts.preYoloPermissionMode ?? 'ask'
+      setOption('yoloModeEnabled', false)
+      setPermissionMode(restoreMode)
+    }
+  }, [setOption, setPermissionMode, sessionOpts.permissionMode, sessionOpts.preYoloPermissionMode])
+
   // Check if session's locked connection has been removed
   const connectionUnavailable = React.useMemo(() =>
     isSessionConnectionUnavailable(session?.llmConnection, llmConnections),
@@ -226,7 +252,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     const connection = connectionSlug ? llmConnections.find(c => c.slug === connectionSlug) : null
 
     return connection?.defaultModel ?? ''
-  }, [session?.id, session?.model, session?.llmConnection, workspaceDefaultLlmConnection, llmConnections, connectionUnavailable])
+  }, [session?.model, session?.llmConnection, workspaceDefaultLlmConnection, llmConnections, connectionUnavailable])
 
   // Working directory for this session
   const workingDirectory = session?.workingDirectory
@@ -729,7 +755,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   ), [sharedUrl, handleShare, handleOpenInBrowser, handleCopyLink, handleUpdateShare, handleRevokeShare])
 
   // Build title menu content for chat sessions using shared SessionMenu
-  const sessionLabels = session?.labels ?? []
+  const sessionLabels = React.useMemo(() => session?.labels ?? [], [session?.labels])
   const titleMenu = React.useMemo(() => (
     <SessionMenu
       sessionId={sessionId}
@@ -837,6 +863,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 isSearchModeActive={isSearchModeActive}
                 onMatchInfoChange={onChatMatchInfoChange}
                 connectionUnavailable={connectionUnavailable}
+                agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
+                onAgentTeamsChange={handleAgentTeamsChange}
+                yoloModeEnabled={sessionOpts.yoloModeEnabled}
+                onYoloModeChange={handleYoloModeChange}
               />
             </div>
           </div>
@@ -947,6 +977,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             isSearchModeActive={isSearchModeActive}
             onMatchInfoChange={onChatMatchInfoChange}
             connectionUnavailable={connectionUnavailable}
+            agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
+            onAgentTeamsChange={handleAgentTeamsChange}
+            yoloModeEnabled={sessionOpts.yoloModeEnabled}
+            onYoloModeChange={handleYoloModeChange}
           />
         </div>
         )}

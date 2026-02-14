@@ -45,64 +45,71 @@ export function useWorkspaceIcon(workspace: Workspace | undefined): string | und
 
   // Track the workspace to detect changes
   const workspaceRef = useRef(workspace)
+  const workspaceId = workspace?.id
+  const workspaceIconUrl = workspace?.iconUrl
 
   useEffect(() => {
-    if (!workspace?.iconUrl) {
+    if (!workspaceIconUrl || !workspaceId) {
       setIconUrl(undefined)
       return
     }
 
     // Remote URLs - use directly
-    if (workspace.iconUrl.startsWith('http://') || workspace.iconUrl.startsWith('https://')) {
-      setIconUrl(workspace.iconUrl)
+    if (workspaceIconUrl.startsWith('http://') || workspaceIconUrl.startsWith('https://')) {
+      setIconUrl(workspaceIconUrl)
       return
     }
 
     // Not a file:// URL - skip
-    if (!workspace.iconUrl.startsWith('file://')) {
+    if (!workspaceIconUrl.startsWith('file://')) {
       setIconUrl(undefined)
       return
     }
 
     // Check if already cached with same source URL
-    const cached = iconCache.get(workspace.id)
-    if (cached && cached.sourceUrl === workspace.iconUrl) {
+    const cached = iconCache.get(workspaceId)
+    if (cached && cached.sourceUrl === workspaceIconUrl) {
       setIconUrl(cached.dataUrl)
       return
     }
 
     // Extract icon filename from file:// URL
     // e.g., "file:///path/to/icon.png?t=123" -> "icon.png"
-    const urlWithoutQuery = workspace.iconUrl.split('?')[0]
+    const urlWithoutQuery = workspaceIconUrl.split('?')[0]
     const iconFilename = urlWithoutQuery.split('/').pop()
     if (!iconFilename) {
       setIconUrl(undefined)
       return
     }
 
+    // Capture narrowed values for use in async function (TS can't narrow across async boundaries)
+    const wsId = workspaceId
+    const wsIconUrl = workspaceIconUrl
+    const filename = iconFilename
+
     // Fetch via IPC and convert to data URL
     let cancelled = false
 
     async function fetchIcon() {
       try {
-        const result = await window.electronAPI.readWorkspaceImage(workspace!.id, iconFilename!)
+        const result = await window.electronAPI.readWorkspaceImage(wsId, filename)
         if (cancelled) return
 
         if (result) {
           // readWorkspaceImage returns raw SVG for .svg files, data URL for others
           let dataUrl = result
-          if (iconFilename!.endsWith('.svg')) {
+          if (filename.endsWith('.svg')) {
             dataUrl = `data:image/svg+xml;base64,${btoa(result)}`
           }
 
           // Cache the result
-          iconCache.set(workspace!.id, { dataUrl, sourceUrl: workspace!.iconUrl! })
+          iconCache.set(wsId, { dataUrl, sourceUrl: wsIconUrl })
           setIconUrl(dataUrl)
         } else {
           setIconUrl(undefined)
         }
       } catch (error) {
-        console.error(`Failed to load icon for workspace ${workspace!.id}:`, error)
+        console.error(`Failed to load icon for workspace ${workspaceId}:`, error)
         if (!cancelled) {
           setIconUrl(undefined)
         }
@@ -114,7 +121,7 @@ export function useWorkspaceIcon(workspace: Workspace | undefined): string | und
     return () => {
       cancelled = true
     }
-  }, [workspace?.id, workspace?.iconUrl])
+  }, [workspaceId, workspaceIconUrl])
 
   return iconUrl
 }

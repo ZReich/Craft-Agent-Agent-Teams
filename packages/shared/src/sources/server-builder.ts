@@ -120,7 +120,7 @@ export class SourceServerBuilder {
     if (mcp.authType !== 'none') {
       if (token) {
         (config as { headers?: Record<string, string> }).headers = { Authorization: `Bearer ${token}` };
-      } else if (source.config.isAuthenticated) {
+      } else if (!isSourceUsable(source)) {
         // Source claims to be authenticated but token is missing - needs re-auth
         debug(`[SourceServerBuilder] Source ${source.config.slug} needs re-authentication`);
         return null;
@@ -158,10 +158,10 @@ export class SourceServerBuilder {
     // Google APIs - use token getter with auto-refresh
     // Note: Direct isAuthenticated check is safe - Google OAuth always requires auth
     if (provider === 'google') {
-      if (!source.config.isAuthenticated || !getToken) {
-        debug(`[SourceServerBuilder] Google API source ${source.config.slug} not authenticated`);
-        return null;
-      }
+    if (!isSourceUsable(source) || !getToken) {
+      debug(`[SourceServerBuilder] Google API source ${source.config.slug} not authenticated`);
+      return null;
+    }
       debug(`[SourceServerBuilder] Building Google API server for ${source.config.slug}`);
       const config = this.buildApiConfig(source);
       // Pass the token getter function - it will be called before each request
@@ -172,10 +172,10 @@ export class SourceServerBuilder {
     // Slack APIs - use token getter with auto-refresh
     // Note: Direct isAuthenticated check is safe - Slack OAuth always requires auth
     if (provider === 'slack') {
-      if (!source.config.isAuthenticated || !getToken) {
-        debug(`[SourceServerBuilder] Slack API source ${source.config.slug} not authenticated`);
-        return null;
-      }
+    if (!isSourceUsable(source) || !getToken) {
+      debug(`[SourceServerBuilder] Slack API source ${source.config.slug} not authenticated`);
+      return null;
+    }
       debug(`[SourceServerBuilder] Building Slack API server for ${source.config.slug}`);
       const config = this.buildApiConfig(source);
       // Pass the token getter function - it will be called before each request

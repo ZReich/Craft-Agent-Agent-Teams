@@ -31,11 +31,10 @@ export function getBuiltinSources(_workspaceId: string, _workspaceRootPath: stri
  *
  * @deprecated craft-agents-docs is now an always-available MCP server
  * configured directly in craft-agent.ts. This function is kept for
- * backwards compatibility but returns a placeholder.
+ * backwards compatibility and returns a disabled docs descriptor.
  */
 export function getDocsSource(workspaceId: string, workspaceRootPath: string): LoadedSource {
-  // Return a placeholder - this shouldn't be called anymore
-  const placeholderConfig: FolderSourceConfig = {
+  const docsConfig: FolderSourceConfig = {
     id: 'builtin-craft-agents-docs',
     name: 'Craft Agents Docs',
     slug: 'craft-agents-docs',
@@ -57,7 +56,7 @@ export function getDocsSource(workspaceId: string, workspaceRootPath: string): L
     workspaceId,
     workspaceRootPath,
     folderPath: '',
-    config: placeholderConfig,
+    config: docsConfig,
     guide: { raw: '' },
     isBuiltin: true,
   };
