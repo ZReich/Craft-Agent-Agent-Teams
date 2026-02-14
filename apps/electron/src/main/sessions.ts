@@ -146,7 +146,7 @@ function getBundledBunPath(): string | undefined {
   if (!app.isPackaged && process.platform === 'win32') {
     const { execSync } = require('child_process')
     try {
-      const result = execSync('where bun.exe', { encoding: 'utf-8', timeout: 5000 }).trim().split('\n')[0]
+      const result = execSync('where bun.exe', { encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }).trim().split('\n')[0]
       if (result && existsSync(result.trim())) {
         sessionLog.info(`Using system bun.exe for dev mode: ${result.trim()}`)
         return result.trim()
@@ -6917,8 +6917,94 @@ export class SessionManager {
   }
 
   /**
-   * Build a lightweight compliance report from team task linkage.
-   * Falls back to task-derived requirements when no full spec is cached.
+   * Scan the codebase for requirement ID references (e.g., REQ-001).
+   * Implements BUG-3/BUG-4: populate referencedInFiles/referencedInTests with real data.
+   */
+  private scanCodebaseForRequirements(
+    workingDir: string,
+    requirementIds: string[],
+  ): Map<string, { files: string[]; tests: string[] }> {
+    const results = new Map<string, { files: string[]; tests: string[] }>()
+    for (const id of requirementIds) {
+      results.set(id, { files: [], tests: [] })
+    }
+    if (!requirementIds.length || !workingDir || !existsSync(workingDir)) return results
+
+    // Build a combined pattern matching all requirement IDs
+    const pattern = requirementIds.map(id => id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+
+    try {
+      const isWin = process.platform === 'win32'
+      let stdout = ''
+
+      if (isWin) {
+        // Windows: use findstr recursively with /S /N
+        const { execSync } = require('child_process') as typeof import('child_process')
+        try {
+          stdout = execSync(
+            `findstr /S /N /R "${pattern}" *.ts *.tsx *.js *.jsx *.py *.rs *.go`,
+            { cwd: workingDir, timeout: 10000, encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }
+          )
+        } catch (e: any) {
+          // findstr returns exit code 1 when no matches found
+          if (e.stdout) stdout = e.stdout
+        }
+      } else {
+        // Unix: use grep recursively
+        const { execSync } = require('child_process') as typeof import('child_process')
+        try {
+          stdout = execSync(
+            `grep -rn --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' --include='*.py' --include='*.rs' --include='*.go' -E "${pattern}" .`,
+            { cwd: workingDir, timeout: 10000, encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }
+          )
+        } catch (e: any) {
+          // grep returns exit code 1 when no matches found
+          if (e.stdout) stdout = e.stdout
+        }
+      }
+
+      if (!stdout) return results
+
+      const lines = stdout.split('\n').filter(Boolean)
+      const testFilePattern = /[./\\](test|spec|__tests__|__test__|e2e|integration)[./\\]|\.(?:test|spec)\.[^.]+$/i
+
+      for (const line of lines) {
+        // Extract file path (format: "filepath:lineNumber:content" or on Windows "filepath:lineNumber: content")
+        const colonIdx = line.indexOf(':')
+        if (colonIdx < 0) continue
+        let filePath = line.substring(0, colonIdx)
+        // Skip node_modules, dist, build, .git
+        if (/node_modules|[/\\]dist[/\\]|[/\\]build[/\\]|[/\\]\.git[/\\]/i.test(filePath)) continue
+
+        // Normalize path separators
+        filePath = filePath.replace(/\\/g, '/')
+        if (filePath.startsWith('./')) filePath = filePath.substring(2)
+
+        const isTest = testFilePattern.test(filePath)
+
+        // Match which requirement IDs this line references
+        for (const reqId of requirementIds) {
+          if (line.includes(reqId)) {
+            const entry = results.get(reqId)!
+            if (isTest) {
+              if (!entry.tests.includes(filePath)) entry.tests.push(filePath)
+            } else {
+              if (!entry.files.includes(filePath)) entry.files.push(filePath)
+            }
+          }
+        }
+      }
+    } catch (err) {
+      sessionLog.warn('[SDD] Codebase scan failed (non-fatal):', err)
+    }
+
+    return results
+  }
+
+  /**
+   * Build a compliance report from team task linkage AND codebase scanning.
+   * Implements BUG-3: populate referencedInFiles/referencedInTests with real data.
+   * Implements BUG-4: build real traceability maps from code references.
    */
   private generateSpecComplianceReport(managed: ManagedSession): SpecComplianceReport | undefined {
     if (!managed.activeSpecId) return undefined
@@ -6930,41 +7016,65 @@ export class SessionManager {
     const requirementIds = spec?.requirements.map(r => r.id)
       ?? [...new Set(tasks.flatMap(task => task.requirementIds ?? []))]
 
+    // Implements BUG-3/BUG-4: scan codebase for actual requirement references
+    const workingDir = managed.workingDirectory || managed.sdkCwd || ''
+    const codebaseRefs = this.scanCodebaseForRequirements(workingDir, requirementIds)
+
     const requirementsCoverage = requirementIds.map(requirementId => {
       const linkedTasks = tasks.filter(task => (task.requirementIds ?? []).includes(requirementId))
-      const coverage: 'full' | 'partial' | 'none' = linkedTasks.length > 0 ? 'full' : 'none'
+      const refs = codebaseRefs.get(requirementId) ?? { files: [], tests: [] }
+
+      const hasTasks = linkedTasks.length > 0
+      const hasFiles = refs.files.length > 0
+      const hasTests = refs.tests.length > 0
+      const signals = [hasTasks, hasFiles, hasTests].filter(Boolean).length
+
+      // Coverage: full = all 3 signals (or 2+ with files), partial = any 1+, none = 0
+      const coverage: 'full' | 'partial' | 'none' =
+        signals >= 2 && hasFiles ? 'full' :
+        signals >= 1 ? 'partial' :
+        'none'
+
+      const noteParts: string[] = []
+      if (hasTasks) noteParts.push(`${linkedTasks.length} task(s)`)
+      if (hasFiles) noteParts.push(`${refs.files.length} file(s)`)
+      if (hasTests) noteParts.push(`${refs.tests.length} test(s)`)
+
       return {
         requirementId,
         coverage,
-        referencedInFiles: [],
-        referencedInTests: [],
-        notes: linkedTasks.length > 0
-          ? `${linkedTasks.length} linked task(s)`
-          : 'No linked tasks',
+        referencedInFiles: refs.files,
+        referencedInTests: refs.tests,
+        notes: noteParts.length > 0 ? noteParts.join(', ') : 'No references found',
       }
     })
 
     const fullCount = requirementsCoverage.filter(r => r.coverage === 'full').length
+    const partialCount = requirementsCoverage.filter(r => r.coverage === 'partial').length
     const overallCoverage = requirementsCoverage.length > 0
-      ? Math.round((fullCount / requirementsCoverage.length) * 100)
+      ? Math.round(((fullCount + partialCount * 0.5) / requirementsCoverage.length) * 100)
       : 100
 
     const unreferencedRequirements = requirementsCoverage
       .filter(r => r.coverage === 'none')
       .map(r => r.requirementId)
 
-    const traceabilityMap = requirementsCoverage.map(r => ({
-      requirementId: r.requirementId,
-      files: [],
-      tests: [],
-      tasks: tasks
-        .filter(task => (task.requirementIds ?? []).includes(r.requirementId))
-        .map(task => task.id),
-      tickets: tasks
-        .flatMap(task => task.ticketLinks ?? [])
-        .filter(ticket => (ticket.requirementIds ?? []).includes(r.requirementId))
-        .map(ticket => ticket.ticketId),
-    }))
+    // Implements BUG-4: build traceability map with real file/test data
+    const traceabilityMap = requirementsCoverage.map(r => {
+      const refs = codebaseRefs.get(r.requirementId) ?? { files: [], tests: [] }
+      return {
+        requirementId: r.requirementId,
+        files: refs.files,
+        tests: refs.tests,
+        tasks: tasks
+          .filter(task => (task.requirementIds ?? []).includes(r.requirementId))
+          .map(task => task.id),
+        tickets: tasks
+          .flatMap(task => task.ticketLinks ?? [])
+          .filter(ticket => (ticket.requirementIds ?? []).includes(r.requirementId))
+          .map(ticket => ticket.ticketId),
+      }
+    })
 
     const hasRollbackPlan = !!spec?.rollbackPlan || tasks.some(t => /rollback/i.test(t.title))
     const hasMonitoring = !!spec?.observabilityPlan || tasks.some(t => /monitor/i.test(t.title))
@@ -7177,6 +7287,9 @@ export class SessionManager {
               const result = await runner.runProgressive(reviewInput.reviewInput, taskContext, qgConfig, spec)
             result.cycleCount = currentCycle
             result.maxCycles = qgConfig.maxReviewCycles
+
+            // Implements BUG-7: store quality gate result for dashboard access
+            teamManager.storeQualityResult(resolvedTeamId, managed.id, result)
 
             if (result.passed) {
               // PASSED — relay to lead with quality report
@@ -8517,6 +8630,22 @@ export class SessionManager {
               })
               this.updateLeadTeamUsageFromTeammate(managed)
               this.persistSession(lead)
+            }
+
+            // Implements BUG-5: sync usage to teamManager so dashboard cost display works
+            const resolvedTeamId = managed.teamId
+              ? teamManager.resolveTeamId(managed.teamId)
+              : managed.parentSessionId
+                ? this.sessions.get(managed.parentSessionId)?.teamId
+                  ? teamManager.resolveTeamId(this.sessions.get(managed.parentSessionId)!.teamId!)
+                  : undefined
+                : undefined
+            if (resolvedTeamId) {
+              teamManager.updateTeammateUsage(resolvedTeamId, managed.id, {
+                inputTokens: event.usage.inputTokens,
+                outputTokens: event.usage.outputTokens,
+                costUsd: applied.costUsd,
+              })
             }
           }
 

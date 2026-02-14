@@ -440,6 +440,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         mailboxMessages,
         activity,
         spec,
+        qReports,
       ] = await Promise.all([
         window.electronAPI.getTeamTasks(session.teamId),
         window.electronAPI.getTeamCost(session.teamId),
@@ -447,6 +448,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         window.electronAPI.getTeamMessages(session.teamId),
         window.electronAPI.getTeamActivity(session.teamId),
         window.electronAPI.getTeamSpec(session.teamId),
+        // Implements BUG-7: fetch quality gate reports
+        window.electronAPI.getQualityReports?.(session.teamId).catch(() => ({})),
       ])
       setTeamTasks(tasks ?? [])
       setTeamCost(cost)
@@ -454,6 +457,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       setTeamMailboxMessages(mailboxMessages ?? [])
       setTeamActivityEvents(activity ?? [])
       setTeamSpec(spec)
+      // Implements BUG-7: convert quality reports to Map
+      if (qReports && typeof qReports === 'object') {
+        setQualityReports(new Map(Object.entries(qReports)))
+      }
       deriveSpecData(spec, session?.sddComplianceReports ?? [])
     } catch (error) {
       console.error('[TeamDashboard] Failed to load team data:', error)
@@ -649,6 +656,95 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       })
     }
   }, [session?.id, loadTeamData])
+
+  // Implements BUG-1: Toggle delegate mode handler
+  const handleToggleDelegateMode = React.useCallback(async () => {
+    if (!session?.teamId || !window.electronAPI?.toggleDelegateMode) return
+    try {
+      await window.electronAPI.toggleDelegateMode(session.teamId)
+      await loadTeamData()
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to toggle delegate mode:', error)
+      toast.error('Failed to toggle delegate mode', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, loadTeamData])
+
+  // Implements BUG-8: Model swap handler
+  const handleSwapModel = React.useCallback(async (teammateId: string) => {
+    if (!session?.teamId || !window.electronAPI?.swapTeammateModel) return
+    try {
+      // Cycle through common models: current → next in rotation
+      const modelRotation = [
+        { model: 'claude-sonnet-4-5-20250929', provider: 'anthropic' },
+        { model: 'claude-haiku-4-5-20251001', provider: 'anthropic' },
+        { model: 'claude-opus-4-6', provider: 'anthropic' },
+      ]
+      const currentMember = teamStatus?.members.find(m => m.id === teammateId)
+      const currentIdx = modelRotation.findIndex(m => m.model === currentMember?.model)
+      const next = modelRotation[(currentIdx + 1) % modelRotation.length]
+      await window.electronAPI.swapTeammateModel(session.teamId, teammateId, next.model, next.provider)
+      await loadTeamData()
+      toast.success(`Model swapped to ${next.model.split('-').slice(0, 3).join('-')}`)
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to swap model:', error)
+      toast.error('Failed to swap model', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, teamStatus, loadTeamData])
+
+  // Implements BUG-9: Escalate teammate handler (swap to highest-tier model)
+  const handleEscalateTeammate = React.useCallback(async (teammateId: string) => {
+    if (!session?.teamId || !window.electronAPI?.swapTeammateModel) return
+    try {
+      await window.electronAPI.swapTeammateModel(session.teamId, teammateId, 'claude-opus-4-6', 'anthropic')
+      await loadTeamData()
+      toast.success('Teammate escalated to Opus')
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to escalate teammate:', error)
+      toast.error('Failed to escalate teammate', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, loadTeamData])
+
+  // Implements BUG-10: Spec requirement click navigation
+  const handleSpecRequirementClick = React.useCallback((requirementId: string) => {
+    // Find linked tasks for this requirement
+    const linkedTasks = teamTasks.filter(t => (t.requirementIds ?? []).includes(requirementId))
+    if (linkedTasks.length > 0) {
+      toast.info(`${requirementId}: ${linkedTasks.length} linked task(s)`, {
+        description: linkedTasks.map(t => `${t.title} (${t.status})`).join(', '),
+      })
+    } else {
+      toast.info(`${requirementId}: No linked tasks yet`)
+    }
+  }, [teamTasks])
+
+  // Implements BUG-11: Complete team handler with SDD validation
+  const handleCompleteTeam = React.useCallback(async () => {
+    if (!session?.teamId || !window.electronAPI) return
+    try {
+      // Refresh compliance before completing
+      if (session.sddEnabled && window.electronAPI.syncSDDCompliance) {
+        await window.electronAPI.syncSDDCompliance(session.id)
+      }
+      await window.electronAPI.cleanupAgentTeam(session.teamId)
+      setShowTeamDashboard(false)
+      await loadTeamData()
+      toast.success('Team completed')
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to complete team:', error)
+      toast.error('Failed to complete team', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, session?.id, session?.sddEnabled, loadTeamData])
+
+  // Implements BUG-7: Quality reports state
+  const [qualityReports, setQualityReports] = React.useState<Map<string, import('@craft-agent/core/types').QualityGateResult>>(new Map())
 
   // Share action handlers
   const handleShare = React.useCallback(async () => {
@@ -924,12 +1020,18 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
               messages={teamMessages}
               activityEvents={teamActivityEvents}
               cost={teamCost}
+              qualityReports={qualityReports}
               onSendMessage={handleSendTeamMessage}
               onCleanupTeam={handleCleanupTeam}
+              onToggleDelegateMode={handleToggleDelegateMode}
+              onSwapModel={handleSwapModel}
               onShutdownTeammate={handleShutdownTeammate}
+              onEscalateTeammate={handleEscalateTeammate}
               specRequirements={specRequirements}
               specTraceabilityMap={specTraceabilityMap}
+              onSpecRequirementClick={handleSpecRequirementClick}
               onSpecRequirementStatusChange={handleRequirementStatusChange}
+              onCompleteTeam={handleCompleteTeam}
             />
           </div>
         ) : (

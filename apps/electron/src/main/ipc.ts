@@ -3420,7 +3420,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     return listScheduledTasks(workspace.rootPath)
   })
 
-  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_CREATE, async (_event, workspaceId: string, task: Omit<import('../../shared/types').ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_CREATE, async (_event, workspaceId: string, task: Omit<import('../shared/types').ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
     const workspace = requireWorkspace(workspaceId)
     const { createScheduledTask } = await import('@craft-agent/shared/scheduled-tasks')
     const result = await createScheduledTask(workspace.rootPath, task)
@@ -3428,7 +3428,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     return result
   })
 
-  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_UPDATE, async (_event, workspaceId: string, index: number, task: Omit<import('../../shared/types').ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_UPDATE, async (_event, workspaceId: string, index: number, task: Omit<import('../shared/types').ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
     const workspace = requireWorkspace(workspaceId)
     const { updateScheduledTask } = await import('@craft-agent/shared/scheduled-tasks')
     const result = await updateScheduledTask(workspace.rootPath, index, task)
@@ -4201,6 +4201,16 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       throw new Error(`Unknown provider: ${provider}`)
     }
     ipcLog.info(`Provider API key saved for: ${provider}`)
+  })
+
+  // Implements BUG-1: Toggle delegate mode
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_TOGGLE_DELEGATE, async (_event, teamId: string) => {
+    return teamManager.toggleDelegateMode(teamManager.resolveTeamId(teamId))
+  })
+
+  // Implements BUG-7: Get quality gate reports for all teammates
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_QUALITY_REPORTS, async (_event, teamId: string) => {
+    return teamManager.getQualityReports(teamManager.resolveTeamId(teamId))
   })
 
   // ============================================================

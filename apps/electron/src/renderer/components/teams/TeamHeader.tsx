@@ -19,6 +19,8 @@ export interface TeamHeaderProps {
   onCleanupTeam?: () => void
   specModeEnabled?: boolean
   specLabel?: string
+  /** Implements BUG-2: actual spec coverage percentage from compliance report */
+  specCoveragePercent?: number
   isCompactSidebarMode?: boolean
   onToggleCompactSidebarMode?: () => void
   viewMode?: 'overview' | 'focus'
@@ -63,6 +65,7 @@ export function TeamHeader({
   onCleanupTeam,
   specModeEnabled,
   specLabel,
+  specCoveragePercent,
   isCompactSidebarMode,
   onToggleCompactSidebarMode,
   viewMode = 'overview',
@@ -87,9 +90,19 @@ export function TeamHeader({
           <Users className="size-3" />
           <span>{activeCount}/{team.members.length}</span>
         </div>
+        {/* Implements BUG-2: dynamic spec compliance badge with percentage and color */}
         {specModeEnabled && (
-          <Badge variant="outline" className="text-[11px] px-2 py-0.5 font-medium border-accent/30 text-accent">
-            Spec Compliance
+          <Badge variant="outline" className={cn(
+            'text-[11px] px-2 py-0.5 font-medium',
+            specCoveragePercent !== undefined
+              ? specCoveragePercent >= 80
+                ? 'bg-success/10 text-success-text border-success/20'
+                : specCoveragePercent >= 50
+                  ? 'bg-warning/10 text-warning-text border-warning/20'
+                  : 'bg-destructive/10 text-destructive-text border-destructive/20'
+              : 'border-accent/30 text-accent'
+          )}>
+            {specCoveragePercent !== undefined ? `Spec: ${specCoveragePercent}%` : 'Spec Compliance'}
           </Badge>
         )}
         {specModeEnabled && specLabel && (

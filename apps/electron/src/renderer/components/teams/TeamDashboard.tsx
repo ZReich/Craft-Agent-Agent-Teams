@@ -378,6 +378,18 @@ export function TeamDashboard({
     }
   }, [session.workspaceId])
 
+  // Implements BUG-2: derive spec coverage percentage from requirements data
+  const specCoveragePercent = useMemo(() => {
+    if (!specModeEnabled || specRequirements.length === 0) return undefined
+    const verified = specRequirements.filter(r => r.status === 'verified').length
+    const implemented = specRequirements.filter(r => r.status === 'implemented').length
+    const inProgress = specRequirements.filter(r => r.status === 'in-progress').length
+    return Math.round(((verified + implemented * 0.75 + inProgress * 0.25) / specRequirements.length) * 100)
+  }, [specModeEnabled, specRequirements])
+
+  // Implements BUG-6: check if YOLO is enabled in workspace settings
+  const yoloEnabled = workspaceSettings?.yoloMode !== undefined && workspaceSettings.yoloMode !== 'off'
+
   // Implements REQ-004: gate team creation when SDD is enabled without an active spec
   const sddBlocked = specModeEnabled && !session.activeSpecId
   // Implements REQ-001: default preset to workspace settings
@@ -503,11 +515,6 @@ export function TeamDashboard({
     })
     return counts
   }, [realtimeTasks])
-  const specCoveragePercent = useMemo(() => {
-    if (specRequirements.length === 0) return 0
-    const fullyCovered = specRequirements.filter(r => (r.linkedTaskIds?.length || 0) > 0 && (r.linkedTestPatterns?.length || 0) > 0).length
-    return Math.round((fullyCovered / specRequirements.length) * 100)
-  }, [specRequirements])
 
   const compactRecentActivity = useMemo(() => realtimeActivity.slice(-5).reverse(), [realtimeActivity])
   const recentMessagesByTeammate = useMemo(() => {
@@ -594,15 +601,16 @@ export function TeamDashboard({
         onStopAllWorkers={onShutdownTeammate ? handleStopAllWorkers : undefined}
         specModeEnabled={specModeEnabled}
         specLabel={specLabel}
+        specCoveragePercent={specCoveragePercent}
         isCompactSidebarMode={compactSidebarMode}
         onToggleCompactSidebarMode={() => {
           setCompactSidebarMode(prev => !prev)
           setCompactSidebarExpanded(false)
         }}
         yoloState={yoloState}
-        onYoloStart={handleYoloStart}
-        onYoloPause={handleYoloPause}
-        onYoloAbort={handleYoloAbort}
+        onYoloStart={yoloEnabled ? handleYoloStart : undefined}
+        onYoloPause={yoloEnabled ? handleYoloPause : undefined}
+        onYoloAbort={yoloEnabled ? handleYoloAbort : undefined}
       />
 
       <div className="flex items-center justify-between px-4 py-2 border-b border-border">
@@ -777,7 +785,7 @@ export function TeamDashboard({
               model: t.model,
             }))}
             activeTasks={tasks.filter(task => task.status === 'in_progress').length}
-            specCoverage={specCoveragePercent}
+            specCoverage={specCoveragePercent ?? 0}
             recentActivity={compactRecentActivity}
             isExpanded={compactSidebarExpanded}
             onToggleExpand={() => setCompactSidebarExpanded(prev => !prev)}
@@ -922,7 +930,7 @@ export function TeamDashboard({
           open={checklistOpen}
           onOpenChange={setChecklistOpen}
           requirements={specRequirements}
-          coveragePercent={specCoveragePercent}
+          coveragePercent={specCoveragePercent ?? 0}
           onConfirmComplete={() => {
             setChecklistOpen(false)
             onCompleteTeam?.()

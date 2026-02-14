@@ -1073,6 +1073,8 @@ export const IPC_CHANNELS = {
   AGENT_TEAMS_EVENT: 'agentTeams:event',  // main → renderer broadcast
   AGENT_TEAMS_GET_PROVIDER_KEY: 'agentTeams:getProviderKey',
   AGENT_TEAMS_SET_PROVIDER_KEY: 'agentTeams:setProviderKey',
+  AGENT_TEAMS_TOGGLE_DELEGATE: 'agentTeams:toggleDelegate',
+  AGENT_TEAMS_GET_QUALITY_REPORTS: 'agentTeams:getQualityReports',
 
   // YOLO (Autonomous Execution)
   AGENT_TEAMS_YOLO_START: 'agentTeams:yoloStart',
@@ -1508,6 +1510,10 @@ export interface ElectronAPI {
   getTeamSpec(teamId: string): Promise<import('@craft-agent/core/types').Spec | undefined>
   getAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter'): Promise<{ hasKey: boolean; maskedKey?: string }>
   setAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter', key: string): Promise<void>
+  // Implements BUG-1: toggle delegate mode
+  toggleDelegateMode(teamId: string): Promise<boolean>
+  // Implements BUG-7: get quality gate reports
+  getQualityReports(teamId: string): Promise<Record<string, import('@craft-agent/core/types').QualityGateResult>>
 
   // YOLO (Autonomous Execution)
   startYolo(teamId: string, objective: string, config?: Partial<YoloConfig>): Promise<YoloState>

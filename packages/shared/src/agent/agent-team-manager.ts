@@ -26,6 +26,7 @@ import type {
   DRIAssignment,
   YoloState,
   TeamPhase,
+  QualityGateResult,
 } from '@craft-agent/core/types';
 import type { ReviewLoopOrchestrator } from '../agent-teams/review-loop';
 import type { YoloOrchestrator } from '../agent-teams/yolo-orchestrator';
@@ -94,6 +95,8 @@ export class AgentTeamManager extends EventEmitter {
   private yoloOrchestrators = new Map<string, YoloOrchestrator>();  // teamId → orchestrator
   // Implements REQ-002: persist team state across close/reopen
   private teamStateStores = new Map<string, TeamStateStore>();  // teamId → state store
+  // Implements BUG-7: store quality gate results per teammate
+  private qualityGateResults = new Map<string, Map<string, QualityGateResult>>();  // teamId → (teammateSessionId → result)
 
   /** Review loop orchestrator — when set, task completions are routed through quality gates */
   private reviewLoop: ReviewLoopOrchestrator | null = null;
@@ -288,6 +291,39 @@ export class AgentTeamManager extends EventEmitter {
   /** Set DRI assignments for a team */
   setTeamDRIAssignments(teamId: string, assignments: DRIAssignment[]): void {
     this.teamDRIAssignments.set(teamId, assignments);
+  }
+
+  // Implements BUG-1: Toggle delegate mode for a team
+  toggleDelegateMode(teamId: string): boolean {
+    const team = this.teams.get(teamId);
+    if (!team) return false;
+    team.delegateMode = !team.delegateMode;
+    this.emit('team:updated', team);
+    this.addActivity(
+      teamId,
+      team.delegateMode ? 'teammate-spawned' : 'teammate-shutdown',
+      `Delegate mode ${team.delegateMode ? 'enabled' : 'disabled'} — lead is ${team.delegateMode ? 'coordination-only' : 'fully active'}`,
+    );
+    return team.delegateMode;
+  }
+
+  // Implements BUG-7: Store quality gate result for a teammate
+  storeQualityResult(teamId: string, teammateSessionId: string, result: QualityGateResult): void {
+    if (!this.qualityGateResults.has(teamId)) {
+      this.qualityGateResults.set(teamId, new Map());
+    }
+    this.qualityGateResults.get(teamId)!.set(teammateSessionId, result);
+  }
+
+  // Implements BUG-7: Get quality gate results for all teammates in a team
+  getQualityReports(teamId: string): Record<string, QualityGateResult> {
+    const results = this.qualityGateResults.get(teamId);
+    if (!results) return {};
+    const out: Record<string, QualityGateResult> = {};
+    for (const [sessionId, result] of results) {
+      out[sessionId] = result;
+    }
+    return out;
   }
 
   // ============================================================
