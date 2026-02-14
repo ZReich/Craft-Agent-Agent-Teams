@@ -362,6 +362,27 @@ const api: ElectronAPI = {
   saveViews: (workspaceId: string, views: any[]) =>
     ipcRenderer.invoke(IPC_CHANNELS.VIEWS_SAVE, workspaceId, views),
 
+  // Scheduled Tasks (workspace-scoped, reads/writes hooks.json SchedulerTick entries)
+  listScheduledTasks: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SCHEDULED_TASKS_LIST, workspaceId),
+  createScheduledTask: (workspaceId: string, task: any) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SCHEDULED_TASKS_CREATE, workspaceId, task),
+  updateScheduledTask: (workspaceId: string, index: number, task: any) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SCHEDULED_TASKS_UPDATE, workspaceId, index, task),
+  deleteScheduledTask: (workspaceId: string, index: number) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SCHEDULED_TASKS_DELETE, workspaceId, index),
+  toggleScheduledTask: (workspaceId: string, index: number) =>
+    ipcRenderer.invoke(IPC_CHANNELS.SCHEDULED_TASKS_TOGGLE, workspaceId, index),
+  onScheduledTasksChanged: (callback: (workspaceId: string) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, workspaceId: string) => {
+      callback(workspaceId)
+    }
+    ipcRenderer.on(IPC_CHANNELS.SCHEDULED_TASKS_CHANGED, handler)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.SCHEDULED_TASKS_CHANGED, handler)
+    }
+  },
+
   // Tool icon mappings (for Appearance settings page)
   getToolIconMappings: () => ipcRenderer.invoke(IPC_CHANNELS.TOOL_ICONS_GET_MAPPINGS),
 
@@ -579,6 +600,10 @@ const api: ElectronAPI = {
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_ABORT, teamId, reason),
   getYoloState: (teamId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_GET_STATE, teamId),
+
+  // Team State Persistence (REQ-002)
+  getPersistedTeamState: (leadSessionId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_PERSISTED_STATE, leadSessionId),
 
   // SDD
   getSDDState: (sessionId: string) =>

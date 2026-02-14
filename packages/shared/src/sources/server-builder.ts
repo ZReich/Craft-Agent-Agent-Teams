@@ -220,7 +220,11 @@ export class SourceServerBuilder {
         config.auth = { type: 'bearer', authScheme: api.authScheme ?? 'Bearer' };
         break;
       case 'header':
-        config.auth = { type: 'header', headerName: api.headerName || 'x-api-key' };
+        config.auth = {
+          type: 'header',
+          headerName: api.headerName || 'x-api-key',
+          headerNames: api.headerNames, // Preserve multi-header array for sources like Datadog
+        };
         break;
       case 'query':
         config.auth = { type: 'query', queryParam: api.queryParam || 'api_key' };

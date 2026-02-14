@@ -316,6 +316,40 @@ export function TeamDashboard({
     return () => { cancelled = true }
   }, [session.teamId, session.id])
 
+  // Implements REQ-002: Load persisted team state (messages, tasks, activity) on mount
+  useEffect(() => {
+    if (!window.electronAPI?.getPersistedTeamState) return
+    let cancelled = false
+    window.electronAPI.getPersistedTeamState(session.id)
+      .then((state) => {
+        if (cancelled || !state) return
+        if (state.messages?.length) {
+          setRealtimeMessages((prev) => {
+            // Merge: persisted first, then any live messages already received
+            const existingIds = new Set(prev.map(m => m.id))
+            const merged = [...state.messages.filter(m => !existingIds.has(m.id)), ...prev]
+            return merged.slice(-MAX_REALTIME_MESSAGES)
+          })
+        }
+        if (state.tasks?.length) {
+          setRealtimeTasks((prev) => {
+            const existingIds = new Set(prev.map(t => t.id))
+            const merged = [...state.tasks.filter(t => !existingIds.has(t.id)), ...prev]
+            return merged
+          })
+        }
+        if (state.activity?.length) {
+          setRealtimeActivity((prev) => {
+            const existingIds = new Set(prev.map(a => a.id))
+            const merged = [...state.activity.filter(a => !existingIds.has(a.id)), ...prev]
+            return merged.slice(-MAX_REALTIME_ACTIVITY)
+          })
+        }
+      })
+      .catch(() => { /* no persisted state — first-time team */ })
+    return () => { cancelled = true }
+  }, [session.id])
+
   // Sync realtime state with props when they change
   useEffect(() => {
     setRealtimeMessages(messages)

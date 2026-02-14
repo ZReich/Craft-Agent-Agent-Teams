@@ -65,6 +65,8 @@ export interface AppShellContextType {
   // Unified session options (replaces ultrathinkSessions and sessionModes)
   /** All session-scoped options in one map. Use useSessionOptionsFor() hook for easy access. */
   sessionOptions: Map<string, SessionOptions>
+  /** Workspace-level agent teams enabled — drives per-session toggle default (REQ-001) */
+  workspaceAgentTeamsEnabled?: boolean
 
   // Session callbacks
   onCreateSession: (workspaceId: string, options?: import('../../shared/types').CreateSessionOptions) => Promise<Session>
@@ -223,9 +225,16 @@ export function useSessionOptionsFor(sessionId: string): {
   setPermissionMode: (mode: PermissionMode) => void
   isSafeModeActive: () => boolean
 } {
-  const { sessionOptions, onSessionOptionsChange } = useAppShellContext()
+  const { sessionOptions, onSessionOptionsChange, workspaceAgentTeamsEnabled } = useAppShellContext()
 
-  const options = sessionOptions.get(sessionId) ?? defaultSessionOptions
+  // Implements REQ-001: workspace agentTeamsEnabled drives per-session toggle default
+  const effectiveDefaults = React.useMemo(() => (
+    workspaceAgentTeamsEnabled
+      ? { ...defaultSessionOptions, agentTeamsEnabled: true }
+      : defaultSessionOptions
+  ), [workspaceAgentTeamsEnabled])
+
+  const options = sessionOptions.get(sessionId) ?? effectiveDefaults
 
   const setOption = useCallback(<K extends keyof SessionOptions>(
     key: K,

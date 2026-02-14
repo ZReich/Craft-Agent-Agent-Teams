@@ -40,7 +40,7 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
     renameSync(tmpPath, filePath);
   } catch (error) {
     // Clean up temp file if rename failed
-    try { unlinkSync(tmpPath); } catch {}
+    try { unlinkSync(tmpPath); } catch { /* best-effort temp file cleanup */ }
     throw error;
   }
 }
@@ -496,7 +496,7 @@ if (fileURLs && !fileURLs.isNil()) {
       timeout: 5000,
     }).trim();
 
-    try { unlinkSync(scriptFile); } catch {}
+    try { unlinkSync(scriptFile); } catch { /* best-effort script cleanup */ }
 
     if (result !== 'no_files' && result.startsWith('{')) {
       const parsed = JSON.parse(result);
@@ -699,10 +699,10 @@ function readClipboardImageDataLinux(): FileAttachment | null {
         return readImageFile(tempFile);
       }
       // Empty file, cleanup
-      try { unlinkSync(tempFile); } catch {}
+      try { unlinkSync(tempFile); } catch { /* best-effort temp cleanup */ }
     }
   } catch {
-    // xclip image extraction failed
+    // xclip not installed or no image in clipboard — fall through to next method
   }
 
   // Try wl-paste for Wayland
@@ -719,10 +719,10 @@ function readClipboardImageDataLinux(): FileAttachment | null {
         return readImageFile(tempFile);
       }
       // Empty file, cleanup
-      try { unlinkSync(tempFile); } catch {}
+      try { unlinkSync(tempFile); } catch { /* best-effort temp cleanup */ }
     }
   } catch {
-    // wl-paste failed
+    // wl-paste not installed or no image in clipboard — fall through
   }
 
   return null;
@@ -778,7 +778,7 @@ if (imgData && !imgData.isNil()) {
       timeout: 5000,
     }).trim();
 
-    try { unlinkSync(scriptFile); } catch {}
+    try { unlinkSync(scriptFile); } catch { /* best-effort script cleanup */ }
 
     if (result === 'success' && existsSync(tempFile)) {
       const imageResult = readImageFile(tempFile);

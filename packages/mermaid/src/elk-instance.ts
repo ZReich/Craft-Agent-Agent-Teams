@@ -56,11 +56,11 @@ function ensureElk(): ELKType {
     // the algorithm registration message)
     const pending: (() => void)[] = []
     const origSetTimeout = globalThis.setTimeout
-    // @ts-ignore — simplified signature for our interception
-    globalThis.setTimeout = (fn: () => void, delay?: number) => {
-      if (delay === 0) { pending.push(fn); return 0 }
+    // Override setTimeout to capture algorithm registration callbacks queued with delay=0
+    ;(globalThis as { setTimeout: typeof setTimeout }).setTimeout = ((fn: () => void, delay?: number) => {
+      if (delay === 0) { pending.push(fn); return 0 as unknown as ReturnType<typeof setTimeout> }
       return origSetTimeout(fn, delay)
-    }
+    }) as typeof setTimeout
 
     elk = new ELKBundled() as unknown as ELKType
 

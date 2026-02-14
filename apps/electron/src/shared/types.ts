@@ -1080,6 +1080,9 @@ export const IPC_CHANNELS = {
   AGENT_TEAMS_YOLO_ABORT: 'agentTeams:yoloAbort',
   AGENT_TEAMS_YOLO_GET_STATE: 'agentTeams:yoloGetState',
 
+  // Team State Persistence (REQ-002)
+  AGENT_TEAMS_GET_PERSISTED_STATE: 'agentTeams:getPersistedState',
+
   // Spec-Driven Development (SDD)
   SDD_GET_STATE: 'sdd:getState',
   SDD_SET_ENABLED: 'sdd:setEnabled',
@@ -1120,10 +1123,47 @@ export const IPC_CHANNELS = {
   MENU_COPY: 'menu:copy',
   MENU_PASTE: 'menu:paste',
   MENU_SELECT_ALL: 'menu:selectAll',
+
+  // Scheduled Tasks (workspace-scoped, reads/writes hooks.json SchedulerTick entries)
+  SCHEDULED_TASKS_LIST: 'scheduledTasks:list',
+  SCHEDULED_TASKS_CREATE: 'scheduledTasks:create',
+  SCHEDULED_TASKS_UPDATE: 'scheduledTasks:update',
+  SCHEDULED_TASKS_DELETE: 'scheduledTasks:delete',
+  SCHEDULED_TASKS_TOGGLE: 'scheduledTasks:toggle',
+  SCHEDULED_TASKS_CHANGED: 'scheduledTasks:changed',  // Broadcast event
 } as const
 
 // Re-import types for ElectronAPI
 import type { Workspace, SessionMetadata, StoredAttachment as StoredAttachmentType } from '@craft-agent/core/types';
+
+/**
+ * ScheduledTask - A SchedulerTick hook entry with UI metadata.
+ * Represents a single cron-scheduled task from hooks.json.
+ */
+export interface ScheduledTask {
+  /** Index in the SchedulerTick matchers array (used as ID) */
+  index: number
+  /** Human-readable name (UI metadata, stored in hooks.json) */
+  name?: string
+  /** Description (UI metadata) */
+  description?: string
+  /** Cron expression (5-field format) */
+  cron: string
+  /** IANA timezone (e.g., "America/Denver") */
+  timezone?: string
+  /** Whether this task is enabled */
+  enabled: boolean
+  /** Permission mode for the created session */
+  permissionMode?: 'safe' | 'ask' | 'allow-all'
+  /** Labels to auto-apply to created sessions */
+  labels?: string[]
+  /** The hooks (prompt/command) to execute */
+  hooks: Array<{ type: 'prompt'; prompt: string } | { type: 'command'; command: string; timeout?: number }>
+  /** Human-readable schedule description (computed, not stored) */
+  scheduleDescription?: string
+  /** Next run time ISO string (computed, not stored) */
+  nextRun?: string
+}
 
 /** Tool icon mapping entry from tool-icons.json (with icon resolved to data URL) */
 export interface ToolIconMapping {
@@ -1343,6 +1383,14 @@ export interface ElectronAPI {
   listViews(workspaceId: string): Promise<import('@craft-agent/shared/views').ViewConfig[]>
   saveViews(workspaceId: string, views: import('@craft-agent/shared/views').ViewConfig[]): Promise<void>
 
+  // Scheduled Tasks (workspace-scoped, reads/writes hooks.json SchedulerTick entries)
+  listScheduledTasks(workspaceId: string): Promise<ScheduledTask[]>
+  createScheduledTask(workspaceId: string, task: Omit<ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>): Promise<ScheduledTask>
+  updateScheduledTask(workspaceId: string, index: number, task: Omit<ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>): Promise<ScheduledTask>
+  deleteScheduledTask(workspaceId: string, index: number): Promise<void>
+  toggleScheduledTask(workspaceId: string, index: number): Promise<ScheduledTask>
+  onScheduledTasksChanged(callback: (workspaceId: string) => void): () => void
+
   // Generic workspace image loading/saving (returns data URL for images, raw string for SVG)
   readWorkspaceImage(workspaceId: string, relativePath: string): Promise<string>
   writeWorkspaceImage(workspaceId: string, relativePath: string, base64: string, mimeType: string): Promise<void>
@@ -1466,6 +1514,9 @@ export interface ElectronAPI {
   pauseYolo(teamId: string): Promise<void>
   abortYolo(teamId: string, reason?: string): Promise<void>
   getYoloState(teamId: string): Promise<YoloState | null>
+
+  // Team State Persistence (REQ-002)
+  getPersistedTeamState(leadSessionId: string): Promise<{ messages: TeammateMessage[]; tasks: TeamTask[]; activity: TeamActivityEvent[] } | null>
 
   // SDD
   getSDDState(sessionId: string): Promise<{ sddEnabled: boolean; activeSpecId?: string; sddComplianceReports: SpecComplianceReport[] }>

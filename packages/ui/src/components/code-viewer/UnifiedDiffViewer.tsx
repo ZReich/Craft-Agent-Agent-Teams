@@ -168,7 +168,8 @@ export function UnifiedDiffViewer({
       }
       header.addEventListener('click', handleClick)
       // Store cleanup ref so we can remove listener
-      ;(header as any).__craftClickCleanup = () => header.removeEventListener('click', handleClick)
+      const el = header as Element & { __craftClickCleanup?: () => void }
+      el.__craftClickCleanup = () => header.removeEventListener('click', handleClick)
     }, 150)
 
     return () => {
@@ -176,7 +177,7 @@ export function UnifiedDiffViewer({
       const diffsContainer = containerRef.current?.querySelector(DIFFS_TAG_NAME)
       const header = diffsContainer?.shadowRoot?.querySelector('[data-diffs-header]')
       if (header) {
-        ;(header as any).__craftClickCleanup?.()
+        (header as Element & { __craftClickCleanup?: () => void }).__craftClickCleanup?.()
       }
     }
   }, [filePath, disableFileHeader, onFileHeaderClick])
