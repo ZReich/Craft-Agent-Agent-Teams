@@ -1550,6 +1550,16 @@ export interface WorkspaceSettings {
   agentTeamsReviewerModel?: string
   /** Model ID for escalation handling */
   agentTeamsEscalationModel?: string
+  /** Whether thinking/extended reasoning is enabled for the Lead role (Custom preset only) */
+  agentTeamsLeadThinking?: boolean
+  /** Whether thinking/extended reasoning is enabled for the Head role (Custom preset only) */
+  agentTeamsHeadThinking?: boolean
+  /** Whether thinking/extended reasoning is enabled for the Worker role (Custom preset only) */
+  agentTeamsWorkerThinking?: boolean
+  /** Whether thinking/extended reasoning is enabled for the Reviewer role (Custom preset only) */
+  agentTeamsReviewerThinking?: boolean
+  /** Whether thinking/extended reasoning is enabled for the Escalation role (Custom preset only) */
+  agentTeamsEscalationThinking?: boolean
   /** Cost cap in USD for agent teams operations */
   agentTeamsCostCapUsd?: number
   // Quality gate settings (stored in agentTeams.qualityGates)

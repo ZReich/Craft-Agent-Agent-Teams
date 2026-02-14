@@ -8,8 +8,8 @@ function readSource(relPath: string): string {
 
 describe('YOLO wiring regression coverage', () => {
   it('has active call sites for YOLO wiring and auto-start', () => {
-    const ipcSource = readSource('src/main/ipc.ts')
-    const sessionsSource = readSource('src/main/sessions.ts')
+    const ipcSource = readSource('apps/electron/src/main/ipc.ts')
+    const sessionsSource = readSource('apps/electron/src/main/sessions.ts')
 
     expect(ipcSource).toContain('sessionManager.ensureYoloWiredForTeam(team.id, options.leadSessionId)')
     expect(sessionsSource).toContain('this.setupYoloOrchestrator(resolvedTeamId, leadSessionId, workingDirectory)')
@@ -17,14 +17,14 @@ describe('YOLO wiring regression coverage', () => {
   })
 
   it('emits yolo_state_changed when orchestrator state changes', () => {
-    const sessionsSource = readSource('src/main/sessions.ts')
+    const sessionsSource = readSource('apps/electron/src/main/sessions.ts')
 
     expect(sessionsSource).toContain("type: 'yolo_state_changed'")
     expect(sessionsSource).toContain('teamManager.updateYoloState(_teamId, state)')
   })
 
   it('declares yolo_state_changed in shared SessionEvent typing', () => {
-    const sharedTypes = readSource('src/shared/types.ts')
+    const sharedTypes = readSource('apps/electron/src/shared/types.ts')
 
     expect(sharedTypes).toContain("type: 'yolo_state_changed'")
     expect(sharedTypes).toContain("state: import('@craft-agent/core/types').YoloState")

@@ -91,6 +91,8 @@ export interface TeamTask {
   title: string;
   description?: string;
   status: TeamTaskStatus;
+  /** Task type — determines whether quality gates run. Non-code types skip QG. */
+  taskType?: TaskType;
   /** Which spec requirements this task addresses */
   requirementIds?: string[];
   /** DRI owner for this task */
@@ -350,12 +352,26 @@ export interface QualityGateConfig {
   baselineAwareTests?: boolean;
   /** Known failing tests from baseline (used when baselineAwareTests is enabled) */
   knownFailingTests?: string[];
+  /** Test scope for per-task quality gates. 'affected' runs only tests related to changed files (vitest --changed), 'full' runs the entire suite, 'none' skips tests. Default: 'affected' */
+  testScope?: 'full' | 'affected' | 'none';
   /** Per-stage configuration */
   stages: Record<QualityGateStageName, QualityGateStageConfig>;
 }
 
-/** Task type hint for TDD enforcement */
-export type TaskType = 'feature' | 'bugfix' | 'refactor' | 'test' | 'docs' | 'other';
+/** Task type hint — controls TDD enforcement and quality gate applicability */
+export type TaskType = 'feature' | 'bugfix' | 'refactor' | 'test' | 'docs' | 'research' | 'planning' | 'search' | 'explore' | 'other';
+
+/** Task types that produce code and should go through quality gates */
+export const CODE_TASK_TYPES: ReadonlySet<TaskType> = new Set(['feature', 'bugfix', 'refactor', 'test']);
+
+/** Task types that are non-code (research, planning, etc.) and should skip quality gates */
+export const NON_CODE_TASK_TYPES: ReadonlySet<TaskType> = new Set(['research', 'planning', 'search', 'explore', 'docs']);
+
+/** Check whether a task type should skip quality gates */
+export function shouldSkipQualityGates(taskType: TaskType | undefined): boolean {
+  if (!taskType) return false; // Default: run gates (backwards-compatible)
+  return NON_CODE_TASK_TYPES.has(taskType);
+}
 
 /** TDD phase state machine */
 export type TDDPhase = 'test-writing' | 'implementing' | 'review';
@@ -508,6 +524,8 @@ export const DEFAULT_YOLO_CONFIG: YoloConfig = {
 export interface YoloState {
   /** Current lifecycle phase */
   phase: YoloPhase;
+  /** The objective this run is executing */
+  objective: string;
   /** Active YOLO config for this run */
   config: YoloConfig;
   /** When the YOLO run started */

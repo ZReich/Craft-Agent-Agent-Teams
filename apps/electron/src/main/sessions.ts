@@ -98,6 +98,7 @@ import { listLabels } from '@craft-agent/shared/labels/storage'
 import { extractLabelId } from '@craft-agent/shared/labels'
 import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
 import { calculateTokenCostUsd, inferProviderFromModel, type UsageProvider } from '@craft-agent/shared/usage'
+import { buildTeammateCodename, buildTeamCodename, teammateMatchesTargetName } from './teammate-codenames'
 import { UsagePersistence, UsageAlertChecker } from '@craft-agent/shared/usage'
 import type { SessionUsage as PersistedSessionUsage, UsageAlert, UsageAlertThresholds } from '@craft-agent/core'
 import type { FSWatcher } from 'fs'
@@ -215,35 +216,7 @@ function normalizeTeamRole(rawRole?: string): TeamRole {
   return 'worker'
 }
 
-const CODENAME_ADJECTIVES = [
-  'Neon', 'Shadow', 'Solar', 'Arctic', 'Crimson', 'Ivory', 'Titan', 'Delta', 'Nova', 'Obsidian',
-]
-
-const CODENAME_NOUNS = [
-  'Falcon', 'Viper', 'Comet', 'Sentinel', 'Raven', 'Pioneer', 'Circuit', 'Phoenix', 'Atlas', 'Cipher',
-]
-
-function roleLabel(role: TeamRole): string {
-  if (role === 'reviewer') return 'Reviewer'
-  if (role === 'escalation') return 'Escalation'
-  if (role === 'head') return 'Head'
-  if (role === 'lead') return 'Lead'
-  return 'Worker'
-}
-
-function buildTeammateCodename(role: TeamRole, index: number): string {
-  const adjective = CODENAME_ADJECTIVES[index % CODENAME_ADJECTIVES.length]
-  const noun = CODENAME_NOUNS[(Math.floor(index / CODENAME_ADJECTIVES.length)) % CODENAME_NOUNS.length]
-  return `${roleLabel(role)} ${adjective} ${noun}`
-}
-
-function buildTeamCodename(seed: string): string {
-  const normalized = seed.trim().toLowerCase()
-  const hash = Array.from(normalized).reduce((acc, ch) => acc + ch.charCodeAt(0), 0)
-  const adjective = CODENAME_ADJECTIVES[hash % CODENAME_ADJECTIVES.length]
-  const noun = CODENAME_NOUNS[Math.floor(hash / CODENAME_ADJECTIVES.length) % CODENAME_NOUNS.length]
-  return `${adjective} ${noun} Squad`
-}
+// Codename generation functions moved to ./teammate-codenames.ts for testability
 
 function formatPercentScore(score: number): string {
   const normalized = Math.max(0, Math.min(100, Math.round(score)))
@@ -343,19 +316,7 @@ function formatHealthAlertMessage(issue: HealthIssue): string {
   ].join('\n')
 }
 
-function teammateMatchesTargetName(teammateName: string | undefined, sessionName: string | undefined, targetName: string): boolean {
-  const target = targetName.trim().toLowerCase()
-  if (!target) return false
-  const teammate = teammateName?.trim().toLowerCase() ?? ''
-  const session = sessionName?.trim().toLowerCase() ?? ''
-  if (teammate === target || session === target) return true
-
-  if (teammate.includes(`(${target})`) || teammate.includes(`[${target}]`)) return true
-
-  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const boundary = new RegExp(`(?:^|\\W)${escaped}(?:\\W|$)`, 'i')
-  return boundary.test(teammate)
-}
+// teammateMatchesTargetName moved to ./teammate-codenames.ts for testability
 
 const execFileAsync = promisify(execFile)
 
@@ -1568,7 +1529,7 @@ export class SessionManager {
 
     this.healthMonitor.startMonitoring(teamId)
 
-    // Relay health alerts to the lead session
+    // Relay health alerts to the lead session + broadcast to dashboard
     const alertHandler = (issue: HealthIssue): void => {
       // Only relay alerts for teammates belonging to this team.
       const teammate = this.sessions.get(issue.teammateId)
@@ -1583,6 +1544,24 @@ export class SessionManager {
           sessionLog.error('[AgentTeams] Failed to send health alert to lead:', err)
         }
       }, 100)
+
+      // Broadcast health issue to the dashboard for inline card badges
+      if (this.windowManager) {
+        const envelope = {
+          type: 'teammate:health_issue' as const,
+          teamId,
+          payload: {
+            teammateId: issue.teammateId,
+            teammateName: issue.teammateName,
+            issueType: issue.type,
+            details: issue.details,
+            duration: issue.duration,
+            taskId: issue.taskId,
+          },
+          timestamp: issue.detectedAt || new Date().toISOString(),
+        }
+        this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
     }
     this.healthMonitor.on('health:stall', alertHandler)
     this.healthMonitor.on('health:error-loop', alertHandler)
@@ -1658,6 +1637,41 @@ export class SessionManager {
       clearInterval(statusInterval)
       this.teamStatusIntervals.delete(teamId)
     }
+  }
+
+  /**
+   * Emit a teammate tool activity event to the dashboard via IPC.
+   * Forwards a lightweight summary of tool calls so the Command Center
+   * can show live worker activity without reading full session state.
+   */
+  private emitTeammateToolActivity(
+    teamId: string,
+    teammateId: string,
+    teammateName: string,
+    activity: {
+      toolName: string
+      toolDisplayName?: string
+      toolIntent?: string
+      toolUseId: string
+      status: 'executing' | 'completed' | 'error'
+      inputPreview?: string
+      resultPreview?: string
+      isError?: boolean
+      elapsedMs?: number
+    }
+  ): void {
+    if (!this.windowManager) return
+    const envelope = {
+      type: 'teammate:tool_activity' as const,
+      teamId,
+      payload: {
+        teammateId,
+        teammateName,
+        ...activity,
+      },
+      timestamp: new Date().toISOString(),
+    }
+    this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
   }
 
   /**
@@ -1872,6 +1886,17 @@ export class SessionManager {
           teamId: _teamId,
           state,
         }, lead.workspace.id)
+        // Also broadcast as a team event for the dashboard hook
+        if (this.windowManager) {
+          const phases = teamManager.getTeamPhases(_teamId)
+          const envelope: import('@craft-agent/core/types').YoloStateChangedEvent = {
+            type: 'yolo:state_changed',
+            teamId: _teamId,
+            payload: { state, phases: phases.length > 0 ? phases : undefined },
+            timestamp: new Date().toISOString(),
+          }
+          this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+        }
       },
     }
 
@@ -3915,9 +3940,8 @@ export class SessionManager {
     const requestedTeammateName = params.teammateName?.trim() || `${teammateRole}-${Date.now().toString(36)}`
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
     const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
-    const teammateDisplayName = teammateCodename === requestedTeammateName
-      ? teammateCodename
-      : `${teammateCodename} (${requestedTeammateName})`
+    // Implements REQ-001: Use clean codename without long ID suffix
+    const teammateDisplayName = teammateCodename
     if (params.role && params.role !== teammateRole) {
       sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested for ${requestedTeammateName}; defaulting to "${teammateRole}"`)
     }
@@ -4869,38 +4893,6 @@ export class SessionManager {
           }
           // Read the plan file content
           const planContent = await readFile(planPath, 'utf-8')
-
-          const teamsEnabled = isAgentTeamsEnabled(managed.workspace.rootPath)
-          const hasTeammates = (managed.teammateSessionIds?.length ?? 0) > 0
-          const noTeamReason = this.extractNoTeamReason(planContent)
-          if (teamsEnabled && !hasTeammates && !noTeamReason) {
-            const warningText =
-              'Agent teams are enabled: the plan must either spawn teammates or include a clear reason why no team is needed (e.g., "Team Decision: no-team — <reason>").'
-            const submitPlanMsg = managed.messages.find(
-              m => m.toolName?.includes('SubmitPlan') && m.toolStatus === 'executing'
-            )
-            if (submitPlanMsg) {
-              submitPlanMsg.toolStatus = 'error'
-              submitPlanMsg.content = 'Plan submitted with missing team decision'
-              submitPlanMsg.toolResult = warningText
-            }
-            const warningMessage: Message = {
-              id: generateMessageId(),
-              role: 'warning',
-              content: warningText,
-              timestamp: Date.now(),
-              infoLevel: 'warning',
-            }
-            managed.messages.push(warningMessage)
-            this.sendEvent({
-              type: 'info',
-              sessionId: managed.id,
-              message: warningText,
-              level: 'warning',
-            }, managed.workspace.id)
-            this.persistSession(managed)
-            return
-          }
 
           if (managed.sddEnabled && managed.activeSpecId) {
             const interimReport = this.generateSpecComplianceReport(managed)
@@ -5918,21 +5910,6 @@ export class SessionManager {
     return undefined
   }
 
-  private extractNoTeamReason(planContent: string): string | null {
-    const lines = planContent.split(/\r?\n/)
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      const match = trimmed.match(/^(team decision|team|no team needed)\s*[:\-]\s*(.+)$/i)
-      if (!match) continue
-      const decisionText = match[2].trim()
-      if (/no\s*team|none|not needed/i.test(decisionText) || /^no\s*team/i.test(trimmed)) {
-        return decisionText
-      }
-    }
-    return null
-  }
-
   /**
    * Set which session the user is actively viewing.
    * Called when user navigates to a session. Used to determine whether to mark
@@ -6627,7 +6604,7 @@ export class SessionManager {
           }
         }
 
-        // Feed tool events to health monitor for teammate sessions
+        // Feed tool events to health monitor + dashboard for teammate sessions
         if (managed.parentSessionId && managed.teammateName && managed.teamId) {
           const hmTeamId = teamManager.resolveTeamId(managed.teamId)
           if (event.type === 'tool_start') {
@@ -6635,11 +6612,28 @@ export class SessionManager {
               type: 'tool_call',
               toolName: event.toolName,
             })
+            // Forward tool activity to dashboard for live visibility
+            this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
+              toolName: event.toolName,
+              toolDisplayName: event.displayName,
+              toolIntent: event.intent,
+              toolUseId: event.toolUseId,
+              status: 'executing',
+              inputPreview: event.input ? JSON.stringify(event.input).slice(0, 200) : undefined,
+            })
           } else if (event.type === 'tool_result') {
             this.healthMonitor.recordActivity(hmTeamId, managed.id, managed.teammateName, {
               type: 'tool_result',
               toolName: event.toolName,
               error: event.isError,
+            })
+            // Forward tool completion to dashboard
+            this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
+              toolName: event.toolName || 'unknown',
+              toolUseId: event.toolUseId,
+              status: event.isError ? 'error' : 'completed',
+              resultPreview: event.result ? String(event.result).slice(0, 200) : undefined,
+              isError: event.isError,
             })
           }
         }
@@ -8156,7 +8150,8 @@ To view this task's output:
       case 'team_initialized': {
         // Agent teams: When the lead agent spawns a teammate
         const teamName = event.teamName
-        const teamDisplayName = `${teamName} • ${buildTeamCodename(teamName)}`
+        // Implements REQ-003: Use clean team codename without ID prefix
+        const teamDisplayName = buildTeamCodename(teamName)
         const teammateName = event.teammateName || 'Teammate'
 
         sessionLog.info(`Agent team initialized: ${teamName}, spawning ${teammateName}`)

@@ -26,7 +26,9 @@ import {
   formatFailureReport,
   formatSuccessReport,
   mergeQualityGateConfig,
+  inferTaskType,
 } from './quality-gates';
+import { shouldSkipQualityGates } from '@craft-agent/core/types';
 
 // ============================================================
 // Types
@@ -143,6 +145,21 @@ export class ReviewLoopOrchestrator extends EventEmitter {
    * Called when a teammate marks a task as "completed."
    */
   enqueueReview(teamId: string, taskId: string, task: TeamTask): void {
+    // Implements REQ-QG-SKIP: Skip quality gates for non-code tasks
+    // Research, planning, search, explore, and docs tasks don't produce code
+    // and should pass through without running syntax/test/review gates.
+    const effectiveType = task.taskType ?? inferTaskType(task.title, task.description);
+    if (shouldSkipQualityGates(effectiveType)) {
+      this.callbacks.updateTaskStatus(teamId, taskId, 'completed', task.assignee, { bypassReviewLoop: true });
+      this.emit('review:skipped', {
+        teamId,
+        taskId,
+        teammateId: task.assignee || '',
+        reason: `Task type "${effectiveType}" does not require quality gates`,
+      });
+      return;
+    }
+
     // Don't re-enqueue tasks already being reviewed
     const existing = this.reviews.get(taskId);
     if (existing && (existing.status === 'running' || existing.status === 'passed')) {

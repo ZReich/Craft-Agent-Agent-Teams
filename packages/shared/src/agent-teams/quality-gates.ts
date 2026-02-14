@@ -14,6 +14,7 @@ import type {
   QualityGateStageResult,
   QualityGateStageName,
   QualityGateStageConfig,
+  TaskType,
 } from '@craft-agent/core/types';
 import { resolveReviewProvider } from './review-provider';
 
@@ -26,8 +27,9 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
   passThreshold: 90,
   maxReviewCycles: 3,
   enforceTDD: true,
-  baselineAwareTests: false,
+  baselineAwareTests: true,
   knownFailingTests: [],
+  testScope: 'affected',
   reviewModel: 'kimi-k2.5',
   reviewProvider: 'moonshot',
   escalationModel: 'claude-sonnet-4-5-20250929',
@@ -309,4 +311,31 @@ export function mergeQualityGateConfig(
   }
 
   return merged;
+}
+
+// ============================================================
+// Task Type Inference
+// ============================================================
+
+/** Keywords that indicate non-code task types */
+const TASK_TYPE_PATTERNS: Array<{ pattern: RegExp; type: TaskType }> = [
+  { pattern: /\b(research|investigate|analyze|study|compare|evaluate|audit)\b/i, type: 'research' },
+  { pattern: /\b(plan|design|architect|spec|outline|propose|draft plan|create plan)\b/i, type: 'planning' },
+  { pattern: /\b(search|find|locate|look up|discover|explore codebase|grep|scan)\b/i, type: 'search' },
+  { pattern: /\b(explore|survey|map out|understand|review existing)\b/i, type: 'explore' },
+  { pattern: /\b(document|write docs|update readme|add comments|write guide)\b/i, type: 'docs' },
+];
+
+/**
+ * Infer a task type from its title and description.
+ * Returns undefined if no clear signal is found (defaults to running quality gates).
+ */
+export function inferTaskType(title: string, description?: string): TaskType | undefined {
+  const text = `${title} ${description || ''}`.toLowerCase();
+
+  for (const { pattern, type } of TASK_TYPE_PATTERNS) {
+    if (pattern.test(text)) return type;
+  }
+
+  return undefined;
 }

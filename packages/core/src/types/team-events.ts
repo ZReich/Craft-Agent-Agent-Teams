@@ -14,6 +14,7 @@ import type {
   TeammateMessage,
   TeamActivityEvent,
   TeamCostSummary,
+  YoloState,
 } from './agent-teams.ts';
 
 // ============================================================
@@ -51,6 +52,15 @@ export interface TeamInitializedEvent extends TeamEventEnvelope<{
   team: AgentTeam;
 }> {
   type: 'team:initialized';
+}
+
+/**
+ * Team was created
+ */
+export interface TeamCreatedEvent extends TeamEventEnvelope<{
+  team: AgentTeam;
+}> {
+  type: 'team:created';
 }
 
 /**
@@ -282,6 +292,82 @@ export interface IntegrationCheckCompletedEvent extends TeamEventEnvelope<{
 }
 
 // ============================================================
+// Tool Activity Events
+// ============================================================
+
+/**
+ * Teammate tool call activity (forwarded from teammate session for dashboard visibility)
+ */
+export interface TeammateToolActivityEvent extends TeamEventEnvelope<{
+  teammateId: string;
+  teammateName: string;
+  toolName: string;
+  toolDisplayName?: string;
+  toolIntent?: string;
+  toolUseId: string;
+  status: 'executing' | 'completed' | 'error';
+  /** Truncated preview of tool input (max 200 chars) */
+  inputPreview?: string;
+  /** Truncated preview of tool result (max 200 chars) */
+  resultPreview?: string;
+  isError?: boolean;
+  /** How long the tool call took (ms) */
+  elapsedMs?: number;
+}> {
+  type: 'teammate:tool_activity';
+}
+
+// ============================================================
+// Health Issue Events
+// ============================================================
+
+/**
+ * Teammate health issue detected (stall, error-loop, retry-storm, context-exhaustion)
+ */
+export interface TeammateHealthIssueEvent extends TeamEventEnvelope<{
+  teammateId: string;
+  teammateName: string;
+  issueType: 'stall' | 'error-loop' | 'retry-storm' | 'context-exhaustion';
+  details: string;
+  /** How long the issue has persisted (ms) */
+  duration?: number;
+  /** Task the teammate was working on */
+  taskId?: string;
+}> {
+  type: 'teammate:health_issue';
+}
+
+// ============================================================
+// YOLO (Autonomous Execution) Events
+// ============================================================
+
+/**
+ * YOLO orchestrator state changed (phase transition, progress update)
+ */
+export interface YoloStateChangedEvent extends TeamEventEnvelope<{
+  state: YoloState;
+  /** Current team phases (for phase-aware task grouping in dashboard) */
+  phases?: import('./agent-teams.ts').TeamPhase[];
+}> {
+  type: 'yolo:state_changed';
+}
+
+// ============================================================
+// Synthesis Events
+// ============================================================
+
+/**
+ * Synthesis requested (all tasks passed quality gates)
+ */
+export interface SynthesisRequestedEvent extends TeamEventEnvelope<{
+  completedTasks: TeamTask[];
+  requirementCoverage: number;
+  outstandingItems: string[];
+}> {
+  type: 'synthesis:requested';
+}
+
+// ============================================================
 // Error Events
 // ============================================================
 
@@ -306,6 +392,7 @@ export interface TeamErrorEvent extends TeamEventEnvelope<{
  */
 export type TeamEvent =
   | TeamInitializedEvent
+  | TeamCreatedEvent
   | TeamUpdatedEvent
   | TeamCleanupEvent
   | TeamCompletedEvent
@@ -313,6 +400,8 @@ export type TeamEvent =
   | TeammateUpdatedEvent
   | TeammateDeltaEvent
   | TeammateShutdownEvent
+  | TeammateToolActivityEvent
+  | TeammateHealthIssueEvent
   | TaskCreatedEvent
   | TaskUpdatedEvent
   | TaskClaimedEvent
@@ -326,6 +415,8 @@ export type TeamEvent =
   | QualityGateCompletedEvent
   | IntegrationCheckStartedEvent
   | IntegrationCheckCompletedEvent
+  | YoloStateChangedEvent
+  | SynthesisRequestedEvent
   | TeamErrorEvent;
 
 // ============================================================
@@ -359,6 +450,7 @@ export function createTeamEvent<T extends TeamEvent>(
  */
 export function isTeamLifecycleEvent(event: TeamEvent): event is
   | TeamInitializedEvent
+  | TeamCreatedEvent
   | TeamUpdatedEvent
   | TeamCleanupEvent
   | TeamCompletedEvent {
@@ -372,7 +464,9 @@ export function isTeammateEvent(event: TeamEvent): event is
   | TeammateSpawnedEvent
   | TeammateUpdatedEvent
   | TeammateDeltaEvent
-  | TeammateShutdownEvent {
+  | TeammateShutdownEvent
+  | TeammateToolActivityEvent
+  | TeammateHealthIssueEvent {
   return event.type.startsWith('teammate:');
 }
 

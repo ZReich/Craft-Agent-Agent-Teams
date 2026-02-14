@@ -16,7 +16,7 @@
 import * as React from 'react'
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { useAtomValue } from 'jotai'
-import { Plus, Activity, FileCheck2, GitBranch, LayoutGrid, Focus, Send } from 'lucide-react'
+import { Plus, Activity, FileCheck2, GitBranch, LayoutGrid, Focus, Send, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -36,6 +36,8 @@ import type {
   QualityGateResult,
   WorkspaceSettings,
   ModelPresetId,
+  YoloState,
+  TeamPhase,
 } from '../../../shared/types'
 
 import { TeamHeader } from './TeamHeader'
@@ -51,9 +53,19 @@ import { SpecTraceabilityPanel } from './SpecTraceabilityPanel'
 import { TeamSidebarCompact } from './TeamSidebarCompact'
 import { SpecChecklistModal } from './SpecChecklistModal'
 import { useTeamStateSync } from '@/hooks/useTeamEvents'
+import { ToolActivityIndicator } from './ToolActivityIndicator'
+import type { ToolActivity } from './ToolActivityIndicator'
 
 const MAX_REALTIME_MESSAGES = 2000
 const MAX_REALTIME_ACTIVITY = 1500
+const MAX_TOOL_ACTIVITIES_PER_TEAMMATE = 5
+const MAX_HEALTH_ISSUES_PER_TEAMMATE = 3
+
+interface TeammateHealthIssue {
+  issueType: 'stall' | 'error-loop' | 'retry-storm' | 'context-exhaustion'
+  details: string
+  timestamp: string
+}
 const EMPTY_TASKS: TeamTask[] = []
 const EMPTY_MESSAGES: TeammateMessage[] = []
 const EMPTY_ACTIVITY: TeamActivityEvent[] = []
@@ -190,6 +202,10 @@ export function TeamDashboard({
   const [realtimeMessages, setRealtimeMessages] = useState<TeammateMessage[]>(messages)
   const [realtimeTasks, setRealtimeTasks] = useState<TeamTask[]>(tasks)
   const [realtimeActivity, setRealtimeActivity] = useState<TeamActivityEvent[]>(activityEvents)
+  const [realtimeToolActivity, setRealtimeToolActivity] = useState<Record<string, ToolActivity[]>>({})
+  const [realtimeHealthIssues, setRealtimeHealthIssues] = useState<Record<string, TeammateHealthIssue[]>>({})
+  const [yoloState, setYoloState] = useState<YoloState | null>(null)
+  const [yoloPhases, setYoloPhases] = useState<TeamPhase[]>([])
 
   // Read teammate session metadata from Jotai atoms
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
@@ -229,12 +245,76 @@ export function TeamDashboard({
         const activity = event.payload.activity
         setRealtimeActivity((prev) => [...prev, activity].slice(-MAX_REALTIME_ACTIVITY))
       },
+      onTeammateHealthIssue: (event) => {
+        const { teammateId, issueType, details } = event.payload
+        setRealtimeHealthIssues((prev) => {
+          const existing = prev[teammateId] ?? []
+          const entry: TeammateHealthIssue = {
+            issueType,
+            details,
+            timestamp: event.timestamp,
+          }
+          const updated = [entry, ...existing].slice(0, MAX_HEALTH_ISSUES_PER_TEAMMATE)
+          return { ...prev, [teammateId]: updated }
+        })
+      },
+      onTeammateToolActivity: (event) => {
+        const { teammateId, toolName, toolDisplayName, toolIntent, toolUseId, status, inputPreview, resultPreview, isError, elapsedMs } = event.payload
+        setRealtimeToolActivity((prev) => {
+          const existing = prev[teammateId] ?? []
+          // For completed/error status, update the existing entry if present
+          if (status !== 'executing') {
+            const idx = existing.findIndex(a => a.toolUseId === toolUseId)
+            if (idx >= 0) {
+              const updated = [...existing]
+              updated[idx] = { ...updated[idx], status, resultPreview, isError, elapsedMs }
+              return { ...prev, [teammateId]: updated }
+            }
+          }
+          // New tool activity — add to ring buffer
+          const entry: ToolActivity = {
+            toolName,
+            toolDisplayName,
+            toolIntent,
+            toolUseId,
+            status,
+            inputPreview,
+            resultPreview,
+            isError,
+            elapsedMs,
+            timestamp: event.timestamp,
+          }
+          const updated = [entry, ...existing].slice(0, MAX_TOOL_ACTIVITIES_PER_TEAMMATE)
+          return { ...prev, [teammateId]: updated }
+        })
+      },
+      onYoloStateChanged: (event) => {
+        setYoloState(event.payload.state)
+        if (event.payload.phases) {
+          setYoloPhases(event.payload.phases)
+        }
+      },
     },
     {
       // Don't use mock mode in production
       mock: false,
     }
   )
+
+  // Fetch initial YOLO state on mount
+  useEffect(() => {
+    const teamId = session.teamId || session.id
+    if (!window.electronAPI?.getYoloState || !teamId) return
+    let cancelled = false
+    window.electronAPI.getYoloState(teamId)
+      .then((state) => {
+        if (!cancelled && state) {
+          setYoloState(state)
+        }
+      })
+      .catch(() => { /* ignore - YOLO not active */ })
+    return () => { cancelled = true }
+  }, [session.teamId, session.id])
 
   // Sync realtime state with props when they change
   useEffect(() => {
@@ -352,6 +432,34 @@ export function TeamDashboard({
     setQuickReplyByTeammate((prev) => ({ ...prev, [teammateId]: '' }))
   }, [quickReplyByTeammate, onSendMessage])
 
+  const handleStopAllWorkers = React.useCallback(() => {
+    if (!onShutdownTeammate) return
+    const workers = teammates.filter(m => !m.isLead)
+    workers.forEach(worker => onShutdownTeammate(worker.id))
+  }, [teammates, onShutdownTeammate])
+
+  const handleYoloStart = React.useCallback((objective: string) => {
+    const teamId = session.teamId || session.id
+    if (!window.electronAPI?.startYolo || !teamId) return
+    window.electronAPI.startYolo(teamId, objective)
+      .then(setYoloState)
+      .catch((err: unknown) => console.error('[TeamDashboard] YOLO start failed:', err))
+  }, [session.teamId, session.id])
+
+  const handleYoloPause = React.useCallback(() => {
+    const teamId = session.teamId || session.id
+    if (!window.electronAPI?.pauseYolo || !teamId) return
+    window.electronAPI.pauseYolo(teamId)
+      .catch((err: unknown) => console.error('[TeamDashboard] YOLO pause failed:', err))
+  }, [session.teamId, session.id])
+
+  const handleYoloAbort = React.useCallback(() => {
+    const teamId = session.teamId || session.id
+    if (!window.electronAPI?.abortYolo || !teamId) return
+    window.electronAPI.abortYolo(teamId)
+      .catch((err: unknown) => console.error('[TeamDashboard] YOLO abort failed:', err))
+  }, [session.teamId, session.id])
+
   const selectedTeammate = teammatesWithTasks.find(m => m.id === selectedTeammateId)
   const teammateActiveTaskCount = useMemo(() => {
     const counts = new Map<string, number>()
@@ -449,6 +557,7 @@ export function TeamDashboard({
         cost={cost}
         onToggleDelegateMode={onToggleDelegateMode}
         onCleanupTeam={onCleanupTeam}
+        onStopAllWorkers={onShutdownTeammate ? handleStopAllWorkers : undefined}
         specModeEnabled={specModeEnabled}
         specLabel={specLabel}
         isCompactSidebarMode={compactSidebarMode}
@@ -456,6 +565,10 @@ export function TeamDashboard({
           setCompactSidebarMode(prev => !prev)
           setCompactSidebarExpanded(false)
         }}
+        yoloState={yoloState}
+        onYoloStart={handleYoloStart}
+        onYoloPause={handleYoloPause}
+        onYoloAbort={handleYoloAbort}
       />
 
       <div className="flex items-center justify-between px-4 py-2 border-b border-border">
@@ -494,14 +607,16 @@ export function TeamDashboard({
               const activeCount = teammateActiveTaskCount.get(teammate.id) || 0
               const recent = recentMessagesByTeammate.get(teammate.id) ?? []
               const draft = quickReplyByTeammate[teammate.id] ?? ''
+              const toolActivities = realtimeToolActivity[teammate.id] ?? []
+              const healthIssues = realtimeHealthIssues[teammate.id] ?? []
               return (
                 <div
                   key={teammate.id}
                   className={cn(
                     'rounded-lg p-3 shadow-tinted transition-shadow hover:shadow-middle',
-                    teammate.status === 'working' ? 'bg-accent/[0.03]' : 'bg-background'
+                    healthIssues.length > 0 ? 'bg-destructive/[0.03]' : teammate.status === 'working' ? 'bg-accent/[0.03]' : 'bg-background',
                   )}
-                  style={{ '--shadow-color': 'var(--accent-rgb)' } as React.CSSProperties}
+                  style={{ '--shadow-color': healthIssues.length > 0 ? 'var(--destructive-rgb)' : 'var(--accent-rgb)' } as React.CSSProperties}
                 >
                   <button
                     type="button"
@@ -513,27 +628,56 @@ export function TeamDashboard({
                     }}
                   >
                     <div className="flex items-center justify-between gap-2">
+                      {/* Implements REQ-002: Show teammate name and role */}
                       <div className="min-w-0">
                         <h3 className="text-sm font-semibold truncate">{teammate.name}</h3>
-                        <p className="text-[11px] text-muted-foreground truncate">{teammate.model}</p>
+                        <p className="text-[11px] text-muted-foreground truncate capitalize">
+                          {teammate.role} • {teammate.model}
+                        </p>
                       </div>
-                      <Badge
-                        variant={teammate.status === 'error' ? 'destructive' : 'secondary'}
-                        className={cn(
-                          'text-[10px] px-2 py-0.5',
-                          teammate.status === 'working' && 'bg-success/10 text-success-text border-transparent',
-                          teammate.status === 'planning' && 'bg-info/10 text-info-text border-transparent',
+                      <div className="flex items-center gap-1.5">
+                        {healthIssues.length > 0 && (
+                          <Badge
+                            variant="destructive"
+                            className="text-[10px] px-1.5 py-0.5 gap-1"
+                            title={healthIssues[0].details}
+                          >
+                            <AlertTriangle className="size-2.5" />
+                            {healthIssues[0].issueType}
+                          </Badge>
                         )}
-                      >
-                        {teammate.status}
-                      </Badge>
+                        <Badge
+                          variant={teammate.status === 'error' ? 'destructive' : 'secondary'}
+                          className={cn(
+                            'text-[10px] px-2 py-0.5',
+                            teammate.status === 'working' && 'bg-success/10 text-success-text border-transparent',
+                            teammate.status === 'planning' && 'bg-info/10 text-info-text border-transparent',
+                          )}
+                        >
+                          {teammate.status}
+                        </Badge>
+                      </div>
                     </div>
                     <p className="mt-2 text-[11px] text-muted-foreground">{activeCount} active tasks</p>
                   </button>
 
-                  <div className="mt-3 rounded-md bg-foreground/[0.02] p-2 min-h-20 space-y-1.5 shadow-thin">
+                  {/* Live tool activity feed */}
+                  {toolActivities.length > 0 && (
+                    <div className="mt-3 rounded-md bg-foreground/[0.02] p-2 shadow-thin">
+                      <p className="text-[10px] font-medium text-muted-foreground/70 uppercase tracking-wider mb-1 px-1">Live Activity</p>
+                      <ToolActivityIndicator activities={toolActivities} />
+                    </div>
+                  )}
+
+                  {/* Recent messages */}
+                  <div className={cn(
+                    'rounded-md bg-foreground/[0.02] p-2 min-h-12 space-y-1.5 shadow-thin',
+                    toolActivities.length > 0 ? 'mt-2' : 'mt-3',
+                  )}>
                     {recent.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">No recent messages</p>
+                      <p className="text-xs text-muted-foreground">
+                        {toolActivities.length > 0 ? 'No recent messages' : 'No recent activity'}
+                      </p>
                     ) : (
                       recent.map((msg) => {
                         const isFromTeammate = msg.from === teammate.id
@@ -691,6 +835,7 @@ export function TeamDashboard({
                   <TeammateDetailView
                     teammate={selectedTeammate}
                     messages={realtimeMessages}
+                    toolActivities={realtimeToolActivity[selectedTeammate.id] ?? []}
                     onSendMessage={onSendMessage}
                     onSwapModel={onSwapModel}
                     onShutdown={onShutdownTeammate}
@@ -734,6 +879,7 @@ export function TeamDashboard({
         isCollapsed={taskListCollapsed}
         onToggleCollapsed={() => setTaskListCollapsed(prev => !prev)}
         highlightedTaskIds={highlightedTaskIds}
+        phases={yoloPhases.length > 0 ? yoloPhases : undefined}
       />
 
       {/* Spec Checklist Modal (shown before completing with SDD mode) */}

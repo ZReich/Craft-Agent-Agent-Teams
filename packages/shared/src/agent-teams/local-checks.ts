@@ -8,7 +8,7 @@ type CacheEntry<T> = { value: T; expiresAt: number };
 const typeCheckCache = new Map<string, CacheEntry<TypeCheckCheckResult>>();
 const testSuiteCache = new Map<string, CacheEntry<TestSuiteCheckResult>>();
 
-const DEFAULT_CACHE_TTL_MS = 30_000;
+const DEFAULT_CACHE_TTL_MS = 300_000; // 5 minutes — long enough to survive review cycles
 
 export interface TypeCheckCheckResult {
   passed: boolean;
@@ -40,6 +40,8 @@ export interface LocalCheckOptions {
   cacheKey?: string;
   cacheTtlMs?: number;
   forceRefresh?: boolean;
+  /** When true, run only tests affected by uncommitted changes (vitest --changed) */
+  changedOnly?: boolean;
 }
 
 function getCached<T>(cache: Map<string, CacheEntry<T>>, key: string): T | null {
@@ -93,9 +95,11 @@ export async function runTypeCheckCached(options: LocalCheckOptions): Promise<Ty
 }
 
 export async function runTestSuiteCached(options: LocalCheckOptions): Promise<TestSuiteCheckResult> {
-  const cacheKey = options.cacheKey ?? `testsuite:${options.workingDir}`;
+  const scopeSuffix = options.changedOnly ? ':affected' : ':full';
+  const cacheKey = options.cacheKey ? `${options.cacheKey}${scopeSuffix}` : `testsuite:${options.workingDir}${scopeSuffix}`;
   const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
-  const command = 'bun run vitest run --reporter=json -c vitest.config.ts';
+  const baseCommand = 'bun run vitest run --reporter=json -c vitest.config.ts';
+  const command = options.changedOnly ? `${baseCommand} --changed` : baseCommand;
   if (!options.forceRefresh) {
     const cached = getCached(testSuiteCache, cacheKey);
     if (cached) {
@@ -114,7 +118,7 @@ export async function runTestSuiteCached(options: LocalCheckOptions): Promise<Te
 
   let result: TestSuiteCheckResult;
   try {
-    const { stdout } = await execAsync('bun run vitest run --reporter=json -c vitest.config.ts', {
+    const { stdout } = await execAsync(command, {
       cwd: options.workingDir,
       timeout: options.timeoutMs,
       env: { ...process.env, CRAFT_DEBUG: '0' },

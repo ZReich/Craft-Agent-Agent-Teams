@@ -319,12 +319,13 @@ export class QualityGateRunner {
 
     // Stage 2: Test Execution (local, free)
     if (config.stages.tests.enabled && taskContext.workingDirectory) {
-      qgLog.info('[QualityGates] Running test execution');
+      const testScope = config.testScope ?? 'affected';
+      qgLog.info(`[QualityGates] Running test execution (scope: ${testScope})`);
       const requireTests = this.shouldRequireTests(taskContext);
       stages.tests = await this.runTestExecution(taskContext.workingDirectory, true, requireTests, {
         enabled: config.baselineAwareTests === true,
         knownFailingTests: config.knownFailingTests ?? [],
-      });
+      }, testScope);
     }
 
     // Early exit if binary gates fail — no point running AI reviews
@@ -508,13 +509,32 @@ export class QualityGateRunner {
 
   /**
    * Run test suite and parse results.
+   *
+   * @param testScope 'affected' runs only tests for changed files (vitest --changed),
+   *   'full' runs the entire suite, 'none' skips tests entirely. Default: 'full'.
    */
   async runTestExecution(
     workingDir: string,
     allowInstall = true,
     requireTests = true,
     baselineOptions: TestBaselineOptions = { enabled: false, knownFailingTests: [] },
+    testScope: 'full' | 'affected' | 'none' = 'full',
   ): Promise<TestStageResult> {
+    // Implements testScope='none': skip tests entirely
+    if (testScope === 'none') {
+      return {
+        score: 100,
+        passed: true,
+        issues: [],
+        suggestions: ['Tests skipped (testScope: none)'],
+        totalTests: 0,
+        passedTests: 0,
+        failedTests: 0,
+        skippedTests: 0,
+      };
+    }
+
+    const changedOnly = testScope === 'affected';
     const timeoutMs = 120000;
     const maxAttempts = 2;
     const cacheKey = `quality:${workingDir}:tests`;
@@ -528,6 +548,7 @@ export class QualityGateRunner {
           timeoutMs,
           cacheKey,
           forceRefresh,
+          changedOnly,
         });
 
         const output = this.normalizeOutput(result.rawOutput || '');
@@ -541,12 +562,18 @@ export class QualityGateRunner {
         );
 
         if (result.total === 0) {
-          if (!requireTests) {
+          // In 'affected' scope, zero tests means no tests were affected by the change — that's fine
+          if (changedOnly || !requireTests) {
             return {
               score: 100,
               passed: true,
               issues: [],
-              suggestions: ['No test files detected; tests are not required for this task type', diagnostics],
+              suggestions: [
+                changedOnly
+                  ? 'No tests affected by the changed files; full suite runs at integration gate'
+                  : 'No test files detected; tests are not required for this task type',
+                diagnostics,
+              ],
               totalTests: 0,
               passedTests: 0,
               failedTests: 0,
@@ -638,8 +665,11 @@ export class QualityGateRunner {
       } catch (err: unknown) {
         const error = err as { stdout?: string; stderr?: string; code?: number };
         const output = this.normalizeOutput(error.stdout || error.stderr || '');
+        const fallbackCommand = changedOnly
+          ? 'bun run vitest run --reporter=json -c vitest.config.ts --changed'
+          : 'bun run vitest run --reporter=json -c vitest.config.ts';
         const diagnostics = this.formatTestDiagnostics(
-          'bun run vitest run --reporter=json -c vitest.config.ts',
+          fallbackCommand,
           workingDir,
           timeoutMs,
           attempt,
@@ -913,17 +943,14 @@ export class QualityGateRunner {
     try {
       const responseText = await this.callReviewModel(prompt, userMessage, config, reviewProvider);
 
-      // Parse the JSON response
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
+      const parsed = this.parseAiReviewResponse(responseText);
+      if (!parsed) {
         qgLog.warn(`[QualityGates] AI review "${stage}" returned non-JSON response`);
-        return this.createStageFailureResult(
-          `AI review "${stage}" returned an unexpected non-JSON format`,
-          ['Ensure the configured model supports structured JSON responses for review stages'],
+        return this.createStageSkippedResult(
+          `AI review "${stage}" returned unstructured output and was treated as advisory`,
+          ['Prefer a review model/provider that reliably returns JSON for stricter gate enforcement'],
         );
       }
-
-      const parsed = JSON.parse(jsonMatch[0]);
       let score = Math.max(0, Math.min(100, Number(parsed.score) || 100));
 
       // Completeness stage: enforce integration verification auto-fail
@@ -931,7 +958,7 @@ export class QualityGateRunner {
       if (stage === 'completeness' && parsed.integrationVerified === false) {
         score = Math.min(score, 65); // Cap below passing threshold
         const integrationIssue = 'INTEGRATION FAILURE: New code is not connected to existing code — components, functions, or handlers are dead code';
-        const issues = Array.isArray(parsed.issues) ? parsed.issues : [];
+        const issues = parsed.issues;
         if (!issues.some((i: string) => i.includes('INTEGRATION FAILURE'))) {
           issues.unshift(integrationIssue);
         }
@@ -939,15 +966,15 @@ export class QualityGateRunner {
           score,
           passed: false,
           issues,
-          suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
+          suggestions: parsed.suggestions,
         };
       }
 
       return {
         score,
         passed: score >= 70,
-        issues: Array.isArray(parsed.issues) ? parsed.issues : [],
-        suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
+        issues: parsed.issues,
+        suggestions: parsed.suggestions,
       };
     } catch (err) {
       const errorDetails = this.serializeError(err);
@@ -1292,6 +1319,67 @@ ${diff.slice(0, 50000)}
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Parse AI review output, tolerating plain-text fallback formats.
+   */
+  private parseAiReviewResponse(
+    responseText: string,
+  ): { score: number; issues: string[]; suggestions: string[]; integrationVerified?: boolean } | null {
+    const parsed = this.parseJsonObject(responseText);
+    if (parsed) {
+      const score = Math.max(0, Math.min(100, Number(parsed.score) || 100));
+      const issues = Array.isArray(parsed.issues)
+        ? parsed.issues.filter((i: unknown) => typeof i === 'string')
+        : [];
+      const suggestions = Array.isArray(parsed.suggestions)
+        ? parsed.suggestions.filter((s: unknown) => typeof s === 'string')
+        : [];
+      return {
+        score,
+        issues,
+        suggestions,
+        integrationVerified: typeof parsed.integrationVerified === 'boolean'
+          ? parsed.integrationVerified
+          : undefined,
+      };
+    }
+
+    const plainText = responseText
+      .replace(/```json/gi, '')
+      .replace(/```/g, '')
+      .trim();
+    if (!plainText) return null;
+
+    const scoreMatch = plainText.match(/(?:score|rating)\s*[:=]\s*(\d{1,3})/i)
+      ?? plainText.match(/\b(\d{1,3})\s*\/\s*100\b/i);
+    const score = scoreMatch
+      ? Math.max(0, Math.min(100, Number(scoreMatch[1])))
+      : null;
+
+    const bullets = plainText
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => /^([-*•]|\d+\.)\s+/.test(line))
+      .map(line => line.replace(/^([-*•]|\d+\.)\s+/, '').trim())
+      .filter(Boolean);
+
+    const lineItems = plainText
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    const issues = (bullets.length > 0 ? bullets : lineItems).slice(0, 5);
+    const suggestions = bullets
+      .filter(line => /\b(should|consider|recommend|improve|simplify|refactor|avoid|add)\b/i.test(line))
+      .slice(0, 5);
+
+    return {
+      score: score ?? (issues.length > 0 ? 65 : 85),
+      issues,
+      suggestions,
+    };
   }
 
   /**

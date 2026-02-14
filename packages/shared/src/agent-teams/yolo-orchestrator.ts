@@ -108,6 +108,7 @@ export class YoloOrchestrator extends EventEmitter {
     const mergedConfig: YoloConfig = { ...DEFAULT_YOLO_CONFIG, ...config };
     this.state = {
       phase: 'idle',
+      objective,
       config: mergedConfig,
       startedAt: new Date().toISOString(),
       remediationRound: 0,

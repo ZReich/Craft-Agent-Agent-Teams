@@ -412,14 +412,15 @@ describe('Quality Gate Engine â€” Core Logic', () => {
     expect(blockingIdx).toBeGreaterThan(-1);
   });
 
-  it('formats success report with stage table', () => {
+  it('formats success report with phase scoreboard', () => {
     const result = createPassingResult();
     const report = formatSuccessReport(result);
 
     expect(report).toContain('PASSED');
-    expect(report).toContain('Score: 92/100');
-    expect(report).toContain('| Stage | Score | Status |');
-    expect(report).toContain('PASS');
+    expect(report).toContain('Score: 92%');
+    expect(report).toContain('### Phase Scoreboard');
+    expect(report).toContain('- [PASS] Syntax & Types: 100% (PASS)');
+    expect(report).toContain('Reviewer notes (non-blocking)');
   });
 
   it('merges user config over defaults preserving unset fields', () => {

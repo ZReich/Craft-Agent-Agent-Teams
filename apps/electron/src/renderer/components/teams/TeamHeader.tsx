@@ -6,7 +6,7 @@
  */
 
 import * as React from 'react'
-import { Users, DollarSign, Shield, ShieldOff, Columns2, PanelLeftClose, LayoutGrid, MessageSquare, Play, Pause, Square, Zap } from 'lucide-react'
+import { Users, DollarSign, Shield, ShieldOff, Columns2, PanelLeftClose, LayoutGrid, MessageSquare, Play, Pause, Square, Zap, OctagonX } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -31,6 +31,8 @@ export interface TeamHeaderProps {
   onYoloPause?: () => void
   /** Called to abort YOLO execution */
   onYoloAbort?: () => void
+  /** Called to stop all non-lead teammates */
+  onStopAllWorkers?: () => void
 }
 
 const STATUS_LABELS: Record<string, { label: string; className: string }> = {
@@ -69,6 +71,7 @@ export function TeamHeader({
   onYoloStart,
   onYoloPause,
   onYoloAbort,
+  onStopAllWorkers,
 }: TeamHeaderProps) {
   const activeCount = team.members.filter(m => m.status === 'working' || m.status === 'idle' || m.status === 'planning').length
   const statusInfo = STATUS_LABELS[team.status] || STATUS_LABELS.active
@@ -188,7 +191,7 @@ export function TeamHeader({
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => onYoloStart(team.name)}
+            onClick={() => onYoloStart(yoloState.objective || team.name)}
             className="h-7 gap-1.5 text-xs text-success-text hover:text-success-text"
             title="Resume YOLO execution"
           >
@@ -206,6 +209,20 @@ export function TeamHeader({
           >
             <Square className="size-3" />
             Abort
+          </Button>
+        )}
+
+        {/* Stop all workers */}
+        {onStopAllWorkers && team.status === 'active' && team.members.filter(m => !m.isLead).length > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onStopAllWorkers}
+            className="h-7 gap-1.5 text-xs text-muted-foreground hover:text-destructive"
+            title="Stop all worker teammates"
+          >
+            <OctagonX className="size-3" />
+            Stop All
           </Button>
         )}
 

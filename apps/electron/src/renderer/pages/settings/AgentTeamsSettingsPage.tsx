@@ -23,7 +23,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@craft-agent/ui'
 import { Button } from '@/components/ui/button'
 import type { DetailsPageMeta } from '@/lib/navigation-registry'
 import type { ModelPresetId, ModelAssignment, WorkspaceSettings } from '../../../shared/types'
-import { OPENAI_MODELS, isCodexModel } from '@config/models'
+import { OPENAI_MODELS, isCodexModel, getModelShortName } from '@config/models'
 import { isOpenAIProvider } from '@config/llm-connections'
 import { QUALITY_GATE_HELP, parseKnownFailingTests, stringifyKnownFailingTests } from './qualityGateHelp'
 
@@ -59,25 +59,44 @@ const CODEX_MODEL_OPTIONS = OPENAI_MODELS.map((model) => ({
 }))
 
 
-// Preset configurations
-const PRESET_OPTIONS: { id: ModelPresetId; name: string; description: string; cost: string }[] = [
-  { id: 'max-quality', name: 'Max Quality', description: 'Opus everywhere', cost: '$$$$' },
-  { id: 'balanced', name: 'Balanced', description: 'Opus lead, Sonnet workers', cost: '$$$' },
-  { id: 'cost-optimized', name: 'Cost Optimized', description: 'Opus lead, Kimi workers', cost: '$$' },
-  { id: 'budget', name: 'Budget', description: 'Sonnet lead, Kimi workers', cost: '$' },
-  { id: 'codex-balanced', name: 'Codex Balanced', description: 'Codex lead/head, Sonnet workers', cost: '$$$' },
-  { id: 'codex-full', name: 'Codex Full', description: 'Codex everywhere', cost: '$$$$' },
-  { id: 'custom', name: 'Custom', description: 'Choose every role', cost: '' },
+// Cost level for badge coloring
+type CostLevel = 1 | 2 | 3 | 4
+
+const COST_BADGE_COLORS: Record<CostLevel, string> = {
+  1: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
+  2: 'bg-sky-500/15 text-sky-600 dark:text-sky-400',
+  3: 'bg-amber-500/15 text-amber-600 dark:text-amber-400',
+  4: 'bg-rose-500/15 text-rose-600 dark:text-rose-400',
+}
+
+// Role dot colors for the expanded grid
+const ROLE_COLORS: Record<string, string> = {
+  lead: 'bg-violet-500',
+  head: 'bg-blue-500',
+  worker: 'bg-emerald-500',
+  reviewer: 'bg-amber-500',
+  escalation: 'bg-rose-500',
+}
+
+// Preset configurations — all use non-thinking models by default; fast workers for throughput
+const PRESET_OPTIONS: { id: ModelPresetId; name: string; description: string; cost: string; costLevel: CostLevel | 0 }[] = [
+  { id: 'max-quality', name: 'Max Quality', description: 'Opus lead + Sonnet workers — best output quality', cost: '$$$$', costLevel: 4 },
+  { id: 'balanced', name: 'Balanced', description: 'Opus lead + Haiku workers — fast with smart planning', cost: '$$$', costLevel: 3 },
+  { id: 'cost-optimized', name: 'Cost Optimized', description: 'Opus lead + Kimi workers — quality plans, cheap execution', cost: '$$', costLevel: 2 },
+  { id: 'budget', name: 'Budget', description: 'Sonnet lead + Kimi workers — lowest cost', cost: '$', costLevel: 1 },
+  { id: 'codex-balanced', name: 'Codex Balanced', description: 'Codex lead + Sonnet workers — OpenAI planning', cost: '$$$', costLevel: 3 },
+  { id: 'codex-full', name: 'Codex Full', description: 'Codex everywhere — full OpenAI stack', cost: '$$$$', costLevel: 4 },
+  { id: 'custom', name: 'Custom', description: 'Choose model and thinking for every role', cost: '', costLevel: 0 },
 ]
 
 const PRESET_CONFIGS: Record<ModelPresetId, { lead: string; head: string; worker: string; reviewer: string; escalation: string }> = {
-  'max-quality': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-opus-4-6', reviewer: 'claude-sonnet-4-5-20250929', escalation: 'claude-opus-4-6' },
-  'balanced': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-sonnet-4-5-20250929', reviewer: 'kimi-k2.5', escalation: 'claude-opus-4-6' },
-  'cost-optimized': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
-  'budget': { lead: 'claude-sonnet-4-5-20250929', head: 'kimi-k2.5', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
-  'codex-balanced': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'claude-sonnet-4-5-20250929', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
-  'codex-full': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'gpt-5.1-codex-mini', reviewer: 'kimi-k2.5', escalation: 'claude-opus-4-6' },
-  'custom': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-sonnet-4-5-20250929', reviewer: 'kimi-k2.5', escalation: 'claude-opus-4-6' },
+  'max-quality': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
+  'balanced': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-haiku-4-5-20251001', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
+  'cost-optimized': { lead: 'claude-opus-4-6', head: 'claude-haiku-4-5-20251001', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
+  'budget': { lead: 'claude-sonnet-4-5-20250929', head: 'claude-haiku-4-5-20251001', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
+  'codex-balanced': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-sonnet-4-5-20250929' },
+  'codex-full': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'gpt-5.1-codex-mini', reviewer: 'claude-haiku-4-5-20251001', escalation: 'gpt-5.3-codex' },
+  'custom': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-haiku-4-5-20251001', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
 }
 
 // Helper to get provider from model ID
@@ -105,6 +124,13 @@ export default function AgentTeamsSettingsPage() {
   const [workerModel, setWorkerModel] = useState('kimi-k2.5')
   const [reviewerModel, setReviewerModel] = useState('kimi-k2.5')
   const [escalationModel, setEscalationModel] = useState('claude-sonnet-4-5-20250929')
+
+  // Per-role thinking toggles (Custom preset only)
+  const [leadThinking, setLeadThinking] = useState(false)
+  const [headThinking, setHeadThinking] = useState(false)
+  const [workerThinking, setWorkerThinking] = useState(false)
+  const [reviewerThinking, setReviewerThinking] = useState(false)
+  const [escalationThinking, setEscalationThinking] = useState(false)
 
   // Provider API keys (stored in encrypted secure storage, not plaintext config)
   const [moonshotApiKey, setMoonshotApiKey] = useState('')
@@ -139,6 +165,14 @@ export default function AgentTeamsSettingsPage() {
     { value: 'default', label: 'Default Template', description: 'Balanced spec skeleton for most features' },
   ])
 
+  // YOLO (autonomous execution) settings
+  const [yoloMode, setYoloMode] = useState<'off' | 'fixed' | 'smart'>('off')
+  const [yoloCostCapUsd, setYoloCostCapUsd] = useState('5')
+  const [yoloTimeoutMinutes, setYoloTimeoutMinutes] = useState('60')
+  const [yoloMaxConcurrency, setYoloMaxConcurrency] = useState('3')
+  const [yoloAutoRemediate, setYoloAutoRemediate] = useState(true)
+  const [yoloMaxRemediationRounds, setYoloMaxRemediationRounds] = useState('3')
+
   const hasOpenAiConnection = (llmConnections || []).some((conn) => isOpenAIProvider(conn.providerType))
 
   // Load settings
@@ -167,6 +201,12 @@ export default function AgentTeamsSettingsPage() {
           setQgReviewModel(settings.agentTeamsReviewerModel)
         }
         if (settings?.agentTeamsEscalationModel) setEscalationModel(settings.agentTeamsEscalationModel)
+        // Load thinking toggles
+        if (settings?.agentTeamsLeadThinking !== undefined) setLeadThinking(settings.agentTeamsLeadThinking)
+        if (settings?.agentTeamsHeadThinking !== undefined) setHeadThinking(settings.agentTeamsHeadThinking)
+        if (settings?.agentTeamsWorkerThinking !== undefined) setWorkerThinking(settings.agentTeamsWorkerThinking)
+        if (settings?.agentTeamsReviewerThinking !== undefined) setReviewerThinking(settings.agentTeamsReviewerThinking)
+        if (settings?.agentTeamsEscalationThinking !== undefined) setEscalationThinking(settings.agentTeamsEscalationThinking)
         if (settings?.agentTeamsCostCapUsd) {
           setCostCapEnabled(true)
           setCostCapUsd(String(settings.agentTeamsCostCapUsd))
@@ -191,6 +231,14 @@ export default function AgentTeamsSettingsPage() {
         if (settings?.qualityGatesSimplicityEnabled !== undefined) setQgSimplicityEnabled(settings.qualityGatesSimplicityEnabled)
         if (settings?.qualityGatesErrorsEnabled !== undefined) setQgErrorsEnabled(settings.qualityGatesErrorsEnabled)
         if (settings?.qualityGatesCompletenessEnabled !== undefined) setQgCompletenessEnabled(settings.qualityGatesCompletenessEnabled)
+        // Load YOLO settings
+        if (settings?.yoloMode) setYoloMode(settings.yoloMode as 'off' | 'fixed' | 'smart')
+        if (settings?.yoloCostCapUsd) setYoloCostCapUsd(String(settings.yoloCostCapUsd))
+        if (settings?.yoloTimeoutMinutes) setYoloTimeoutMinutes(String(settings.yoloTimeoutMinutes))
+        if (settings?.yoloMaxConcurrency) setYoloMaxConcurrency(String(settings.yoloMaxConcurrency))
+        if (settings?.yoloAutoRemediate !== undefined) setYoloAutoRemediate(settings.yoloAutoRemediate)
+        if (settings?.yoloMaxRemediationRounds) setYoloMaxRemediationRounds(String(settings.yoloMaxRemediationRounds))
+
         if (settings?.sddEnabled !== undefined) setSddEnabled(settings.sddEnabled)
         if (settings?.sddRequireDRIAssignment !== undefined) setSddRequireDriAssignment(settings.sddRequireDRIAssignment)
         if (settings?.sddRequireFullCoverage !== undefined) setSddRequireFullCoverage(settings.sddRequireFullCoverage)
@@ -275,6 +323,14 @@ export default function AgentTeamsSettingsPage() {
         saveSetting('agentTeamsEscalationModel', config.escalation)
         setQgReviewModel(config.reviewer)
         saveSetting('qualityGatesReviewModel', config.reviewer)
+        // Presets use non-thinking models for speed
+        setLeadThinking(false); setHeadThinking(false); setWorkerThinking(false)
+        setReviewerThinking(false); setEscalationThinking(false)
+        saveSetting('agentTeamsLeadThinking', false)
+        saveSetting('agentTeamsHeadThinking', false)
+        saveSetting('agentTeamsWorkerThinking', false)
+        saveSetting('agentTeamsReviewerThinking', false)
+        saveSetting('agentTeamsEscalationThinking', false)
       }
     },
     [saveSetting]
@@ -316,6 +372,20 @@ export default function AgentTeamsSettingsPage() {
     setSelectedPreset('custom')
     saveSetting('agentTeamsModelPreset', 'custom')
     saveSetting('agentTeamsEscalationModel', v)
+  }, [saveSetting])
+
+  // Thinking toggle handlers (Custom preset only)
+  const handleThinkingToggle = useCallback((role: string, enabled: boolean) => {
+    const setters: Record<string, (v: boolean) => void> = {
+      lead: setLeadThinking, head: setHeadThinking, worker: setWorkerThinking,
+      reviewer: setReviewerThinking, escalation: setEscalationThinking,
+    }
+    const keys: Record<string, keyof WorkspaceSettings> = {
+      lead: 'agentTeamsLeadThinking', head: 'agentTeamsHeadThinking', worker: 'agentTeamsWorkerThinking',
+      reviewer: 'agentTeamsReviewerThinking', escalation: 'agentTeamsEscalationThinking',
+    }
+    setters[role]?.(enabled)
+    if (keys[role]) saveSetting(keys[role], enabled)
   }, [saveSetting])
 
   // Cost cap handlers
@@ -459,6 +529,43 @@ export default function AgentTeamsSettingsPage() {
     saveSetting('sddDefaultSpecTemplate', templateId)
   }, [saveSetting])
 
+  // YOLO handlers
+  const handleYoloModeChange = useCallback((mode: string) => {
+    const m = mode as 'off' | 'fixed' | 'smart'
+    setYoloMode(m)
+    saveSetting('yoloMode', m)
+  }, [saveSetting])
+
+  const handleYoloCostCapBlur = useCallback(() => {
+    const parsed = parseFloat(yoloCostCapUsd)
+    if (!isNaN(parsed) && parsed > 0) {
+      saveSetting('yoloCostCapUsd', parsed)
+    }
+  }, [yoloCostCapUsd, saveSetting])
+
+  const handleYoloTimeoutBlur = useCallback(() => {
+    const val = Math.max(1, Math.min(1440, parseInt(yoloTimeoutMinutes) || 60))
+    setYoloTimeoutMinutes(String(val))
+    saveSetting('yoloTimeoutMinutes', val)
+  }, [yoloTimeoutMinutes, saveSetting])
+
+  const handleYoloMaxConcurrencyBlur = useCallback(() => {
+    const val = Math.max(1, Math.min(10, parseInt(yoloMaxConcurrency) || 3))
+    setYoloMaxConcurrency(String(val))
+    saveSetting('yoloMaxConcurrency', val)
+  }, [yoloMaxConcurrency, saveSetting])
+
+  const handleYoloAutoRemediateToggle = useCallback((enabled: boolean) => {
+    setYoloAutoRemediate(enabled)
+    saveSetting('yoloAutoRemediate', enabled)
+  }, [saveSetting])
+
+  const handleYoloMaxRemediationRoundsBlur = useCallback(() => {
+    const val = Math.max(0, Math.min(10, parseInt(yoloMaxRemediationRounds) || 3))
+    setYoloMaxRemediationRounds(String(val))
+    saveSetting('yoloMaxRemediationRounds', val)
+  }, [yoloMaxRemediationRounds, saveSetting])
+
   const hasCodexConnection = llmConnections.some((conn) =>
     isOpenAIProvider(conn.providerType) && conn.isAuthenticated
   )
@@ -584,7 +691,8 @@ export default function AgentTeamsSettingsPage() {
                     {/* Model Preset */}
                     <SettingsSection
                       title="Model Preset"
-                      description="Choose a pre-configured model mix for your teams"
+                      description="Choose a model mix for your teams — all presets use non-thinking mode for speed"
+                      className="relative"
                     >
                       <SettingsRadioGroup
                         value={selectedPreset}
@@ -595,66 +703,77 @@ export default function AgentTeamsSettingsPage() {
                             key={preset.id}
                             value={preset.id}
                             label={preset.name}
-                            description={`${preset.description}${preset.cost ? ` — ${preset.cost}` : ''}`}
+                            description={preset.description}
+                            badge={preset.costLevel > 0 ? (
+                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${COST_BADGE_COLORS[preset.costLevel as CostLevel]}`}>
+                                {preset.cost}
+                              </span>
+                            ) : undefined}
+                            expandedContent={preset.id !== 'custom' ? (
+                              /* Role → model summary grid for non-custom presets */
+                              <div className="grid grid-cols-5 gap-2 pt-1">
+                                {(['lead', 'head', 'worker', 'reviewer', 'escalation'] as const).map((role) => (
+                                  <div key={role} className="flex flex-col items-center gap-1">
+                                    <div className={`w-2 h-2 rounded-full ${ROLE_COLORS[role]}`} />
+                                    <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">{role}</span>
+                                    <span className="text-xs font-medium">{getModelShortName(PRESET_CONFIGS[preset.id][role])}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              /* Full custom config: model dropdowns + thinking toggles */
+                              <div className="space-y-4 pt-1">
+                                <div className="flex items-start gap-2 px-1 py-2 rounded-lg bg-foreground/[0.02] border border-border/40">
+                                  <Info className="size-3.5 mt-0.5 text-muted-foreground shrink-0" />
+                                  <p className="text-[11px] text-muted-foreground leading-relaxed">
+                                    Lead: Opus/Codex (planning) · Head: Sonnet/Codex (coordination) · Worker: Haiku/Kimi (throughput) · Reviewer: Haiku/Kimi (fast checks) · Escalation: Opus/Codex (hard blockers)
+                                  </p>
+                                </div>
+                                {([
+                                  { role: 'lead', label: 'Lead', desc: 'Plans work and delegates', model: leadModel, onChange: handleLeadChange, thinking: leadThinking },
+                                  { role: 'head', label: 'Head', desc: 'Coordinates sub-teams', model: headModel, onChange: handleHeadChange, thinking: headThinking },
+                                  { role: 'worker', label: 'Worker', desc: 'Executes individual tasks', model: workerModel, onChange: handleWorkerChange, thinking: workerThinking },
+                                  { role: 'reviewer', label: 'Reviewer', desc: 'Quality gate reviews', model: reviewerModel, onChange: handleReviewerChange, thinking: reviewerThinking },
+                                  { role: 'escalation', label: 'Escalation', desc: 'Handles failures', model: escalationModel, onChange: handleEscalationChange, thinking: escalationThinking },
+                                ] as const).map(({ role, label, desc, model, onChange, thinking }) => (
+                                  <div key={role} className="flex items-center gap-3 py-1">
+                                    <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${ROLE_COLORS[role]}`} />
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-xs font-medium">{label}</span>
+                                        <span className="text-[10px] text-muted-foreground">{desc}</span>
+                                      </div>
+                                      <div className="flex items-center gap-2 mt-1.5">
+                                        <select
+                                          value={model}
+                                          onChange={(e) => onChange(e.target.value)}
+                                          className="h-7 text-xs rounded-md border border-border/60 bg-background px-2 pr-6 appearance-none cursor-pointer hover:border-border focus:outline-none focus:ring-1 focus:ring-ring"
+                                        >
+                                          {roleModelOptions.map((opt) => (
+                                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                          ))}
+                                        </select>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleThinkingToggle(role, !thinking)}
+                                          className={`h-7 px-2.5 text-[10px] font-medium rounded-md border transition-colors ${
+                                            thinking
+                                              ? 'border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-400'
+                                              : 'border-border/60 bg-background text-muted-foreground hover:text-foreground'
+                                          }`}
+                                        >
+                                          {thinking ? 'Thinking ON' : 'Thinking OFF'}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           />
                         ))}
                       </SettingsRadioGroup>
                     </SettingsSection>
-
-                    {/* Per-role model assignment is only shown for Custom preset */}
-                    {selectedPreset === 'custom' && (
-                      <SettingsSection
-                        title="Role Models"
-                        description="Model assigned to each role in the team hierarchy"
-                      >
-                        <SettingsCard>
-                          <div className="px-4 py-3 border-b border-border/60 bg-foreground/[0.02]">
-                            <div className="flex items-start gap-2">
-                              <Info className="size-4 mt-0.5 text-muted-foreground shrink-0" />
-                              <div className="space-y-1">
-                                <p className="text-xs font-medium">Suggested defaults for speed + quality</p>
-                                <p className="text-xs text-muted-foreground">Lead: Opus/Codex (planning) · Head: Sonnet/Codex (coordination) · Worker: Sonnet/Haiku/Kimi (throughput) · Reviewer: Sonnet/Kimi (fast checks) · Escalation: Opus/Codex (hard blockers).</p>
-                              </div>
-                            </div>
-                          </div>
-                          <SettingsMenuSelectRow
-                            label="Lead"
-                            description="Orchestrator that plans work and delegates"
-                            value={leadModel}
-                            onValueChange={handleLeadChange}
-                            options={roleModelOptions}
-                          />
-                          <SettingsMenuSelectRow
-                            label="Head"
-                            description="Coordinates sub-teams or complex sub-tasks"
-                            value={headModel}
-                            onValueChange={handleHeadChange}
-                            options={roleModelOptions}
-                          />
-                          <SettingsMenuSelectRow
-                            label="Worker"
-                            description="Executes individual tasks"
-                            value={workerModel}
-                            onValueChange={handleWorkerChange}
-                            options={roleModelOptions}
-                          />
-                          <SettingsMenuSelectRow
-                            label="Reviewer"
-                            description="Reviews teammate output in quality gates"
-                            value={reviewerModel}
-                            onValueChange={handleReviewerChange}
-                            options={reviewModelOptions}
-                          />
-                          <SettingsMenuSelectRow
-                            label="Escalation"
-                            description="Handles worker failures or review rejections"
-                            value={escalationModel}
-                            onValueChange={handleEscalationChange}
-                            options={roleModelOptions}
-                          />
-                        </SettingsCard>
-                      </SettingsSection>
-                    )}
 
                     {(codexSelected && !hasCodexConnection) && (
                       <SettingsSection
@@ -748,6 +867,7 @@ export default function AgentTeamsSettingsPage() {
                     <SettingsSection
                       title="Quality Gates"
                       description="Automated code review pipeline — every piece of teammate code is reviewed, scored, and rejected if below threshold"
+                      className="border-l-2 border-l-amber-500/50 pl-4"
                     >
                       <SettingsCard>
                         <SettingsToggle
@@ -874,10 +994,100 @@ export default function AgentTeamsSettingsPage() {
                       </AnimatePresence>
                     </SettingsSection>
 
+                    {/* YOLO — Autonomous Execution */}
+                    <SettingsSection
+                      title="Autonomous Execution (YOLO)"
+                      description="Fully autonomous orchestration engine. When enabled, YOLO takes an objective, generates a spec, decomposes it into tasks, spawns teammates, runs quality gates, auto-remediates failures, and synthesizes results — all without manual intervention. Pair with Spec Mode below for structured traceability, or use standalone for fast autonomous runs."
+                      className="border-l-2 border-l-violet-500/50 pl-4"
+                    >
+                      <SettingsCard>
+                        <SettingsRadioGroup
+                          value={yoloMode}
+                          onValueChange={handleYoloModeChange}
+                        >
+                          <SettingsRadioCard
+                            value="off"
+                            label="Off"
+                            description="Manual orchestration only — you control the workflow"
+                          />
+                          <SettingsRadioCard
+                            value="fixed"
+                            label="Fixed Plan"
+                            description="Autonomous execution following a fixed plan. Generates a spec, decomposes tasks, spawns teammates, and runs to completion without changing the plan."
+                          />
+                          <SettingsRadioCard
+                            value="smart"
+                            label="Smart (Adaptive)"
+                            description="Same as Fixed, but can discover spec gaps at runtime and propose changes. Best for exploratory or complex work."
+                          />
+                        </SettingsRadioGroup>
+                      </SettingsCard>
+
+                      <AnimatePresence>
+                        {yoloMode !== 'off' && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                            className="space-y-4 overflow-hidden"
+                          >
+                            <SettingsCard>
+                              <div className="px-4 py-3.5 space-y-3">
+                                <SettingsInput
+                                  label="Cost cap (USD)"
+                                  description="Auto-pause when spending reaches this limit"
+                                  value={yoloCostCapUsd}
+                                  onChange={setYoloCostCapUsd}
+                                  onBlur={handleYoloCostCapBlur}
+                                  placeholder="5"
+                                />
+                                <SettingsInput
+                                  label="Timeout (minutes)"
+                                  description="Auto-pause after this many minutes of wall-clock time"
+                                  value={yoloTimeoutMinutes}
+                                  onChange={setYoloTimeoutMinutes}
+                                  onBlur={handleYoloTimeoutBlur}
+                                  placeholder="60"
+                                />
+                                <SettingsInput
+                                  label="Max concurrency"
+                                  description="Maximum teammates working in parallel (1-10)"
+                                  value={yoloMaxConcurrency}
+                                  onChange={setYoloMaxConcurrency}
+                                  onBlur={handleYoloMaxConcurrencyBlur}
+                                  placeholder="3"
+                                />
+                              </div>
+                              <SettingsToggle
+                                label="Auto-remediate failures"
+                                description="Automatically create fix-up tasks when quality gates or integration checks fail"
+                                checked={yoloAutoRemediate}
+                                onCheckedChange={handleYoloAutoRemediateToggle}
+                              />
+                              {yoloAutoRemediate && (
+                                <div className="px-4 pb-3.5">
+                                  <SettingsInput
+                                    label="Max remediation rounds (0-10)"
+                                    description="How many fix-up rounds before aborting (prevents infinite loops)"
+                                    value={yoloMaxRemediationRounds}
+                                    onChange={setYoloMaxRemediationRounds}
+                                    onBlur={handleYoloMaxRemediationRoundsBlur}
+                                    placeholder="3"
+                                  />
+                                </div>
+                              )}
+                            </SettingsCard>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </SettingsSection>
+
                     {/* Spec-Driven Development */}
                     <SettingsSection
                       title="Spec-Driven Development"
-                      description="Enable spec-centric planning, coverage, and compliance workflows"
+                      description="Structured requirement tracking for team work. Adds requirement IDs, DRI assignments, coverage gates, and compliance reports. Works independently of YOLO — use it for governance whether you drive the workflow manually or let YOLO automate it."
+                      className="border-l-2 border-l-sky-500/50 pl-4"
                     >
                       <SettingsCard>
                         <SettingsToggle

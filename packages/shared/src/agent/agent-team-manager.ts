@@ -62,6 +62,7 @@ export interface TeamManagerEvents {
   'message:sent': (message: TeammateMessage) => void;
   'activity': (event: TeamActivityEvent) => void;
   'cost:updated': (teamId: string, cost: TeamCostSummary) => void;
+  'yolo:state_changed': (teamId: string, state: import('@craft-agent/core/types').YoloState) => void;
   'synthesis:requested': (payload: {
     teamId: string;
     completedTasks: TeamTask[];
@@ -344,6 +345,7 @@ export class AgentTeamManager extends EventEmitter {
       ticketLinks?: TeamTask['ticketLinks'];
       assignee?: string;
       dependencies?: string[];
+      taskType?: TeamTask['taskType'];
     }
   ): TeamTask {
     const task: TeamTask = {
@@ -351,6 +353,7 @@ export class AgentTeamManager extends EventEmitter {
       title,
       description,
       status: 'pending',
+      taskType: options?.taskType,
       requirementIds: options?.requirementIds,
       driOwner: options?.driOwner,
       driReviewer: options?.driReviewer,
@@ -662,7 +665,7 @@ export class AgentTeamManager extends EventEmitter {
       const state = orchestrator.getState();
       if (state) {
         this.yoloStates.set(data.teamId, { ...state });
-        this.emit('yolo:state-changed', data.teamId, state);
+        this.emit('yolo:state_changed', data.teamId, state);
       }
     });
   }
@@ -680,7 +683,7 @@ export class AgentTeamManager extends EventEmitter {
   /** Update YOLO state for a team (called by the orchestrator's onStateChange callback) */
   updateYoloState(teamId: string, state: YoloState): void {
     this.yoloStates.set(teamId, state);
-    this.emit('yolo:state-changed', teamId, state);
+    this.emit('yolo:state_changed', teamId, state);
   }
 
   /** Stop a YOLO run for a team */

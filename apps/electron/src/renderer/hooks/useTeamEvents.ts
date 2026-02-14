@@ -12,13 +12,20 @@ import type {
   TeamEvent,
   TeamEventBatch,
   TeamInitializedEvent,
+  TeamCreatedEvent,
+  TeamCleanupEvent,
   TeammateSpawnedEvent,
   TeammateUpdatedEvent,
+  TeammateShutdownEvent,
+  TeammateToolActivityEvent,
+  TeammateHealthIssueEvent,
   TaskCreatedEvent,
   TaskUpdatedEvent,
   MessageSentEvent,
   ActivityLoggedEvent,
   CostUpdatedEvent,
+  YoloStateChangedEvent,
+  SynthesisRequestedEvent,
 } from '@craft-agent/core/types';
 
 // ============================================================
@@ -366,14 +373,21 @@ export function useTeamEventHandler(
 export function useTeamStateSync(
   teamId: string,
   callbacks: {
+    onTeamCreated?: (event: TeamCreatedEvent) => void;
     onTeamUpdated?: (event: TeamInitializedEvent) => void;
+    onTeamCleanup?: (event: TeamCleanupEvent) => void;
     onTeammateSpawned?: (event: TeammateSpawnedEvent) => void;
     onTeammateUpdated?: (event: TeammateUpdatedEvent) => void;
+    onTeammateShutdown?: (event: TeammateShutdownEvent) => void;
+    onTeammateToolActivity?: (event: TeammateToolActivityEvent) => void;
+    onTeammateHealthIssue?: (event: TeammateHealthIssueEvent) => void;
     onTaskCreated?: (event: TaskCreatedEvent) => void;
     onTaskUpdated?: (event: TaskUpdatedEvent) => void;
     onMessageSent?: (event: MessageSentEvent) => void;
     onActivityLogged?: (event: ActivityLoggedEvent) => void;
     onCostUpdated?: (event: CostUpdatedEvent) => void;
+    onYoloStateChanged?: (event: YoloStateChangedEvent) => void;
+    onSynthesisRequested?: (event: SynthesisRequestedEvent) => void;
   },
   options?: Omit<TeamEventSubscriptionOptions, 'teamId'>
 ): UseTeamEventsResult {
@@ -382,15 +396,30 @@ export function useTeamStateSync(
   useEffect(() => {
     const handler = (event: TeamEvent) => {
       switch (event.type) {
+        case 'team:created':
+          callbacks.onTeamCreated?.(event as TeamCreatedEvent);
+          break;
         case 'team:initialized':
         case 'team:updated':
           callbacks.onTeamUpdated?.(event as TeamInitializedEvent);
+          break;
+        case 'team:cleanup':
+          callbacks.onTeamCleanup?.(event as TeamCleanupEvent);
           break;
         case 'teammate:spawned':
           callbacks.onTeammateSpawned?.(event as TeammateSpawnedEvent);
           break;
         case 'teammate:updated':
           callbacks.onTeammateUpdated?.(event as TeammateUpdatedEvent);
+          break;
+        case 'teammate:shutdown':
+          callbacks.onTeammateShutdown?.(event as TeammateShutdownEvent);
+          break;
+        case 'teammate:tool_activity':
+          callbacks.onTeammateToolActivity?.(event as TeammateToolActivityEvent);
+          break;
+        case 'teammate:health_issue':
+          callbacks.onTeammateHealthIssue?.(event as TeammateHealthIssueEvent);
           break;
         case 'task:created':
           callbacks.onTaskCreated?.(event as TaskCreatedEvent);
@@ -406,6 +435,12 @@ export function useTeamStateSync(
           break;
         case 'cost:updated':
           callbacks.onCostUpdated?.(event as CostUpdatedEvent);
+          break;
+        case 'yolo:state_changed':
+          callbacks.onYoloStateChanged?.(event as YoloStateChangedEvent);
+          break;
+        case 'synthesis:requested':
+          callbacks.onSynthesisRequested?.(event as SynthesisRequestedEvent);
           break;
       }
     };

@@ -19,6 +19,7 @@ import { getPreferencesPath, getSessionDraft, setSessionDraft, deleteSessionDraf
 import { getSessionAttachmentsPath, validateSessionId } from '@craft-agent/shared/sessions'
 import { loadWorkspaceSources, getSourcesBySlugs, type LoadedSource } from '@craft-agent/shared/sources'
 import { isValidThinkingLevel } from '@craft-agent/shared/agent/thinking-levels'
+import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { MarkItDown } from 'markitdown-js'
 
@@ -1852,7 +1853,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       qualityGatesMaxCycles: qg?.maxReviewCycles ?? 5,
       qualityGatesEnforceTDD: qg?.enforceTDD ?? true,
       qualityGatesReviewModel: qg?.reviewModel ?? 'kimi-k2.5',
-      qualityGatesBaselineAwareTests: qg?.baselineAwareTests ?? false,
+      qualityGatesBaselineAwareTests: qg?.baselineAwareTests ?? true,
       qualityGatesKnownFailingTests: qg?.knownFailingTests ?? [],
       qualityGatesSyntaxEnabled: qg?.stages?.syntax?.enabled ?? true,
       qualityGatesTestsEnabled: qg?.stages?.tests?.enabled ?? true,
@@ -1860,6 +1861,13 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       qualityGatesSimplicityEnabled: qg?.stages?.simplicity?.enabled ?? true,
       qualityGatesErrorsEnabled: qg?.stages?.errors?.enabled ?? true,
       qualityGatesCompletenessEnabled: qg?.stages?.completeness?.enabled ?? true,
+      // YOLO settings
+      yoloMode: config?.agentTeams?.yolo?.mode ?? 'off',
+      yoloCostCapUsd: config?.agentTeams?.yolo?.costCapUsd ?? 5,
+      yoloTimeoutMinutes: config?.agentTeams?.yolo?.timeoutMinutes ?? 60,
+      yoloMaxConcurrency: config?.agentTeams?.yolo?.maxConcurrency ?? 3,
+      yoloAutoRemediate: config?.agentTeams?.yolo?.autoRemediate ?? true,
+      yoloMaxRemediationRounds: config?.agentTeams?.yolo?.maxRemediationRounds ?? 3,
       // SDD settings
       sddEnabled: sdd?.sddEnabled ?? false,
       sddRequireDRIAssignment: sdd?.requireDRIAssignment ?? true,
@@ -1877,7 +1885,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
+    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate', 'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -1976,6 +1984,23 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       }
 
       config.agentTeams.qualityGates = qg as typeof config.agentTeams.qualityGates
+    } else if (key.startsWith('yolo')) {
+      // Store YOLO settings in config.agentTeams.yolo
+      config.agentTeams = config.agentTeams || { enabled: false }
+      const yolo: Record<string, unknown> = (config.agentTeams.yolo || {}) as Record<string, unknown>
+      const yoloKeyMap: Record<string, string> = {
+        yoloMode: 'mode',
+        yoloCostCapUsd: 'costCapUsd',
+        yoloTimeoutMinutes: 'timeoutMinutes',
+        yoloMaxConcurrency: 'maxConcurrency',
+        yoloAutoRemediate: 'autoRemediate',
+        yoloMaxRemediationRounds: 'maxRemediationRounds',
+      }
+      const mappedKey = yoloKeyMap[key]
+      if (mappedKey) {
+        yolo[mappedKey] = value
+      }
+      config.agentTeams.yolo = yolo as typeof config.agentTeams.yolo
     } else if (key.startsWith('sdd')) {
       // Store SDD settings in config.sdd
       config.sdd = config.sdd || {}
@@ -3741,118 +3766,169 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // ============================================================
 
   // Broadcast agent-team events to all renderers
+  // Implements REQ-001: Dashboard event pipeline — listeners registered synchronously via static import
   if (!teamActivityListenerRegistered) {
     teamActivityListenerRegistered = true
-    void (async () => {
-      const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
-      const resolveTeamIdForTeammate = (teammateId: string): string | null => {
-        const team = teamManager.getActiveTeams().find(t => t.members.some(m => m.id === teammateId))
-        return team?.id ?? null
-      }
-      const resolveTeamIdForTask = (taskId: string): string | null => {
-        const team = teamManager.getActiveTeams().find(t => teamManager.getTasks(t.id).some(task => task.id === taskId))
-        return team?.id ?? null
-      }
-      const resolveTeamIdForMessage = (messageId: string): string | null => {
-        const team = teamManager.getActiveTeams().find(t => teamManager.getMessages(t.id).some(msg => msg.id === messageId))
-        return team?.id ?? null
-      }
 
-      const activityListener = (event: import('@craft-agent/core/types').TeamActivityEvent) => {
-        if (!event.teamId) {
-          ipcLog.warn('[agent teams] Skipping activity event without teamId', event)
-          return
-        }
-        const envelope: import('@craft-agent/core/types').ActivityLoggedEvent = {
-          type: 'activity:logged',
-          teamId: event.teamId,
-          payload: { activity: event },
-          timestamp: event.timestamp,
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    const resolveTeamIdForTeammate = (teammateId: string): string | null => {
+      const team = teamManager.getActiveTeams().find(t => t.members.some(m => m.id === teammateId))
+      return team?.id ?? null
+    }
+    const resolveTeamIdForTask = (taskId: string): string | null => {
+      const team = teamManager.getActiveTeams().find(t => teamManager.getTasks(t.id).some(task => task.id === taskId))
+      return team?.id ?? null
+    }
+    const resolveTeamIdForMessage = (messageId: string): string | null => {
+      const team = teamManager.getActiveTeams().find(t => teamManager.getMessages(t.id).some(msg => msg.id === messageId))
+      return team?.id ?? null
+    }
+
+    const activityListener = (event: import('@craft-agent/core/types').TeamActivityEvent) => {
+      if (!event.teamId) {
+        ipcLog.warn('[agent teams] Skipping activity event without teamId', event)
+        return
       }
-      const teamUpdatedListener = (team: import('@craft-agent/core/types').AgentTeam) => {
-        const envelope: import('@craft-agent/core/types').TeamUpdatedEvent = {
-          type: 'team:updated',
-          teamId: team.id,
-          payload: { team },
-          timestamp: new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      const envelope: import('@craft-agent/core/types').ActivityLoggedEvent = {
+        type: 'activity:logged',
+        teamId: event.teamId,
+        payload: { activity: event },
+        timestamp: event.timestamp,
       }
-      const teammateSpawnedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
-        const teamId = resolveTeamIdForTeammate(teammate.id)
-        if (!teamId) return
-        const envelope: import('@craft-agent/core/types').TeammateSpawnedEvent = {
-          type: 'teammate:spawned',
-          teamId,
-          payload: { teammate },
-          timestamp: new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const teamUpdatedListener = (team: import('@craft-agent/core/types').AgentTeam) => {
+      const envelope: import('@craft-agent/core/types').TeamUpdatedEvent = {
+        type: 'team:updated',
+        teamId: team.id,
+        payload: { team },
+        timestamp: new Date().toISOString(),
       }
-      const teammateUpdatedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
-        const teamId = resolveTeamIdForTeammate(teammate.id)
-        if (!teamId) return
-        const envelope: import('@craft-agent/core/types').TeammateUpdatedEvent = {
-          type: 'teammate:updated',
-          teamId,
-          payload: { teammate },
-          timestamp: new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const teammateSpawnedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
+      const teamId = resolveTeamIdForTeammate(teammate.id)
+      if (!teamId) return
+      const envelope: import('@craft-agent/core/types').TeammateSpawnedEvent = {
+        type: 'teammate:spawned',
+        teamId,
+        payload: { teammate },
+        timestamp: new Date().toISOString(),
       }
-      const taskCreatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
-        const teamId = resolveTeamIdForTask(task.id)
-        if (!teamId) return
-        const envelope: import('@craft-agent/core/types').TaskCreatedEvent = {
-          type: 'task:created',
-          teamId,
-          payload: { task },
-          timestamp: new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const teammateUpdatedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
+      const teamId = resolveTeamIdForTeammate(teammate.id)
+      if (!teamId) return
+      const envelope: import('@craft-agent/core/types').TeammateUpdatedEvent = {
+        type: 'teammate:updated',
+        teamId,
+        payload: { teammate },
+        timestamp: new Date().toISOString(),
       }
-      const taskUpdatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
-        const teamId = resolveTeamIdForTask(task.id)
-        if (!teamId) return
-        const envelope: import('@craft-agent/core/types').TaskUpdatedEvent = {
-          type: 'task:updated',
-          teamId,
-          payload: { task },
-          timestamp: new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const taskCreatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
+      const teamId = resolveTeamIdForTask(task.id)
+      if (!teamId) return
+      const envelope: import('@craft-agent/core/types').TaskCreatedEvent = {
+        type: 'task:created',
+        teamId,
+        payload: { task },
+        timestamp: new Date().toISOString(),
       }
-      const messageSentListener = (message: import('@craft-agent/core/types').TeammateMessage) => {
-        const teamId = resolveTeamIdForMessage(message.id)
-        if (!teamId) return
-        const envelope: import('@craft-agent/core/types').MessageSentEvent = {
-          type: 'message:sent',
-          teamId,
-          payload: { message },
-          timestamp: message.timestamp ?? new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const taskUpdatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
+      const teamId = resolveTeamIdForTask(task.id)
+      if (!teamId) return
+      const envelope: import('@craft-agent/core/types').TaskUpdatedEvent = {
+        type: 'task:updated',
+        teamId,
+        payload: { task },
+        timestamp: new Date().toISOString(),
       }
-      const costUpdatedListener = (teamId: string, summary: import('@craft-agent/core/types').TeamCostSummary) => {
-        const envelope: import('@craft-agent/core/types').CostUpdatedEvent = {
-          type: 'cost:updated',
-          teamId,
-          payload: { summary },
-          timestamp: new Date().toISOString(),
-        }
-        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const messageSentListener = (message: import('@craft-agent/core/types').TeammateMessage) => {
+      const teamId = resolveTeamIdForMessage(message.id)
+      if (!teamId) return
+      const envelope: import('@craft-agent/core/types').MessageSentEvent = {
+        type: 'message:sent',
+        teamId,
+        payload: { message },
+        timestamp: message.timestamp ?? new Date().toISOString(),
       }
-      teamManager.on('activity', activityListener)
-      teamManager.on('team:updated', teamUpdatedListener)
-      teamManager.on('teammate:spawned', teammateSpawnedListener)
-      teamManager.on('teammate:updated', teammateUpdatedListener)
-      teamManager.on('task:created', taskCreatedListener)
-      teamManager.on('task:updated', taskUpdatedListener)
-      teamManager.on('message:sent', messageSentListener)
-      teamManager.on('cost:updated', costUpdatedListener)
-    })()
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const costUpdatedListener = (teamId: string, summary: import('@craft-agent/core/types').TeamCostSummary) => {
+      const envelope: import('@craft-agent/core/types').CostUpdatedEvent = {
+        type: 'cost:updated',
+        teamId,
+        payload: { summary },
+        timestamp: new Date().toISOString(),
+      }
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const teamCreatedListener = (team: import('@craft-agent/core/types').AgentTeam) => {
+      const envelope: import('@craft-agent/core/types').TeamCreatedEvent = {
+        type: 'team:created',
+        teamId: team.id,
+        payload: { team },
+        timestamp: new Date().toISOString(),
+      }
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const teammateShutdownListener = (teammateId: string) => {
+      const teamId = resolveTeamIdForTeammate(teammateId)
+      if (!teamId) return
+      const envelope: import('@craft-agent/core/types').TeammateShutdownEvent = {
+        type: 'teammate:shutdown',
+        teamId,
+        payload: { teammateId },
+        timestamp: new Date().toISOString(),
+      }
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const teamCleanupListener = (teamId: string) => {
+      const envelope: import('@craft-agent/core/types').TeamCleanupEvent = {
+        type: 'team:cleanup',
+        teamId,
+        payload: {},
+        timestamp: new Date().toISOString(),
+      }
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const yoloStateChangedListener = (teamId: string, state: import('@craft-agent/core/types').YoloState) => {
+      const envelope: import('@craft-agent/core/types').YoloStateChangedEvent = {
+        type: 'yolo:state_changed',
+        teamId,
+        payload: { state },
+        timestamp: new Date().toISOString(),
+      }
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    const synthesisRequestedListener = (payload: { teamId: string; completedTasks: import('@craft-agent/core/types').TeamTask[]; requirementCoverage: number; outstandingItems: string[] }) => {
+      const envelope: import('@craft-agent/core/types').SynthesisRequestedEvent = {
+        type: 'synthesis:requested',
+        teamId: payload.teamId,
+        payload: { completedTasks: payload.completedTasks, requirementCoverage: payload.requirementCoverage, outstandingItems: payload.outstandingItems },
+        timestamp: new Date().toISOString(),
+      }
+      windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+    }
+    teamManager.on('activity', activityListener)
+    teamManager.on('team:created', teamCreatedListener)
+    teamManager.on('team:updated', teamUpdatedListener)
+    teamManager.on('team:cleanup', teamCleanupListener)
+    teamManager.on('teammate:spawned', teammateSpawnedListener)
+    teamManager.on('teammate:updated', teammateUpdatedListener)
+    teamManager.on('teammate:shutdown', teammateShutdownListener)
+    teamManager.on('task:created', taskCreatedListener)
+    teamManager.on('task:updated', taskUpdatedListener)
+    teamManager.on('message:sent', messageSentListener)
+    teamManager.on('cost:updated', costUpdatedListener)
+    teamManager.on('yolo:state_changed', yoloStateChangedListener)
+    teamManager.on('synthesis:requested', synthesisRequestedListener)
   }
 
   // Get whether agent teams are enabled for a workspace
@@ -3878,7 +3954,6 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     workspaceId: string;
     modelPreset?: string;
   }) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const { resolveTeamModelConfig } = await import('@craft-agent/shared/agent-teams/model-resolution')
     const { loadWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
     const workspace = getWorkspaceOrThrow(options.workspaceId)
@@ -3926,25 +4001,21 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Get team status
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_STATUS, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.getTeam(teamManager.resolveTeamId(teamId))
   })
 
   // Get team mailbox messages
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_MESSAGES, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.getMessages(teamManager.resolveTeamId(teamId))
   })
 
   // Get team activity log
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_ACTIVITY, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.getActivityLog(teamManager.resolveTeamId(teamId))
   })
 
   // Get active team spec (if any)
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_SPEC, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.getTeamSpec(teamManager.resolveTeamId(teamId))
   })
 
@@ -3986,20 +4057,17 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Shut down a teammate
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SHUTDOWN_TEAMMATE, async (_event, teamId: string, teammateId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     teamManager.shutdownTeammate(teamManager.resolveTeamId(teamId), teammateId)
     ipcLog.info(`Teammate shut down: ${teammateId}`)
   })
 
   // Send message between teammates
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SEND_MESSAGE, async (_event, teamId: string, from: string, to: string, content: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.sendMessage(teamManager.resolveTeamId(teamId), from, to, content)
   })
 
   // Send message to teammate session and mailbox (execution path)
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SEND_EXECUTE, async (_event, teamId: string, from: string, to: string, content: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const resolvedTeamId = teamManager.resolveTeamId(teamId)
     // Implements REQ-001: ensure dashboard sends trigger teammate execution
     await sessionManager.sendMessage(to, `[From Lead] ${content}`)
@@ -4008,31 +4076,26 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
   // Broadcast message to all teammates
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_BROADCAST, async (_event, teamId: string, from: string, content: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.broadcastMessage(teamManager.resolveTeamId(teamId), from, content)
   })
 
   // Get task list
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_TASKS, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.getTasks(teamManager.resolveTeamId(teamId))
   })
 
   // Update a task
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_UPDATE_TASK, async (_event, teamId: string, taskId: string, status: string, assignee?: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     teamManager.updateTaskStatus(teamManager.resolveTeamId(teamId), taskId, status as any, assignee)
   })
 
   // Get cost summary
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_COST, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.getCostSummary(teamManager.resolveTeamId(teamId))
   })
 
   // Swap teammate model
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_SWAP_MODEL, async (_event, teamId: string, teammateId: string, newModel: string, newProvider: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const team = teamManager.getTeam(teamManager.resolveTeamId(teamId))
     if (!team) throw new Error(`Team not found: ${teamId}`)
     const teammate = team.members.find(m => m.id === teammateId)
@@ -4106,12 +4169,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   })
 
   ipcMain.handle(IPC_CHANNELS.SDD_VALIDATE_DRI, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.validateDRICoverage(teamManager.resolveTeamId(teamId))
   })
 
   ipcMain.handle(IPC_CHANNELS.SDD_CAN_CLOSE, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     return teamManager.canClosePlan(teamManager.resolveTeamId(teamId))
   })
 
@@ -4120,7 +4181,6 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // ============================================================
 
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_START, async (_event, teamId: string, objective: string, config?: Record<string, unknown>) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const resolvedId = teamManager.resolveTeamId(teamId)
     const team = teamManager.getTeam(resolvedId)
     if (!team) throw new Error(`Team not found: ${teamId}`)
@@ -4131,11 +4191,12 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
     if (!orchestrator) throw new Error(`YOLO orchestrator not available for team ${teamId}`)
 
-    return orchestrator.start(resolvedId, objective, config)
+    // Config arrives as plain JSON from IPC — cast to the expected shape
+    const yoloConfig = config as Partial<import('@craft-agent/core/types').YoloConfig> | undefined
+    return orchestrator.start(resolvedId, objective, yoloConfig)
   })
 
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_PAUSE, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const resolvedId = teamManager.resolveTeamId(teamId)
     const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
     if (!orchestrator) throw new Error(`YOLO orchestrator not available for team ${teamId}`)
@@ -4144,7 +4205,6 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   })
 
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_ABORT, async (_event, teamId: string, reason?: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const resolvedId = teamManager.resolveTeamId(teamId)
     const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
     if (!orchestrator) throw new Error(`YOLO orchestrator not available for team ${teamId}`)
@@ -4153,7 +4213,6 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   })
 
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_YOLO_GET_STATE, async (_event, teamId: string) => {
-    const { teamManager } = await import('@craft-agent/shared/agent/agent-team-manager')
     const resolvedId = teamManager.resolveTeamId(teamId)
     const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
     return orchestrator?.getState() ?? null

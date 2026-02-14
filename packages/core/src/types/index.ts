@@ -88,7 +88,7 @@ export type {
   // Phase types
   TeamPhase,
 } from './agent-teams.ts';
-export { DEFAULT_YOLO_CONFIG } from './agent-teams.ts';
+export { DEFAULT_YOLO_CONFIG, CODE_TASK_TYPES, NON_CODE_TASK_TYPES, shouldSkipQualityGates } from './agent-teams.ts';
 
 // Team Dashboard View State types (Phase 1)
 export type {
@@ -106,12 +106,15 @@ export { createInitialDashboardState } from './team-view-state.ts';
 export type {
   TeamEventEnvelope,
   TeamInitializedEvent,
+  TeamCreatedEvent,
   TeamUpdatedEvent,
   TeamCleanupEvent,
   TeamCompletedEvent,
   TeammateSpawnedEvent,
   TeammateUpdatedEvent,
   TeammateDeltaEvent,
+  TeammateToolActivityEvent,
+  TeammateHealthIssueEvent,
   TeammateShutdownEvent,
   TaskCreatedEvent,
   TaskUpdatedEvent,
@@ -126,6 +129,8 @@ export type {
   QualityGateCompletedEvent,
   IntegrationCheckStartedEvent,
   IntegrationCheckCompletedEvent,
+  YoloStateChangedEvent,
+  SynthesisRequestedEvent,
   TeamErrorEvent,
   TeamEvent,
   TeamEventBatch,
