@@ -41,6 +41,18 @@ export interface SidebarContextMenuConfig {
   viewId?: string
   /** Handler for "Delete View" action */
   onDeleteView?: (id: string) => void
+  /** Handler for "Add Scheduled Task" action - for scheduled type */
+  onAddScheduledTask?: () => void
+  /** Scheduled task index — for individual task items */
+  scheduledTaskIndex?: number
+  /** Handler for "Edit Scheduled Task" action */
+  onEditScheduledTask?: (index: number) => void
+  /** Handler for "Delete Scheduled Task" action */
+  onDeleteScheduledTask?: (index: number) => void
+  /** Handler for "Toggle Scheduled Task" action */
+  onToggleScheduledTask?: (index: number) => void
+  /** Whether the scheduled task is currently enabled */
+  scheduledTaskEnabled?: boolean
 }
 
 /**
@@ -242,6 +254,12 @@ export function LeftSidebar({ links, isCollapsed, getItemProps, focusedItemId, i
                         onConfigureViews={link.contextMenu.onConfigureViews}
                         viewId={link.contextMenu.viewId}
                         onDeleteView={link.contextMenu.onDeleteView}
+                        onAddScheduledTask={link.contextMenu.onAddScheduledTask}
+                        scheduledTaskIndex={link.contextMenu.scheduledTaskIndex}
+                        onEditScheduledTask={link.contextMenu.onEditScheduledTask}
+                        onDeleteScheduledTask={link.contextMenu.onDeleteScheduledTask}
+                        onToggleScheduledTask={link.contextMenu.onToggleScheduledTask}
+                        scheduledTaskEnabled={link.contextMenu.scheduledTaskEnabled}
                       />
                     </ContextMenuProvider>
                   </StyledContextMenuContent>

@@ -109,6 +109,18 @@ import { sanitizeForTitle } from './title-sanitizer'
 export { sanitizeForTitle }
 
 /**
+ * Resolve the usage provider from a connection's providerType and model.
+ * Replaces repeated nested ternary: openai → 'openai', openai_compat → infer from model, else → 'anthropic'.
+ */
+function resolveUsageProvider(providerType: string | undefined, model: string | undefined): UsageProvider {
+  switch (providerType) {
+    case 'openai': return 'openai'
+    case 'openai_compat': return inferProviderFromModel(model)
+    default: return 'anthropic'
+  }
+}
+
+/**
  * Get the path to the bundled Bun executable.
  * - Packaged app: returns path to bundled Bun in vendor/bun
  * - Development: returns undefined (caller should use system 'bun' command)
@@ -1597,7 +1609,9 @@ export class SessionManager {
       const lines = liveHealth.map(h => {
         const elapsed = Date.now() - new Date(h.lastActivityAt).getTime()
         const elapsedStr = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s ago` : `${Math.round(elapsed / 60000)}m ago`
-        const task = h.currentTaskId ? `working on ${h.currentTaskId}` : 'idle'
+        const rawTask = h.currentTaskId ?? ''
+        const taskLabel = rawTask.length > 60 ? rawTask.slice(0, 57) + '...' : rawTask
+        const task = taskLabel ? `working on "${taskLabel}"` : 'idle'
         const issues = h.issues.length > 0 ? ` [${h.issues.length} issue(s)]` : ''
         return `- ${h.teammateName}: ${task} (last activity: ${elapsedStr})${issues}`
       })
@@ -1827,6 +1841,9 @@ export class SessionManager {
 
       spawnAndAssign: async (_teamId: string, taskIds: string[]) => {
         const tasks = teamManager.getTasks(_teamId)
+        // Resolve the worker model from presets instead of using the lead's model
+        const workerAssignment = resolveTeamModelForRole(wsConfig, 'worker', undefined, lead.model)
+        const workerModel = workerAssignment.model !== 'unknown' ? workerAssignment.model : lead.model
         for (const taskId of taskIds) {
           const task = tasks.find(t => t.id === taskId)
           if (!task) continue
@@ -1837,7 +1854,7 @@ export class SessionManager {
               teamId: _teamId,
               teammateName: `worker-${taskId.slice(-6)}`,
               prompt: task.description || task.title,
-              model: lead.model,
+              model: workerModel,
             })
             // Assign the task to the spawned teammate
             const team = teamManager.getTeam(_teamId)
@@ -3902,7 +3919,8 @@ export class SessionManager {
     parentSessionId: string
     workspaceId: string
     teamId: string
-    teammateName: string
+    /** Teammate name - if undefined, a witty codename will be generated */
+    teammateName: string | undefined
     prompt: string
     model?: string
     llmConnection?: string
@@ -3925,6 +3943,35 @@ export class SessionManager {
       parent.teamColor = teamColor
       parent.teamId = params.teamId
       parent.isTeamLead = true
+
+      // Upgrade lead session model to the preset's lead model
+      const wsConfigForLead = loadWorkspaceConfig(parent.workspace.rootPath)
+      const leadAssignment = resolveTeamModelForRole(wsConfigForLead, 'lead')
+      const leadModel = leadAssignment.model
+      if (leadModel && leadModel !== 'unknown' && leadModel !== parent.model) {
+        const leadConnectionSlug = resolveConnectionForModel({
+          model: leadModel,
+          parentConnectionSlug: parent.llmConnection,
+          workspaceDefaultSlug: wsConfigForLead?.defaults?.defaultLlmConnection,
+        })
+        const resolvedConn = leadConnectionSlug ? getLlmConnection(leadConnectionSlug) : null
+        if (resolvedConn && connectionSupportsModel(resolvedConn, leadModel)) {
+          sessionLog.info(`[AgentTeams] Upgrading lead session model from "${parent.model}" to preset lead model "${leadModel}"`)
+          parent.model = leadModel
+          parent.llmConnection = leadConnectionSlug!
+          parent.llmProvider = resolveUsageProvider(resolvedConn.providerType, leadModel)
+          if (parent.agent) {
+            parent.agent.setModel(leadModel)
+          }
+          // Persist and notify renderer
+          updateSessionMetadata(parent.workspace.rootPath, parent.id, {
+            model: parent.model,
+            llmProvider: parent.llmProvider,
+            llmConnection: parent.llmConnection,
+          })
+          this.sendEvent({ type: 'session_model_changed', sessionId: parent.id, model: parent.model }, parent.workspace.id)
+        }
+      }
     }
 
     // Create the teammate session
@@ -3937,13 +3984,18 @@ export class SessionManager {
       throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
     }
     const teammateRole = normalizeTeamRole(params.role)
-    const requestedTeammateName = params.teammateName?.trim() || `${teammateRole}-${Date.now().toString(36)}`
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
     const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
-    // Implements REQ-001: Use clean codename without long ID suffix
-    const teammateDisplayName = teammateCodename
+    // Implements REQ-002: Use witty codename as primary name, honor explicit custom names
+    const customName = params.teammateName?.trim()
+    const teammateDisplayName = customName || teammateCodename
+    const isAutoGenerated = !customName
+
     if (params.role && params.role !== teammateRole) {
-      sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested for ${requestedTeammateName}; defaulting to "${teammateRole}"`)
+      sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested; defaulting to "${teammateRole}"`)
+    }
+    if (isAutoGenerated) {
+      sessionLog.info(`[AgentTeams] No teammate name provided; generated codename: ${teammateCodename}`)
     }
     // Implements REQ-002: honor workspace role model defaults and ignore conflicting overrides
     const requestedModel = params.model?.trim()
@@ -3970,7 +4022,7 @@ export class SessionManager {
       )
     }
 
-    sessionLog.info(`[AgentTeams] Resolved teammate spawn: requested=${requestedTeammateName} display=${teammateDisplayName} role=${teammateRole} model=${teammateModel}`)
+    sessionLog.info(`[AgentTeams] Resolved teammate spawn: name=${teammateDisplayName}${isAutoGenerated ? ' (auto-generated)' : ''} role=${teammateRole} model=${teammateModel}`)
 
     // Implements REQ-004: choose a provider/connection compatible with the resolved model
     const teammateConnectionSlug = resolveConnectionForModel({
@@ -4012,7 +4064,7 @@ export class SessionManager {
       sddEnabled: parent.sddEnabled,
       activeSpecId: parent.activeSpecId,
     })
-    await this.renameSession(teammateSession.id, requestedTeammateName)
+    await this.renameSession(teammateSession.id, teammateDisplayName)
 
     // Track teammate in parent
     if (!parent.teammateSessionIds) {
@@ -4047,7 +4099,7 @@ export class SessionManager {
     this.startTeamHealthMonitoring(resolvedTeamId, params.parentSessionId)
     this.healthMonitor.recordActivity(resolvedTeamId, teammateSession.id, teammateDisplayName, {
       type: 'task_update',
-      taskId: requestedTeammateName,
+      taskId: params.prompt?.slice(0, 80) ?? 'unknown',
     })
 
     // Build compact spec context + task metadata for teammates when SDD is enabled
@@ -4361,11 +4413,7 @@ export class SessionManager {
       if (connection) {
         provider = providerTypeToAgentProvider(connection.providerType || 'anthropic')
         authType = connectionAuthTypeToBackendAuthType(connection.authType)
-        managed.llmProvider = connection.providerType === 'openai'
-          ? 'openai'
-          : connection.providerType === 'openai_compat'
-            ? inferProviderFromModel(managed.model || connection.defaultModel)
-            : 'anthropic'
+        managed.llmProvider = resolveUsageProvider(connection.providerType, managed.model || connection.defaultModel)
         sessionLog.info(`Using LLM connection "${connection.slug}" (${connection.providerType}) for session ${managed.id}`)
       } else {
         // Fallback: try to get default connection
@@ -4374,11 +4422,7 @@ export class SessionManager {
         if (defaultConn) {
           provider = providerTypeToAgentProvider(defaultConn.providerType || 'anthropic')
           authType = connectionAuthTypeToBackendAuthType(defaultConn.authType)
-          managed.llmProvider = defaultConn.providerType === 'openai'
-            ? 'openai'
-            : defaultConn.providerType === 'openai_compat'
-              ? inferProviderFromModel(managed.model || defaultConn.defaultModel)
-              : 'anthropic'
+          managed.llmProvider = resolveUsageProvider(defaultConn.providerType, managed.model || defaultConn.defaultModel)
           sessionLog.info(`Using default LLM connection "${defaultConn.slug}" (${defaultConn.providerType}) for session ${managed.id}`)
         } else {
           // No connections at all - fall back to anthropic provider
@@ -6190,13 +6234,9 @@ export class SessionManager {
       }
       const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
       const sessionConn = resolveSessionConnection(managed.llmConnection, wsConfig?.defaults?.defaultLlmConnection)
-      managed.llmProvider = sessionConn?.providerType === 'openai'
-        ? 'openai'
-        : sessionConn?.providerType === 'openai_compat'
-          ? inferProviderFromModel(model ?? sessionConn.defaultModel)
-          : sessionConn
-            ? 'anthropic'
-            : inferProviderFromModel(model ?? managed.model)
+      managed.llmProvider = sessionConn
+        ? resolveUsageProvider(sessionConn.providerType, model ?? sessionConn.defaultModel)
+        : inferProviderFromModel(model ?? managed.model)
       // Persist to disk (include connection if it was updated)
       const updates: { model?: string; llmProvider?: UsageProvider; llmConnection?: string } = {
         model: model ?? undefined,

@@ -117,7 +117,7 @@ describe('CodexAgent agent teams interception', () => {
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'Task');
     expect(toolResult).toBeDefined();
     expect(toolResult!.isError).toBe(false);
-    expect(String(toolResult!.result)).toContain('Worker');
+    expect(String(toolResult!.result)).toContain('spawned successfully');
   });
 
   // ──────────────────────────────────────────────
@@ -159,7 +159,7 @@ describe('CodexAgent agent teams interception', () => {
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'Task');
     expect(toolResult).toBeDefined();
     expect(toolResult!.isError).toBe(false);
-    expect(String(toolResult!.result)).toContain('Researcher');
+    expect(String(toolResult!.result)).toContain('spawned successfully');
   });
 
   // ---------------------------------------------------------------------------
@@ -325,7 +325,7 @@ describe('CodexAgent agent teams interception', () => {
     const toolResult = events.find((e) => e.type === 'tool_result' && e.toolName === 'Task');
     expect(toolResult).toBeDefined();
     expect(toolResult!.isError).toBe(true);
-    expect(String(toolResult!.result)).toContain('Failed to spawn teammate "FailBot"');
+    expect(String(toolResult!.result)).toContain('Failed to spawn teammate');
     expect(String(toolResult!.result)).toContain('Session pool exhausted');
 
     // Should NOT emit team_initialized on error

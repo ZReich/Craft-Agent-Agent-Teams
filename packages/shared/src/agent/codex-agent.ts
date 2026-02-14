@@ -1163,7 +1163,8 @@ export class CodexAgent extends BaseAgent {
       sdkToolName.endsWith('__Task');
 
     if (isSpawnTool && teamName && this.onTeammateSpawnRequested) {
-      const teammateName = (inputObj.name as string) || `teammate-${Date.now()}`;
+      // Implements REQ-001: Let session manager generate witty codenames
+      const teammateName = (inputObj.name as string) || undefined;
       const prompt = (inputObj.prompt as string) || (inputObj.input as string) || '';
       const model = inputObj.model as string | undefined;
       const role = inputObj.role as string | undefined;
@@ -1172,10 +1173,13 @@ export class CodexAgent extends BaseAgent {
         this.debug(`[AgentTeams] No team_name provided; defaulting to "${teamName}"`);
       }
       if (!role) {
-        this.debug(`[AgentTeams] No role provided for teammate "${teammateName}"; defaulting to worker at session manager`);
+        this.debug(`[AgentTeams] No role provided for teammate; defaulting to worker at session manager`);
+      }
+      if (!teammateName) {
+        this.debug(`[AgentTeams] No teammate name provided; session manager will generate codename`);
       }
 
-      this.debug(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}" via MCP`);
+      this.debug(`[AgentTeams] Intercepting teammate spawn: ${teammateName || '(auto-generated)'} for team "${teamName}" via MCP`);
 
       try {
         const result = await this.onTeammateSpawnRequested({
@@ -1192,15 +1196,15 @@ export class CodexAgent extends BaseAgent {
         this.debug(`[AgentTeams] Team "${teamName}" now has ${this.activeTeammateCount} active teammates`);
 
         const outputContent =
-          `Teammate "${teammateName}" spawned successfully as a separate session.\n` +
-          `agent_id: ${result.sessionId}\nname: ${teammateName}\nstatus: running\n\n` +
-          `The teammate is now working independently in its own context window. You will receive their results when they complete.`;
+          `Teammate spawned successfully as a separate session.\n` +
+          `agent_id: ${result.sessionId}\nstatus: running\n\n` +
+          `The teammate is now working independently in its own context window with an auto-generated codename. You will receive their results when they complete.`;
 
         // Emit team initialization for UI + task list
         this.enqueueEvent({
           type: 'team_initialized',
           teamName,
-          teammateName,
+          teammateName: teammateName || 'teammate',
           teamToolUseId: itemId,
         });
 
@@ -1220,7 +1224,7 @@ export class CodexAgent extends BaseAgent {
         });
         return;
       } catch (err) {
-        const errorMessage = `Failed to spawn teammate "${teammateName}": ${
+        const errorMessage = `Failed to spawn teammate: ${
           err instanceof Error ? err.message : String(err)
         }`;
 

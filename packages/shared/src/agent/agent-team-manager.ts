@@ -29,6 +29,8 @@ import type {
 } from '@craft-agent/core/types';
 import type { ReviewLoopOrchestrator } from '../agent-teams/review-loop';
 import type { YoloOrchestrator } from '../agent-teams/yolo-orchestrator';
+import { TeamStateStore } from '../agent-teams/team-state-store';
+import type { TeamState } from '../agent-teams/team-state-store';
 
 // ============================================================
 // Types
@@ -90,6 +92,8 @@ export class AgentTeamManager extends EventEmitter {
   private yoloStates = new Map<string, YoloState>();  // teamId → YOLO state
   private teamPhases = new Map<string, TeamPhase[]>();  // teamId → phases
   private yoloOrchestrators = new Map<string, YoloOrchestrator>();  // teamId → orchestrator
+  // Implements REQ-002: persist team state across close/reopen
+  private teamStateStores = new Map<string, TeamStateStore>();  // teamId → state store
 
   /** Review loop orchestrator — when set, task completions are routed through quality gates */
   private reviewLoop: ReviewLoopOrchestrator | null = null;
@@ -106,6 +110,43 @@ export class AgentTeamManager extends EventEmitter {
   /** Get the attached review loop (if any) */
   getReviewLoop(): ReviewLoopOrchestrator | null {
     return this.reviewLoop;
+  }
+
+  // ── Team State Persistence ──────────────────────────────────
+
+  /**
+   * Initialize a TeamStateStore for a team. Called when creating a team
+   * or when resuming a team session from a known session path.
+   * Implements REQ-002: persist team state across close/reopen.
+   */
+  initStateStore(teamId: string, sessionDirPath: string): void {
+    if (!this.teamStateStores.has(teamId)) {
+      this.teamStateStores.set(teamId, new TeamStateStore(sessionDirPath));
+    }
+  }
+
+  /**
+   * Load persisted team state from disk.
+   * Returns messages, tasks, and activity that were saved before the app closed.
+   */
+  loadPersistedState(teamId: string): TeamState | null {
+    const store = this.teamStateStores.get(teamId);
+    if (!store) return null;
+    try {
+      return store.load();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Load persisted state from a session path (without requiring the store
+   * to be initialized first). Used by IPC handlers when the team manager
+   * may not have the store initialized yet.
+   */
+  loadPersistedStateFromPath(sessionDirPath: string): TeamState {
+    const store = new TeamStateStore(sessionDirPath);
+    return store.load();
   }
 
   private pushCapped<T>(arr: T[], item: T, max: number): void {
@@ -152,6 +193,13 @@ export class AgentTeamManager extends EventEmitter {
     this.messages.set(team.id, []);
     this.activityLog.set(team.id, []);
     this.teamDRIAssignments.set(team.id, []);
+
+    // Initialize state store for persistence (REQ-002)
+    if (options.workspaceRootPath) {
+      const { join: joinPath } = require('path');
+      const sessionsDir = joinPath(options.workspaceRootPath, 'sessions', options.leadSessionId);
+      this.initStateStore(team.id, sessionsDir);
+    }
 
     this.emit('team:created', team);
     this.addActivity(team.id, 'teammate-spawned', 'Team created', undefined, undefined);
@@ -368,6 +416,9 @@ export class AgentTeamManager extends EventEmitter {
     this.pushCapped(teamTasks, task, AgentTeamManager.MAX_TEAM_TASKS + 100);
     this.tasks.set(teamId, this.trimTasks(teamTasks));
 
+    // Persist to disk (REQ-002)
+    this.teamStateStores.get(teamId)?.appendTask(task);
+
     this.emit('task:created', task);
     return task;
   }
@@ -413,6 +464,9 @@ export class AgentTeamManager extends EventEmitter {
     task.status = status;
     if (assignee !== undefined) task.assignee = assignee;
     if (status === 'completed') task.completedAt = new Date().toISOString();
+
+    // Persist updated task to disk (REQ-002)
+    this.teamStateStores.get(teamId)?.appendTask(task);
 
     this.emit('task:updated', task);
     this.tasks.set(teamId, this.trimTasks(teamTasks));
@@ -465,6 +519,9 @@ export class AgentTeamManager extends EventEmitter {
     this.pushCapped(teamMessages, msg, AgentTeamManager.MAX_TEAM_MESSAGES);
     this.messages.set(teamId, teamMessages);
 
+    // Persist to disk (REQ-002)
+    this.teamStateStores.get(teamId)?.appendMessage(msg);
+
     this.emit('message:sent', msg);
     this.addActivity(teamId, 'message-sent', `Message from ${from} to ${to}`, from, undefined);
     return msg;
@@ -506,6 +563,9 @@ export class AgentTeamManager extends EventEmitter {
     const log = this.activityLog.get(teamId) || [];
     this.pushCapped(log, event, AgentTeamManager.MAX_ACTIVITY_EVENTS);
     this.activityLog.set(teamId, log);
+
+    // Persist to disk (REQ-002)
+    this.teamStateStores.get(teamId)?.appendActivity(event);
 
     this.emit('activity', event);
   }

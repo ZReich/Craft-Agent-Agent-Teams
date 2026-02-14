@@ -21,10 +21,12 @@ import {
   DollarSign,
   AlertTriangle,
   SearchCheck,
+  ArrowDown,
 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
+import { useScrollAnchor } from '@/hooks/useScrollAnchor'
 import type { TeamActivityEvent, TeamActivityType } from '../../../shared/types'
 
 export interface TeamActivityFeedProps {
@@ -108,11 +110,6 @@ const MESSAGE_TYPES = new Set<TeamActivityType>(['message-sent', 'plan-submitted
 
 export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
   const [filter, setFilter] = useState<FilterType>('all')
-  // Implements REQ-001, REQ-002: keep activity feed anchored to bottom when appropriate
-  const viewportRef = React.useRef<HTMLDivElement>(null)
-  const endRef = React.useRef<HTMLDivElement>(null)
-  const isStickToBottomRef = React.useRef(true)
-  const skipSmoothUntilRef = React.useRef(0)
 
   const filteredEvents = useMemo(() => {
     if (filter === 'all') return events
@@ -121,36 +118,11 @@ export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
     return events.filter(e => !TASK_TYPES.has(e.type) && !MESSAGE_TYPES.has(e.type))
   }, [events, filter])
 
-  const scrollToBottom = React.useCallback((behavior: ScrollBehavior) => {
-    endRef.current?.scrollIntoView({ behavior, block: 'end' })
-  }, [])
-
-  // Scroll to bottom on mount/filter change (instant to avoid visible jump)
-  React.useLayoutEffect(() => {
-    scrollToBottom('instant')
-    isStickToBottomRef.current = true
-    skipSmoothUntilRef.current = Date.now() + 400
-  }, [filter, scrollToBottom])
-
-  // Track scroll position to toggle sticky behavior
-  React.useEffect(() => {
-    const viewport = viewportRef.current
-    if (!viewport) return
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = viewport
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      isStickToBottomRef.current = distanceFromBottom < 20
-    }
-    viewport.addEventListener('scroll', handleScroll)
-    return () => viewport.removeEventListener('scroll', handleScroll)
-  }, [])
-
-  // Auto-scroll on new events only when user is at bottom
-  React.useEffect(() => {
-    if (!isStickToBottomRef.current) return
-    if (Date.now() < skipSmoothUntilRef.current) return
-    scrollToBottom('smooth')
-  }, [filteredEvents.length, scrollToBottom])
+  // Implements REQ-001: direction-aware scroll anchor prevents snap-back
+  const { viewportRef, endRef, isScrolledUp, scrollToBottom } = useScrollAnchor({
+    contentLength: filteredEvents.length,
+    resetKey: filter,
+  })
 
   return (
     <div className={cn('flex flex-col h-full', className)}>
@@ -174,43 +146,59 @@ export function TeamActivityFeed({ events, className }: TeamActivityFeedProps) {
       </div>
 
       {/* Timeline */}
-      <ScrollArea className="flex-1 min-h-0" viewportRef={viewportRef}>
-        <div className="p-3 space-y-1">
-          {filteredEvents.length === 0 ? (
-            <div className="flex items-center justify-center py-8 text-muted-foreground">
-              <p className="text-xs">No activity yet</p>
-            </div>
-          ) : (
-            filteredEvents.map((event) => {
-              const config = EVENT_CONFIG[event.type] || EVENT_CONFIG.error
-              const EventIcon = config.icon
+      <div className="relative flex-1 min-h-0">
+        <ScrollArea className="h-full" viewportRef={viewportRef}>
+          <div className="p-3 space-y-1">
+            {filteredEvents.length === 0 ? (
+              <div className="flex items-center justify-center py-8 text-muted-foreground">
+                <p className="text-xs">No activity yet</p>
+              </div>
+            ) : (
+              filteredEvents.map((event) => {
+                const config = EVENT_CONFIG[event.type] || EVENT_CONFIG.error
+                const EventIcon = config.icon
 
-              return (
-                <div
-                  key={event.id}
-                  className="flex items-start gap-2.5 py-1.5 group"
-                >
-                  <EventIcon className={cn('size-3.5 mt-0.5 shrink-0', config.color)} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-baseline gap-2">
-                      {event.teammateName && (
-                        <span className="text-xs font-medium">{event.teammateName}</span>
-                      )}
-                      <span className="text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
-                        {event.details}
-                      </span>
-                      <span className="text-[10px] text-muted-foreground/50 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                        {new Date(event.timestamp).toLocaleTimeString()}
-                      </span>
+                return (
+                  <div
+                    key={event.id}
+                    className="flex items-start gap-2.5 py-1.5 group"
+                  >
+                    <EventIcon className={cn('size-3.5 mt-0.5 shrink-0', config.color)} />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-baseline gap-2">
+                        {event.teammateName && (
+                          <span className="text-xs font-medium">{event.teammateName}</span>
+                        )}
+                        <span className="text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
+                          {event.details}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground/50 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                          {new Date(event.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              )
-            })
-          )}
-          <div ref={endRef} />
-        </div>
-      </ScrollArea>
+                )
+              })
+            )}
+            <div ref={endRef} />
+          </div>
+        </ScrollArea>
+
+        {/* Jump-to-bottom indicator */}
+        {isScrolledUp && (
+          <button
+            type="button"
+            onClick={scrollToBottom}
+            className="absolute bottom-3 right-3 z-10 flex items-center gap-1.5 rounded-full
+                       bg-foreground/10 hover:bg-foreground/20 backdrop-blur-sm
+                       px-3 py-1.5 text-xs text-foreground/80 shadow-md transition-all"
+          >
+            <ArrowDown className="size-3" />
+            New activity
+          </button>
+        )}
+      </div>
     </div>
   )
 }

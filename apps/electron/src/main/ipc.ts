@@ -46,6 +46,16 @@ function sanitizeFilename(name: string): string {
 }
 
 /**
+ * Validate and return a workspace, throwing if not found.
+ * Reduces boilerplate in IPC handlers that need workspace access.
+ */
+function requireWorkspace(workspaceId: string) {
+  const workspace = getWorkspaceByNameOrId(workspaceId)
+  if (!workspace) throw new Error('Workspace not found')
+  return workspace
+}
+
+/**
  * Get ISO week number for a date.
  */
 function getISOWeekNumber(date: Date): number {
@@ -3400,10 +3410,50 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     windowManager.broadcastToAll(IPC_CHANNELS.LABELS_CHANGED, workspaceId)
   })
 
+  // ============================================================
+  // Scheduled Tasks (workspace-scoped, reads/writes hooks.json SchedulerTick entries)
+  // ============================================================
+
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_LIST, async (_event, workspaceId: string) => {
+    const workspace = requireWorkspace(workspaceId)
+    const { listScheduledTasks } = await import('@craft-agent/shared/scheduled-tasks')
+    return listScheduledTasks(workspace.rootPath)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_CREATE, async (_event, workspaceId: string, task: Omit<import('../../shared/types').ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
+    const workspace = requireWorkspace(workspaceId)
+    const { createScheduledTask } = await import('@craft-agent/shared/scheduled-tasks')
+    const result = await createScheduledTask(workspace.rootPath, task)
+    windowManager.broadcastToAll(IPC_CHANNELS.SCHEDULED_TASKS_CHANGED, workspaceId)
+    return result
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_UPDATE, async (_event, workspaceId: string, index: number, task: Omit<import('../../shared/types').ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
+    const workspace = requireWorkspace(workspaceId)
+    const { updateScheduledTask } = await import('@craft-agent/shared/scheduled-tasks')
+    const result = await updateScheduledTask(workspace.rootPath, index, task)
+    windowManager.broadcastToAll(IPC_CHANNELS.SCHEDULED_TASKS_CHANGED, workspaceId)
+    return result
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_DELETE, async (_event, workspaceId: string, index: number) => {
+    const workspace = requireWorkspace(workspaceId)
+    const { deleteScheduledTask } = await import('@craft-agent/shared/scheduled-tasks')
+    await deleteScheduledTask(workspace.rootPath, index)
+    windowManager.broadcastToAll(IPC_CHANNELS.SCHEDULED_TASKS_CHANGED, workspaceId)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SCHEDULED_TASKS_TOGGLE, async (_event, workspaceId: string, index: number) => {
+    const workspace = requireWorkspace(workspaceId)
+    const { toggleScheduledTask } = await import('@craft-agent/shared/scheduled-tasks')
+    const result = toggleScheduledTask(workspace.rootPath, index)
+    windowManager.broadcastToAll(IPC_CHANNELS.SCHEDULED_TASKS_CHANGED, workspaceId)
+    return result
+  })
+
   // Generic workspace image loading (for source icons, status icons, etc.)
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_READ_IMAGE, async (_event, workspaceId: string, relativePath: string) => {
-    const workspace = getWorkspaceByNameOrId(workspaceId)
-    if (!workspace) throw new Error('Workspace not found')
+    const workspace = requireWorkspace(workspaceId)
 
     const { readFileSync, existsSync } = await import('fs')
     const { join, normalize } = await import('path')
@@ -4231,6 +4281,17 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const resolvedId = teamManager.resolveTeamId(teamId)
     const orchestrator = teamManager.getYoloOrchestrator(resolvedId)
     return orchestrator?.getState() ?? null
+  })
+
+  // Implements REQ-002: Load persisted team state from disk on reopen
+  ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_PERSISTED_STATE, async (_event, leadSessionId: string) => {
+    try {
+      const sessionPath = sessionManager.getSessionPath(leadSessionId)
+      if (!sessionPath) return null
+      return teamManager.loadPersistedStateFromPath(sessionPath)
+    } catch {
+      return null
+    }
   })
 
   // ============================================================

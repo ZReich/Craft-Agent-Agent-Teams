@@ -26,6 +26,7 @@ import {
   HelpCircle,
   ExternalLink,
   Cake,
+  Clock,
 } from "lucide-react"
 import { PanelRightRounded } from "../icons/PanelRightRounded"
 import { PanelLeftRounded } from "../icons/PanelLeftRounded"
@@ -89,6 +90,9 @@ import { type TodoStateId, type TodoState, statusConfigsToTodoStates } from "@/c
 import { useStatuses } from "@/hooks/useStatuses"
 import { useLabels } from "@/hooks/useLabels"
 import { useViews } from "@/hooks/useViews"
+import { useScheduledTasks } from "@/hooks/useScheduledTasks"
+import { ScheduledTaskDialog } from "@/components/scheduled/ScheduledTaskDialog"
+import type { ScheduledTask } from "../../../shared/types"
 import { LabelIcon, LabelValueTypeIcon } from "@/components/ui/label-icon"
 import { filterItems as filterLabelMenuItems, filterStates as filterLabelMenuStates, type LabelMenuItem } from "@/components/ui/label-menu"
 import { buildLabelTree, getDescendantIds, getLabelDisplayName, flattenLabels, extractLabelId, findLabelById } from "@craft-agent/shared/labels"
@@ -912,6 +916,51 @@ function AppShellContent({
 
   // Views: compiled once on config load, evaluated per session in list/chat
   const { evaluateSession: evaluateViews, viewConfigs } = useViews(activeWorkspace?.id || null)
+
+  // Scheduled tasks (SchedulerTick entries from hooks.json)
+  const { tasks: scheduledTasks, createTask, updateTask, deleteTask, toggleTask } = useScheduledTasks(activeWorkspace?.id || null)
+  const [scheduledTaskDialogOpen, setScheduledTaskDialogOpen] = useState(false)
+  const [editingScheduledTask, setEditingScheduledTask] = useState<ScheduledTask | null>(null)
+
+  const handleOpenCreateScheduledTask = useCallback(() => {
+    setEditingScheduledTask(null)
+    setScheduledTaskDialogOpen(true)
+  }, [])
+
+  const handleEditScheduledTask = useCallback((index: number) => {
+    const task = scheduledTasks.find(t => t.index === index)
+    if (task) {
+      setEditingScheduledTask(task)
+      setScheduledTaskDialogOpen(true)
+    }
+  }, [scheduledTasks])
+
+  const handleDeleteScheduledTask = useCallback(async (index: number) => {
+    try {
+      await deleteTask(index)
+      toast.success('Scheduled task deleted')
+    } catch (err) {
+      toast.error('Failed to delete scheduled task')
+    }
+  }, [deleteTask])
+
+  const handleToggleScheduledTask = useCallback(async (index: number) => {
+    try {
+      await toggleTask(index)
+    } catch (err) {
+      toast.error('Failed to toggle scheduled task')
+    }
+  }, [toggleTask])
+
+  const handleSaveScheduledTask = useCallback(async (task: Omit<ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => {
+    if (editingScheduledTask) {
+      await updateTask(editingScheduledTask.index, task)
+      toast.success('Scheduled task updated')
+    } else {
+      await createTask(task)
+      toast.success('Scheduled task created')
+    }
+  }, [editingScheduledTask, updateTask, createTask])
 
   // Build hierarchical label tree from nested config structure
   const labelTree = useMemo(() => buildLabelTree(labelConfigs), [labelConfigs])
@@ -1823,6 +1872,12 @@ function AppShellContent({
     // 2b. Archived section
     result.push({ id: 'nav:archived', type: 'nav', action: handleArchivedClick })
 
+    // 2c. Scheduled tasks
+    result.push({ id: 'nav:scheduled', type: 'nav', action: handleOpenCreateScheduledTask })
+    for (const task of scheduledTasks) {
+      result.push({ id: `nav:scheduled:${task.index}`, type: 'nav', action: () => handleEditScheduledTask(task.index) })
+    }
+
     // 3. Sources, Skills, Settings
     result.push({ id: 'nav:sources', type: 'nav', action: handleSourcesClick })
     result.push({ id: 'nav:skills', type: 'nav', action: handleSkillsClick })
@@ -1830,7 +1885,7 @@ function AppShellContent({
     result.push({ id: 'nav:whats-new', type: 'nav', action: handleWhatsNewClick })
 
     return result
-  }, [handleAllSessionsClick, handleFlaggedClick, handleArchivedClick, handleTodoStateClick, effectiveTodoStates, handleLabelClick, labelTree, handleSourcesClick, handleSkillsClick, handleSettingsClick, handleWhatsNewClick])
+  }, [handleAllSessionsClick, handleFlaggedClick, handleArchivedClick, handleTodoStateClick, effectiveTodoStates, handleLabelClick, labelTree, handleSourcesClick, handleSkillsClick, handleSettingsClick, handleWhatsNewClick, scheduledTasks, handleOpenCreateScheduledTask, handleEditScheduledTask])
 
   // Toggle folder expanded state
   const handleToggleFolder = React.useCallback((path: string) => {
@@ -2217,6 +2272,52 @@ function AppShellContent({
                       variant: sessionFilter?.kind === 'archived' ? "default" : "ghost",
                       onClick: handleArchivedClick,
                     },
+                    // --- Scheduled Tasks Section ---
+                    ...(scheduledTasks.length > 0 ? [{
+                      id: "nav:scheduled",
+                      title: "Scheduled",
+                      label: String(scheduledTasks.length),
+                      icon: Clock,
+                      variant: "ghost" as const,
+                      expandable: true,
+                      expanded: isExpanded('nav:scheduled'),
+                      onToggle: () => toggleExpanded('nav:scheduled'),
+                      contextMenu: {
+                        type: 'scheduled' as const,
+                        onAddScheduledTask: handleOpenCreateScheduledTask,
+                      },
+                      items: scheduledTasks.map((task) => ({
+                        id: `nav:scheduled:${task.index}`,
+                        title: task.name || task.hooks.find(h => h.type === 'prompt')?.prompt?.slice(0, 30) || 'Unnamed',
+                        label: task.scheduleDescription,
+                        icon: Clock,
+                        iconColor: task.enabled
+                          ? undefined
+                          : 'color-mix(in oklch, var(--foreground) 30%, transparent)',
+                        compact: true,
+                        variant: "ghost" as const,
+                        contextMenu: {
+                          type: 'scheduled' as const,
+                          onAddScheduledTask: handleOpenCreateScheduledTask,
+                          scheduledTaskIndex: task.index,
+                          onEditScheduledTask: handleEditScheduledTask,
+                          onDeleteScheduledTask: handleDeleteScheduledTask,
+                          onToggleScheduledTask: handleToggleScheduledTask,
+                          scheduledTaskEnabled: task.enabled,
+                        },
+                        onClick: () => handleEditScheduledTask(task.index),
+                      })),
+                    }] : [{
+                      id: "nav:scheduled",
+                      title: "Scheduled",
+                      icon: Clock,
+                      variant: "ghost" as const,
+                      contextMenu: {
+                        type: 'scheduled' as const,
+                        onAddScheduledTask: handleOpenCreateScheduledTask,
+                      },
+                      onClick: handleOpenCreateScheduledTask,
+                    }]),
                     // --- Separator ---
                     { id: "separator:chats-sources", type: "separator" },
                     // --- Sources & Skills Section ---
@@ -3374,6 +3475,14 @@ function AppShellContent({
         onClose={() => setShowWhatsNew(false)}
         content={releaseNotesContent}
         onOpenUrl={(url) => window.electronAPI.openUrl(url)}
+      />
+
+      {/* Scheduled Task Dialog */}
+      <ScheduledTaskDialog
+        open={scheduledTaskDialogOpen}
+        onClose={() => setScheduledTaskDialogOpen(false)}
+        onSave={handleSaveScheduledTask}
+        task={editingScheduledTask}
       />
 
     </AppShellProvider>

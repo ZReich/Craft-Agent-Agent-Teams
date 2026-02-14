@@ -7,7 +7,7 @@
 
 import * as React from 'react'
 import { useState, useCallback } from 'react'
-import { Send, MoreHorizontal, ArrowUpCircle, Power, RefreshCw, Activity, MessageSquare } from 'lucide-react'
+import { Send, MoreHorizontal, ArrowUpCircle, Power, RefreshCw, Activity, MessageSquare, ArrowDown } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { useScrollAnchor } from '@/hooks/useScrollAnchor'
 import type { AgentTeammate, TeammateMessage } from '../../../shared/types'
 import type { ToolActivity } from './ToolActivityIndicator'
 import { WorkerActivityStream } from './WorkerActivityStream'
@@ -53,11 +54,6 @@ export function TeammateDetailView({
   const [detailTab, setDetailTab] = useState<'messages' | 'activity'>(
     toolActivities.length > 0 ? 'activity' : 'messages'
   )
-  // Implements REQ-003, REQ-004: auto-scroll when at bottom
-  const viewportRef = React.useRef<HTMLDivElement>(null)
-  const endRef = React.useRef<HTMLDivElement>(null)
-  const isStickToBottomRef = React.useRef(true)
-  const skipSmoothUntilRef = React.useRef(0)
   const modelName = MODEL_NAMES[teammate.model] || teammate.model
 
   const handleSend = useCallback(() => {
@@ -82,36 +78,11 @@ export function TeammateDetailView({
     m => m.from === teammate.id || m.to === teammate.id || m.to === 'all'
   )
 
-  const scrollToBottom = React.useCallback((behavior: ScrollBehavior) => {
-    endRef.current?.scrollIntoView({ behavior, block: 'end' })
-  }, [])
-
-  // Scroll to bottom on teammate switch (instant to avoid visible jump)
-  React.useLayoutEffect(() => {
-    scrollToBottom('instant')
-    isStickToBottomRef.current = true
-    skipSmoothUntilRef.current = Date.now() + 400
-  }, [teammate.id, scrollToBottom])
-
-  // Track scroll position to toggle sticky behavior
-  React.useEffect(() => {
-    const viewport = viewportRef.current
-    if (!viewport) return
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = viewport
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      isStickToBottomRef.current = distanceFromBottom < 20
-    }
-    viewport.addEventListener('scroll', handleScroll)
-    return () => viewport.removeEventListener('scroll', handleScroll)
-  }, [])
-
-  // Auto-scroll on new messages only when user is at bottom
-  React.useEffect(() => {
-    if (!isStickToBottomRef.current) return
-    if (Date.now() < skipSmoothUntilRef.current) return
-    scrollToBottom('smooth')
-  }, [relevantMessages.length, scrollToBottom])
+  // Implements REQ-001: direction-aware scroll anchor prevents snap-back
+  const { viewportRef, endRef, isScrolledUp, scrollToBottom } = useScrollAnchor({
+    contentLength: relevantMessages.length,
+    resetKey: teammate.id,
+  })
 
   return (
     <div className="flex-1 flex flex-col h-full min-w-0">
@@ -232,54 +203,70 @@ export function TeammateDetailView({
           className="flex-1 min-h-0"
         />
       ) : (
-        <ScrollArea className="flex-1 min-h-0" viewportRef={viewportRef}>
-          <div className="p-4 space-y-3">
-            {relevantMessages.length === 0 ? (
-              <div className="flex items-center justify-center h-32 text-muted-foreground">
-                <p className="text-sm">
-                  {teammate.status === 'spawning'
-                    ? 'Spawning teammate...'
-                    : teammate.status === 'idle'
-                      ? 'Waiting for task assignment'
-                      : 'No messages yet'}
-                </p>
-              </div>
-            ) : (
-              relevantMessages.map((msg) => {
-                const isFromTeammate = msg.from === teammate.id
-                return (
-                  <div key={msg.id} className={cn('flex', isFromTeammate ? 'justify-start' : 'justify-end')}>
-                    <div className={cn(
-                      'max-w-[85%] rounded-lg px-3 py-2 text-sm',
-                      isFromTeammate
-                        ? 'bg-background shadow-minimal'
-                        : 'bg-foreground text-background'
-                    )}>
-                      <div className={cn('flex items-center gap-2 mb-1', !isFromTeammate && 'text-background/70')}>
-                        <span className="text-xs font-medium">
-                          {isFromTeammate ? teammate.name : msg.from === 'user' ? 'You' : msg.from}
-                        </span>
-                        <span className={cn('text-[10px]', isFromTeammate ? 'text-muted-foreground' : 'text-background/50')}>
-                          {new Date(msg.timestamp).toLocaleTimeString()}
-                        </span>
-                        {msg.type !== 'message' && (
-                          <Badge variant="secondary" className={cn(
-                            'text-[10px] px-1 py-0 h-4',
-                            !isFromTeammate && 'bg-background/20 text-background border-transparent'
-                          )}>
-                            {msg.type}
-                          </Badge>
-                        )}
+        <div className="relative flex-1 min-h-0">
+          <ScrollArea className="h-full" viewportRef={viewportRef}>
+            <div className="p-4 space-y-3">
+              {relevantMessages.length === 0 ? (
+                <div className="flex items-center justify-center h-32 text-muted-foreground">
+                  <p className="text-sm">
+                    {teammate.status === 'spawning'
+                      ? 'Spawning teammate...'
+                      : teammate.status === 'idle'
+                        ? 'Waiting for task assignment'
+                        : 'No messages yet'}
+                  </p>
+                </div>
+              ) : (
+                relevantMessages.map((msg) => {
+                  const isFromTeammate = msg.from === teammate.id
+                  return (
+                    <div key={msg.id} className={cn('flex', isFromTeammate ? 'justify-start' : 'justify-end')}>
+                      <div className={cn(
+                        'max-w-[85%] rounded-lg px-3 py-2 text-sm',
+                        isFromTeammate
+                          ? 'bg-background shadow-minimal'
+                          : 'bg-foreground text-background'
+                      )}>
+                        <div className={cn('flex items-center gap-2 mb-1', !isFromTeammate && 'text-background/70')}>
+                          <span className="text-xs font-medium">
+                            {isFromTeammate ? teammate.name : msg.from === 'user' ? 'You' : msg.from}
+                          </span>
+                          <span className={cn('text-[10px]', isFromTeammate ? 'text-muted-foreground' : 'text-background/50')}>
+                            {new Date(msg.timestamp).toLocaleTimeString()}
+                          </span>
+                          {msg.type !== 'message' && (
+                            <Badge variant="secondary" className={cn(
+                              'text-[10px] px-1 py-0 h-4',
+                              !isFromTeammate && 'bg-background/20 text-background border-transparent'
+                            )}>
+                              {msg.type}
+                            </Badge>
+                          )}
+                        </div>
+                        <p className={cn('whitespace-pre-wrap', isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>{msg.content}</p>
                       </div>
-                      <p className={cn('whitespace-pre-wrap', isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>{msg.content}</p>
                     </div>
-                  </div>
-                )
-              })
-            )}
-            <div ref={endRef} />
-          </div>
-        </ScrollArea>
+                  )
+                })
+              )}
+              <div ref={endRef} />
+            </div>
+          </ScrollArea>
+
+          {/* Jump-to-bottom indicator */}
+          {isScrolledUp && (
+            <button
+              type="button"
+              onClick={scrollToBottom}
+              className="absolute bottom-3 right-3 z-10 flex items-center gap-1.5 rounded-full
+                         bg-foreground/10 hover:bg-foreground/20 backdrop-blur-sm
+                         px-3 py-1.5 text-xs text-foreground/80 shadow-md transition-all"
+            >
+              <ArrowDown className="size-3" />
+              New messages
+            </button>
+          )}
+        </div>
       )}
 
       {/* Message input */}

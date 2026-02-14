@@ -400,7 +400,8 @@ export interface BackendConfig {
   /** Callback when a teammate spawn is requested (agent teams) */
   onTeammateSpawnRequested?: (params: {
     teamName: string;
-    teammateName: string;
+    /** Teammate name - if undefined, session manager will generate a witty codename */
+    teammateName: string | undefined;
     prompt: string;
     model?: string;
     role?: string;

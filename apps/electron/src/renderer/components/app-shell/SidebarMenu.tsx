@@ -22,11 +22,13 @@ import {
   Plus,
   Trash2,
   ExternalLink,
+  Pencil,
+  Power,
 } from 'lucide-react'
 import { useMenuComponents } from '@/components/ui/menu-context'
 import { getDocUrl, type DocFeature } from '@craft-agent/shared/docs/doc-links'
 
-export type SidebarMenuType = 'allSessions' | 'flagged' | 'status' | 'sources' | 'skills' | 'labels' | 'views' | 'newSession'
+export type SidebarMenuType = 'allSessions' | 'flagged' | 'status' | 'sources' | 'skills' | 'labels' | 'views' | 'newSession' | 'scheduled'
 
 export interface SidebarMenuProps {
   /** Type of sidebar item (determines available menu items) */
@@ -55,6 +57,18 @@ export interface SidebarMenuProps {
   viewId?: string
   /** Handler for "Delete View" action */
   onDeleteView?: (id: string) => void
+  /** Handler for "Add Scheduled Task" action - for scheduled type */
+  onAddScheduledTask?: () => void
+  /** Scheduled task index — when set, enables Edit/Delete/Toggle */
+  scheduledTaskIndex?: number
+  /** Handler for "Edit Scheduled Task" action */
+  onEditScheduledTask?: (index: number) => void
+  /** Handler for "Delete Scheduled Task" action */
+  onDeleteScheduledTask?: (index: number) => void
+  /** Handler for "Toggle Scheduled Task" action */
+  onToggleScheduledTask?: (index: number) => void
+  /** Whether the scheduled task is currently enabled */
+  scheduledTaskEnabled?: boolean
 }
 
 /**
@@ -75,6 +89,12 @@ export function SidebarMenu({
   onConfigureViews,
   viewId,
   onDeleteView,
+  onAddScheduledTask,
+  scheduledTaskIndex,
+  onEditScheduledTask,
+  onDeleteScheduledTask,
+  onToggleScheduledTask,
+  scheduledTaskEnabled,
 }: SidebarMenuProps) {
   // Get menu components from context (works with both DropdownMenu and ContextMenu)
   const { MenuItem, Separator } = useMenuComponents()
@@ -182,6 +202,41 @@ export function SidebarMenu({
           <ExternalLink className="h-3.5 w-3.5" />
           <span className="flex-1">{learnMoreLabel}</span>
         </MenuItem>
+      </>
+    )
+  }
+
+  // Scheduled: show Add/Edit/Toggle/Delete actions
+  if (type === 'scheduled') {
+    return (
+      <>
+        {onAddScheduledTask && (
+          <MenuItem onClick={onAddScheduledTask}>
+            <Plus className="h-3.5 w-3.5" />
+            <span className="flex-1">Add Scheduled Task</span>
+          </MenuItem>
+        )}
+        {scheduledTaskIndex !== undefined && onEditScheduledTask && (
+          <MenuItem onClick={() => onEditScheduledTask(scheduledTaskIndex)}>
+            <Pencil className="h-3.5 w-3.5" />
+            <span className="flex-1">Edit Task</span>
+          </MenuItem>
+        )}
+        {scheduledTaskIndex !== undefined && onToggleScheduledTask && (
+          <MenuItem onClick={() => onToggleScheduledTask(scheduledTaskIndex)}>
+            <Power className="h-3.5 w-3.5" />
+            <span className="flex-1">{scheduledTaskEnabled ? 'Disable' : 'Enable'}</span>
+          </MenuItem>
+        )}
+        {scheduledTaskIndex !== undefined && onDeleteScheduledTask && (
+          <>
+            <Separator />
+            <MenuItem onClick={() => onDeleteScheduledTask(scheduledTaskIndex)}>
+              <Trash2 className="h-3.5 w-3.5" />
+              <span className="flex-1">Delete Task</span>
+            </MenuItem>
+          </>
+        )}
       </>
     )
   }

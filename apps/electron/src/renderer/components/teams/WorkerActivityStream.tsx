@@ -21,9 +21,11 @@ import {
   Wrench,
   ChevronDown,
   ChevronRight,
+  ArrowDown,
 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
+import { useScrollAnchor } from '@/hooks/useScrollAnchor'
 import type { TeammateMessage } from '../../../shared/types'
 import type { ToolActivity } from './ToolActivityIndicator'
 
@@ -212,10 +214,6 @@ export function WorkerActivityStream({
   toolActivities,
   className,
 }: WorkerActivityStreamProps) {
-  const viewportRef = React.useRef<HTMLDivElement>(null)
-  const endRef = React.useRef<HTMLDivElement>(null)
-  const isStickToBottomRef = React.useRef(true)
-
   // Interleave messages and tool activities by timestamp
   const entries: StreamEntry[] = useMemo(() => {
     const items: StreamEntry[] = []
@@ -238,23 +236,11 @@ export function WorkerActivityStream({
     return items
   }, [teammateId, messages, toolActivities])
 
-  // Track scroll position for sticky behavior
-  React.useEffect(() => {
-    const viewport = viewportRef.current
-    if (!viewport) return
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = viewport
-      isStickToBottomRef.current = (scrollHeight - scrollTop - clientHeight) < 20
-    }
-    viewport.addEventListener('scroll', handleScroll)
-    return () => viewport.removeEventListener('scroll', handleScroll)
-  }, [])
-
-  // Auto-scroll on new entries when at bottom
-  React.useEffect(() => {
-    if (!isStickToBottomRef.current) return
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-  }, [entries.length])
+  // Implements REQ-001: direction-aware scroll anchor prevents snap-back
+  const { viewportRef, endRef, isScrolledUp, scrollToBottom } = useScrollAnchor({
+    contentLength: entries.length,
+    resetKey: teammateId,
+  })
 
   if (entries.length === 0) {
     return (
@@ -265,30 +251,46 @@ export function WorkerActivityStream({
   }
 
   return (
-    <ScrollArea className={cn('flex-1 min-h-0', className)} viewportRef={viewportRef}>
-      <div className="p-4 space-y-2">
-        {entries.map((entry, idx) => {
-          if (entry.kind === 'message' && entry.message) {
-            return (
-              <MessageEntry
-                key={`msg-${entry.message.id}`}
-                message={entry.message}
-                teammateName={teammateName}
-              />
-            )
-          }
-          if (entry.kind === 'tool' && entry.tool) {
-            return (
-              <ToolActivityEntry
-                key={`tool-${entry.tool.toolUseId}`}
-                activity={entry.tool}
-              />
-            )
-          }
-          return null
-        })}
-        <div ref={endRef} />
-      </div>
-    </ScrollArea>
+    <div className={cn('relative flex-1 min-h-0', className)}>
+      <ScrollArea className="h-full" viewportRef={viewportRef}>
+        <div className="p-4 space-y-2">
+          {entries.map((entry, idx) => {
+            if (entry.kind === 'message' && entry.message) {
+              return (
+                <MessageEntry
+                  key={`msg-${entry.message.id}`}
+                  message={entry.message}
+                  teammateName={teammateName}
+                />
+              )
+            }
+            if (entry.kind === 'tool' && entry.tool) {
+              return (
+                <ToolActivityEntry
+                  key={`tool-${entry.tool.toolUseId}`}
+                  activity={entry.tool}
+                />
+              )
+            }
+            return null
+          })}
+          <div ref={endRef} />
+        </div>
+      </ScrollArea>
+
+      {/* Jump-to-bottom indicator */}
+      {isScrolledUp && (
+        <button
+          type="button"
+          onClick={scrollToBottom}
+          className="absolute bottom-3 right-3 z-10 flex items-center gap-1.5 rounded-full
+                     bg-foreground/10 hover:bg-foreground/20 backdrop-blur-sm
+                     px-3 py-1.5 text-xs text-foreground/80 shadow-md transition-all"
+        >
+          <ArrowDown className="size-3" />
+          New activity
+        </button>
+      )}
+    </div>
   )
 }
