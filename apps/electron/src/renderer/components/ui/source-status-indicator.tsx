@@ -146,26 +146,28 @@ export function deriveConnectionStatus(source: {
     api?: { authType?: string }
   }
 }, localMcpEnabled = true): SourceConnectionStatus {
+  const { config } = source
+
   // Check if this is a stdio source and local MCP is disabled
-  const mcp = source.config.mcp
+  const mcp = config.mcp
   if (mcp?.transport === 'stdio' && !localMcpEnabled) {
     return 'local_disabled'
   }
 
   // If explicit status is set, use it
-  if (source.config.connectionStatus) {
-    return source.config.connectionStatus
+  if (config.connectionStatus) {
+    return config.connectionStatus
   }
 
   // Derive from auth state
-  const api = source.config.api
+  const api = config.api
   const authType = mcp?.authType || api?.authType
   const requiresAuth = authType !== undefined && authType !== 'none'
 
   // Check authentication status
-  const isAuthenticated = !requiresAuth || source.config.isAuthenticated === true
+  const isAuthenticated = !requiresAuth || config.isAuthenticated === true
 
-  if (requiresAuth && !source.config.isAuthenticated) {
+  if (requiresAuth && !config.isAuthenticated) {
     return 'needs_auth'
   }
 
@@ -174,7 +176,7 @@ export function deriveConnectionStatus(source: {
   }
 
   // Local sources are always connected
-  if (source.config.type === 'local') {
+  if (config.type === 'local') {
     return 'connected'
   }
 

@@ -7,6 +7,8 @@
 
 import * as React from 'react'
 import type { RightSidebarPanel } from '../../../shared/types'
+import { SessionFilesSection } from '../right-sidebar/SessionFilesSection'
+import { SessionHistoryPanel } from '../right-sidebar/SessionHistoryPanel'
 import { SessionMetadataPanel } from '../right-sidebar/SessionMetadataPanel'
 
 export interface RightSidebarProps {
@@ -27,20 +29,10 @@ export function RightSidebar({ panel, sessionId, closeButton }: RightSidebarProp
       return <SessionMetadataPanel sessionId={sessionId} closeButton={closeButton} />
 
     case 'files':
-      // TODO: Implement SessionFilesPanel
-      return (
-        <div className="h-full flex items-center justify-center text-muted-foreground">
-          <p className="text-sm">Files panel - Coming soon</p>
-        </div>
-      )
+      return <SessionFilesSection sessionId={sessionId} className="h-full" />
 
     case 'history':
-      // TODO: Implement SessionHistoryPanel
-      return (
-        <div className="h-full flex items-center justify-center text-muted-foreground">
-          <p className="text-sm">History panel - Coming soon</p>
-        </div>
-      )
+      return <SessionHistoryPanel sessionId={sessionId} closeButton={closeButton} />
 
     case 'none':
     default:

@@ -1285,8 +1285,7 @@ function migrateWorkspaceOpus45ToOpus46(config: StoredConfig): void {
  * Same for openai. Then remove modelDefaults from config.
  */
 function migrateModelDefaultsToConnections(config: StoredConfig): boolean {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const configAny = config as any;
+    const configAny = config as any;
   if (!configAny.modelDefaults || !config.llmConnections) return false;
   let changed = false;
 
@@ -1391,8 +1390,7 @@ export function migrateLegacyLlmConnectionsConfig(): void {
   if (config.llmConnections !== undefined) {
     // Clean up any remaining legacy fields from previous runs
     let needsSave = false;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const configAny = config as any;
+        const configAny = config as any;
     if ('authType' in config) {
       delete configAny.authType;
       needsSave = true;
@@ -1446,8 +1444,7 @@ export function migrateLegacyLlmConnectionsConfig(): void {
   config.llmConnections = [];
 
   // Legacy migration: if user had authType set, create a connection for them
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const configAny = config as any;
+    const configAny = config as any;
   const legacyAuthType = configAny.authType as AuthType | undefined;
   const legacyBaseUrl = configAny.anthropicBaseUrl as string | undefined;
   const legacyCustomModel = configAny.customModel as string | undefined;

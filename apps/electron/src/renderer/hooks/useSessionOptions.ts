@@ -24,6 +24,12 @@ export interface SessionOptions {
   permissionMode: PermissionMode
   /** Session-level thinking level ('off', 'think', 'max') - sticky, persisted */
   thinkingLevel: ThinkingLevel
+  /** Whether Agent Teams is enabled for this session — Implements REQ-002 */
+  agentTeamsEnabled: boolean
+  /** Whether YOLO Mode (autonomous execution) is enabled for this session — Implements REQ-003 */
+  yoloModeEnabled: boolean
+  /** Permission mode to restore when YOLO Mode is toggled off */
+  preYoloPermissionMode?: PermissionMode
 }
 
 /** Default values for new sessions */
@@ -31,6 +37,8 @@ export const defaultSessionOptions: SessionOptions = {
   ultrathinkEnabled: false,
   permissionMode: 'ask', // Default to ask mode (prompt for permissions)
   thinkingLevel: DEFAULT_THINKING_LEVEL, // Default to 'think' level
+  agentTeamsEnabled: false,
+  yoloModeEnabled: false,
 }
 
 /** Type for partial updates to session options */

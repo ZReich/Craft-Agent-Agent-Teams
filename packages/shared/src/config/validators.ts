@@ -102,9 +102,23 @@ const LocationSchema = z.object({
   country: z.string().optional(),
 });
 
+const TimezoneSchema = z.string().refine((value) => {
+  try {
+    if (typeof (Intl as unknown as { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf === 'function') {
+      const supported = (Intl as unknown as { supportedValuesOf: (key: string) => string[] }).supportedValuesOf('timeZone');
+      return supported.includes(value);
+    }
+    // Fallback for runtimes without Intl.supportedValuesOf
+    void new Intl.DateTimeFormat('en-US', { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}, 'Timezone must be a valid IANA timezone (e.g., America/Denver)');
+
 export const UserPreferencesSchema = z.object({
   name: z.string().optional(),
-  timezone: z.string().optional(),  // TODO: Could validate against IANA timezone list
+  timezone: TimezoneSchema.optional(),
   location: LocationSchema.optional(),
   language: z.string().optional(),
   notes: z.string().optional(),

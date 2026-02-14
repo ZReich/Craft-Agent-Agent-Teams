@@ -79,7 +79,7 @@ export function TeamStatusBar({
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
 
   const isLead = session.isTeamLead === true
-  const teammateSessionIds = session.teammateSessionIds ?? []
+  const teammateSessionIds = React.useMemo(() => session.teammateSessionIds ?? [], [session.teammateSessionIds])
   const teamColor = session.teamColor ?? '#7c3aed' // Default purple
   const teamName = session.name ?? session.teamId ?? 'Agent Team'
 

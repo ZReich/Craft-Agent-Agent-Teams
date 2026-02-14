@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
+import { getCurrentVersion } from '../version/version.ts';
 
 // Import generated types from codex-types package
 import type {
@@ -844,7 +845,7 @@ export class AppServerClient extends EventEmitter {
       clientInfo: {
         name: 'Craft Agent',
         title: null,
-        version: '0.3.1', // TODO: Get from package.json
+        version: getCurrentVersion(),
       },
     };
 

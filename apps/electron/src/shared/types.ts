@@ -1570,6 +1570,8 @@ export interface WorkspaceSettings {
   qualityGatesReviewModel?: string
   qualityGatesBaselineAwareTests?: boolean
   qualityGatesKnownFailingTests?: string[]
+  /** Test scope for per-task quality gates: 'affected' (vitest --changed), 'full' (entire suite), 'none' (skip tests) */
+  qualityGatesTestScope?: 'affected' | 'full' | 'none'
   qualityGatesSyntaxEnabled?: boolean
   qualityGatesTestsEnabled?: boolean
   qualityGatesArchEnabled?: boolean

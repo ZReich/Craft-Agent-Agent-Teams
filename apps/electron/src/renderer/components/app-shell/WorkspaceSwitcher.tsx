@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Check, FolderPlus, ExternalLink, ChevronDown } from "lucide-react"
 import { AnimatePresence } from "motion/react"
 import { useSetAtom } from "jotai"
@@ -49,6 +49,11 @@ export function WorkspaceSwitcher({
   const setFullscreenOverlayOpen = useSetAtom(fullscreenOverlayOpenAtom)
   // Cache stores { dataUrl, sourceUrl } to detect when icon file changes
   const [iconCache, setIconCache] = useState<Record<string, { dataUrl: string; sourceUrl: string }>>({})
+  const iconCacheRef = useRef(iconCache)
+
+  useEffect(() => {
+    iconCacheRef.current = iconCache
+  }, [iconCache])
   const selectedWorkspace = workspaces.find(w => w.id === activeWorkspaceId)
 
   // Fetch workspace icons via IPC (converts local files to data URLs)
@@ -66,7 +71,7 @@ export function WorkspaceSwitcher({
         if (!iconFilename) continue
 
         // Skip if already cached with the same source URL
-        const cached = iconCache[workspace.id]
+        const cached = iconCacheRef.current[workspace.id]
         if (cached && cached.sourceUrl === workspace.iconUrl) continue
 
         try {

@@ -29,10 +29,10 @@ const IGNORED_CONSOLE_PATTERNS = [
 // giving Sentry the same rich context visible in DevTools without needing sourcemaps.
 //
 // NOTE: Source map upload is intentionally disabled — see main/index.ts for details.
+const consoleIntegration = captureConsoleIntegration({ levels: ['warn', 'error'] }) as unknown as NonNullable<Parameters<typeof sentryInit>[0]['integrations']>[number]
 sentryInit(
   {
-    // @ts-ignore -- Integration type mismatch between @sentry/electron and @sentry/react due to transitive @sentry/core version skew (10.38 vs 10.36)
-    integrations: [captureConsoleIntegration({ levels: ['warn', 'error'] })],
+    integrations: [consoleIntegration],
 
     beforeSend(event) {
       // Drop events matching known-harmless console patterns to avoid Sentry quota waste

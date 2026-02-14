@@ -3,6 +3,16 @@ import { promisify } from 'util';
 
 const execAsync = promisify(exec);
 
+/** Resolve the current git HEAD SHA for cache-key scoping. Returns '' on failure. */
+async function getGitHeadSha(cwd: string): Promise<string> {
+  try {
+    const { stdout } = await execAsync('git rev-parse HEAD', { cwd, timeout: 5_000 });
+    return stdout.trim().slice(0, 12); // short SHA is sufficient
+  } catch {
+    return '';
+  }
+}
+
 type CacheEntry<T> = { value: T; expiresAt: number };
 
 const typeCheckCache = new Map<string, CacheEntry<TypeCheckCheckResult>>();
@@ -59,7 +69,8 @@ function setCached<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T, 
 }
 
 export async function runTypeCheckCached(options: LocalCheckOptions): Promise<TypeCheckCheckResult> {
-  const cacheKey = options.cacheKey ?? `typecheck:${options.workingDir}`;
+  const sha = await getGitHeadSha(options.workingDir);
+  const cacheKey = options.cacheKey ? `${options.cacheKey}:${sha}` : `typecheck:${options.workingDir}:${sha}`;
   const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   if (!options.forceRefresh) {
     const cached = getCached(typeCheckCache, cacheKey);
@@ -95,8 +106,9 @@ export async function runTypeCheckCached(options: LocalCheckOptions): Promise<Ty
 }
 
 export async function runTestSuiteCached(options: LocalCheckOptions): Promise<TestSuiteCheckResult> {
+  const sha = await getGitHeadSha(options.workingDir);
   const scopeSuffix = options.changedOnly ? ':affected' : ':full';
-  const cacheKey = options.cacheKey ? `${options.cacheKey}${scopeSuffix}` : `testsuite:${options.workingDir}${scopeSuffix}`;
+  const cacheKey = options.cacheKey ? `${options.cacheKey}:${sha}${scopeSuffix}` : `testsuite:${options.workingDir}:${sha}${scopeSuffix}`;
   const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   const baseCommand = 'bun run vitest run --reporter=json -c vitest.config.ts';
   const command = options.changedOnly ? `${baseCommand} --changed` : baseCommand;

@@ -45,7 +45,7 @@ import {
   type MicrosoftOAuthOptions,
 } from '../auth/microsoft-oauth.ts';
 import { debug } from '../utils/debug.ts';
-import { markSourceAuthenticated, loadSourceConfig, saveSourceConfig } from './storage.ts';
+import { markSourceAuthenticated, loadSourceConfig, saveSourceConfig, isSourceUsable } from './storage.ts';
 
 /**
  * Result of authentication attempt
@@ -876,15 +876,15 @@ export function sourceNeedsAuthentication(source: LoadedSource): boolean {
     }
     // Only require auth if authType is explicitly set to 'oauth' or 'bearer'
     // Undefined or 'none' means no authentication required
-    if (mcp.authType && mcp.authType !== 'none' && !source.config.isAuthenticated) {
-      return true;
+    if (mcp.authType && mcp.authType !== 'none') {
+      return !isSourceUsable(source);
     }
   }
 
   // API sources with auth requirements
   if (source.config.type === 'api' && api) {
-    if (api.authType !== 'none' && api.authType !== undefined && !source.config.isAuthenticated) {
-      return true;
+    if (api.authType !== 'none' && api.authType !== undefined) {
+      return !isSourceUsable(source);
     }
   }
 

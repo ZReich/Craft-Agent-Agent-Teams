@@ -1,3 +1,4 @@
+/* eslint-disable craft-agent/no-localstorage -- Playground-only persistence for preview UX. */
 import * as React from 'react'
 import { cn } from '@/lib/utils'
 import type { ComponentEntry } from './registry'

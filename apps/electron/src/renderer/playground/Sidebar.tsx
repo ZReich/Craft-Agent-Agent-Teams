@@ -1,3 +1,4 @@
+/* eslint-disable craft-agent/no-localstorage -- Playground-only persistence for expanded categories. */
 import * as React from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'

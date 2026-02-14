@@ -31,7 +31,6 @@ const MIN_FILES_HEIGHT = 80
 /**
  * Custom hook for debounced callback
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function useDebouncedCallback<T extends (...args: any[]) => void>(
   callback: T,
   delay: number

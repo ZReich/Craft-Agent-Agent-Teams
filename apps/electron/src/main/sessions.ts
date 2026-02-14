@@ -2550,9 +2550,9 @@ export class SessionManager {
             process.env.ANTHROPIC_API_KEY = apiKey
             sessionLog.info(`Set API key for connection: ${slug}`)
           } else if (connection.baseUrl) {
-            // Keyless provider (Ollama) - set placeholder
+            // Keyless provider (e.g., local endpoint) - SDK still expects a token-shaped value.
             process.env.ANTHROPIC_API_KEY = 'not-needed'
-            sessionLog.warn(`Using placeholder API key for keyless provider: ${slug}`)
+            sessionLog.info(`Using keyless connection mode for provider: ${slug}`)
           } else {
             sessionLog.error(`No API key found for connection: ${slug}`)
           }
@@ -7488,34 +7488,43 @@ export class SessionManager {
 
   /**
    * Get output from a background task or shell
-   *
-   * NOT YET IMPLEMENTED - This is a placeholder.
-   *
-   * Background task output retrieval requires infrastructure that doesn't exist yet:
-   * 1. Storing shell output streams as they come in (tool_result events only have final output)
-   * 2. Associating outputs with task/shell IDs in a queryable store
-   * 3. Handling the BashOutput tool results for ongoing shells
-   *
-   * Current workaround: Users can view task output in the main chat panel where
-   * tool results are displayed inline with the conversation.
-   *
    * @param taskId - The task or shell ID
-   * @returns Placeholder message explaining the limitation
+   * @returns Latest known output (best-effort) or null if not found
    */
   async getTaskOutput(taskId: string): Promise<string | null> {
-    sessionLog.info(`Getting output for task: ${taskId} (not implemented)`)
+    sessionLog.info(`Getting output for task: ${taskId}`)
 
-    // This functionality requires a dedicated output tracking system.
-    // The SDK manages shells internally but doesn't expose an API for querying
-    // their output history outside of tool_result events.
-    return `Background task output retrieval is not yet implemented.
+    const allMessages: Message[] = []
+    for (const managed of this.sessions.values()) {
+      allMessages.push(...managed.messages)
+    }
 
-Task ID: ${taskId}
+    // Newest-first search for matching output in tool messages.
+    for (let i = allMessages.length - 1; i >= 0; i--) {
+      const message = allMessages[i]
+      if (message.role !== 'tool') continue
+      const input = (message.toolInput ?? {}) as Record<string, unknown>
+      const content = message.toolResult || message.content || ''
 
-To view this task's output:
-• Check the main chat panel where tool results are displayed
-• Look for the tool_result message associated with this task
-• For ongoing shells, the agent can use BashOutput to check status`
+      const taskIdFromInput =
+        (typeof input.task_id === 'string' && input.task_id) ||
+        (typeof input.shell_id === 'string' && input.shell_id) ||
+        (typeof input.backgroundTaskId === 'string' && input.backgroundTaskId) ||
+        (typeof input.taskId === 'string' && input.taskId) ||
+        (typeof input.shellId === 'string' && input.shellId) ||
+        null
+
+      if (taskIdFromInput === taskId) {
+        return content || null
+      }
+
+      // Fallback for providers that only include IDs in result text.
+      if (typeof content === 'string' && content.includes(taskId)) {
+        return content
+      }
+    }
+
+    return null
   }
 
   /**

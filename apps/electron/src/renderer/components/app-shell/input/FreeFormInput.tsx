@@ -62,6 +62,7 @@ import { EditPopover, getEditConfig } from '@/components/ui/EditPopover'
 import { SourceAvatar } from '@/components/ui/source-avatar'
 import { ConnectionIcon } from '@/components/icons/ConnectionIcon'
 import { FreeFormInputContextBadge } from './FreeFormInputContextBadge'
+import { SessionControlsDropdown } from './SessionControlsDropdown'
 import type { FileAttachment, LoadedSource, LoadedSkill } from '../../../../shared/types'
 import type { PermissionMode } from '@craft-agent/shared/agent/modes'
 import { PERMISSION_MODE_ORDER } from '@craft-agent/shared/agent/modes'
@@ -198,6 +199,15 @@ export interface FreeFormInputProps {
   onConnectionChange?: (connectionSlug: string) => void
   /** When true, the session's locked connection has been removed */
   connectionUnavailable?: boolean
+  // Session controls (Agent Teams + YOLO Mode) — Implements REQ-001
+  /** Whether Agent Teams is enabled for this session */
+  agentTeamsEnabled?: boolean
+  /** Callback when Agent Teams toggle changes */
+  onAgentTeamsChange?: (enabled: boolean) => void
+  /** Whether YOLO Mode is enabled for this session */
+  yoloModeEnabled?: boolean
+  /** Callback when YOLO Mode toggle changes */
+  onYoloModeChange?: (enabled: boolean) => void
 }
 
 /**
@@ -251,11 +261,15 @@ export function FreeFormInput({
   currentConnection,
   onConnectionChange,
   connectionUnavailable = false,
+  agentTeamsEnabled = false,
+  onAgentTeamsChange,
+  yoloModeEnabled = false,
+  onYoloModeChange,
 }: FreeFormInputProps) {
   // Read connection default model, connections, and workspace info from context.
   // Uses optional variant so playground (no provider) doesn't crash.
   const appShellCtx = useOptionalAppShellContext()
-  const llmConnections = appShellCtx?.llmConnections ?? []
+  const llmConnections = React.useMemo(() => appShellCtx?.llmConnections ?? [], [appShellCtx?.llmConnections])
   const workspaceDefaultConnection = appShellCtx?.workspaceDefaultLlmConnection
 
   // Derive connectionDefaultModel per-session from the effective connection.
@@ -668,6 +682,60 @@ export function FreeFormInput({
     return () => window.removeEventListener('craft:focus-input', handleFocusInput)
   }, [richInputRef])
 
+  // Check if running in Electron environment (has electronAPI)
+  const hasElectronAPI = typeof window !== 'undefined' && !!window.electronAPI
+
+  // Helper to read a File using FileReader API
+  const readFileAsAttachment = React.useCallback(async (file: File, overrideName?: string): Promise<FileAttachment | null> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader()
+      reader.onload = async () => {
+        const result = reader.result as ArrayBuffer
+        const base64 = btoa(
+          new Uint8Array(result).reduce((data, byte) => data + String.fromCharCode(byte), '')
+        )
+
+        let type: FileAttachment['type'] = 'unknown'
+        const fileName = overrideName || file.name
+        if (file.type.startsWith('image/')) type = 'image'
+        else if (file.type === 'application/pdf') type = 'pdf'
+        else if (file.type.includes('text') || fileName.match(/\.(txt|md|json|js|ts|tsx|py|css|html)$/i)) type = 'text'
+        else if (file.type.includes('officedocument') || fileName.match(/\.(docx?|xlsx?|pptx?)$/i)) type = 'office'
+
+        const mimeType = file.type || 'application/octet-stream'
+
+        // For text files, decode the ArrayBuffer as UTF-8 text
+        let text: string | undefined
+        if (type === 'text') {
+          text = new TextDecoder('utf-8').decode(new Uint8Array(result))
+        }
+
+        let thumbnailBase64: string | undefined
+        if (hasElectronAPI) {
+          try {
+            const thumb = await window.electronAPI.generateThumbnail(base64, mimeType)
+            if (thumb) thumbnailBase64 = thumb
+          } catch {
+            // Thumbnail generation is optional, continue without it
+          }
+        }
+
+        resolve({
+          type,
+          path: fileName,
+          name: fileName,
+          mimeType,
+          base64,
+          text,
+          size: file.size,
+          thumbnailBase64,
+        })
+      }
+      reader.onerror = () => resolve(null)
+      reader.readAsArrayBuffer(file)
+    })
+  }, [hasElectronAPI])
+
   // Get the next available number for a pasted file prefix (e.g., pasted-image-1, pasted-image-2)
   const getNextPastedNumber = (
     prefix: 'image' | 'text' | 'file',
@@ -722,7 +790,7 @@ export function FreeFormInput({
 
     window.addEventListener('craft:paste-files', handlePasteFiles as unknown as EventListener)
     return () => window.removeEventListener('craft:paste-files', handlePasteFiles as unknown as EventListener)
-  }, [disabled, richInputRef])
+  }, [disabled, readFileAsAttachment, richInputRef])
 
   // Build active commands list for slash command menu
   const activeCommands = React.useMemo(() => {
@@ -752,7 +820,7 @@ export function FreeFormInput({
     else if (commandId === 'ask') onPermissionModeChange?.('ask')
     else if (commandId === 'allow-all') onPermissionModeChange?.('allow-all')
     else if (commandId === 'ultrathink') onUltrathinkChange?.(!ultrathinkEnabled)
-  }, [permissionMode, ultrathinkEnabled, onPermissionModeChange, onUltrathinkChange])
+  }, [ultrathinkEnabled, onPermissionModeChange, onUltrathinkChange])
 
   // Handle folder selection from slash command menu
   const handleSlashFolderSelect = React.useCallback((path: string) => {
@@ -772,7 +840,7 @@ export function FreeFormInput({
     window.electronAPI?.getHomeDir?.().then((dir: string) => {
       if (dir) setHomeDir(dir)
     })
-  }, [])
+  }, [getRecentDirs])
 
   // Inline slash command hook (modes, features, and folders)
   const inlineSlash = useInlineSlashCommand({
@@ -877,9 +945,6 @@ export function FreeFormInput({
     // When not processing, ResizeObserver will report the full height
   }, [compactMode, isProcessing, onHeightChange])
 
-  // Check if running in Electron environment (has electronAPI)
-  const hasElectronAPI = typeof window !== 'undefined' && !!window.electronAPI
-
   // File attachment handlers
   const handleAttachClick = async () => {
     if (disabled || !hasElectronAPI) return
@@ -922,57 +987,6 @@ export function FreeFormInput({
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault()
     e.stopPropagation()
-  }
-
-  // Helper to read a File using FileReader API
-  const readFileAsAttachment = async (file: File, overrideName?: string): Promise<FileAttachment | null> => {
-    return new Promise((resolve) => {
-      const reader = new FileReader()
-      reader.onload = async () => {
-        const result = reader.result as ArrayBuffer
-        const base64 = btoa(
-          new Uint8Array(result).reduce((data, byte) => data + String.fromCharCode(byte), '')
-        )
-
-        let type: FileAttachment['type'] = 'unknown'
-        const fileName = overrideName || file.name
-        if (file.type.startsWith('image/')) type = 'image'
-        else if (file.type === 'application/pdf') type = 'pdf'
-        else if (file.type.includes('text') || fileName.match(/\.(txt|md|json|js|ts|tsx|py|css|html)$/i)) type = 'text'
-        else if (file.type.includes('officedocument') || fileName.match(/\.(docx?|xlsx?|pptx?)$/i)) type = 'office'
-
-        const mimeType = file.type || 'application/octet-stream'
-
-        // For text files, decode the ArrayBuffer as UTF-8 text
-        let text: string | undefined
-        if (type === 'text') {
-          text = new TextDecoder('utf-8').decode(new Uint8Array(result))
-        }
-
-        let thumbnailBase64: string | undefined
-        if (hasElectronAPI) {
-          try {
-            const thumb = await window.electronAPI.generateThumbnail(base64, mimeType)
-            if (thumb) thumbnailBase64 = thumb
-          } catch {
-            // Thumbnail generation is optional, continue without it
-          }
-        }
-
-        resolve({
-          type,
-          path: fileName,
-          name: fileName,
-          mimeType,
-          base64,
-          text,
-          size: file.size,
-          thumbnailBase64,
-        })
-      }
-      reader.onerror = () => resolve(null)
-      reader.readAsArrayBuffer(file)
-    })
   }
 
   // Clipboard paste handler for files/images
@@ -1026,7 +1040,7 @@ export function FreeFormInput({
     setAttachments(prev => [...prev, attachment])
     // Focus input after adding attachment
     richInputRef.current?.focus()
-  }, []) // No deps needed - uses ref
+  }, [richInputRef])
 
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault()
@@ -1105,7 +1119,7 @@ export function FreeFormInput({
     })
 
     return true
-  }, [input, attachments, disabled, disableSend, onInputChange, onSubmit, skills, sources, optimisticSourceSlugs, onSourcesChange, onWorkingDirectoryChange, homeDir])
+  }, [input, attachments, disabled, disableSend, onInputChange, onSubmit, skills, sources, optimisticSourceSlugs, onSourcesChange, richInputRef])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -1266,7 +1280,7 @@ export function FreeFormInput({
       setInput(newValue)
       syncToParent(newValue)
     }
-  }, [inlineSlash, inlineMention, inlineLabel, syncToParent, autoCapitalisation])
+  }, [inlineSlash, inlineMention, inlineLabel, syncToParent, autoCapitalisation, richInputRef])
 
   // Handle inline slash command selection (removes the /command text)
   const handleInlineSlashCommandSelect = React.useCallback((commandId: SlashCommandId) => {
@@ -1274,7 +1288,7 @@ export function FreeFormInput({
     setInput(newValue)
     syncToParent(newValue)
     richInputRef.current?.focus()
-  }, [inlineSlash, syncToParent])
+  }, [inlineSlash, syncToParent, richInputRef])
 
   // Handle inline slash folder selection (inserts [dir:/path] badge)
   const handleInlineSlashFolderSelect = React.useCallback((path: string) => {
@@ -1282,7 +1296,7 @@ export function FreeFormInput({
     setInput(newValue)
     syncToParent(newValue)
     richInputRef.current?.focus()
-  }, [inlineSlash, syncToParent])
+  }, [inlineSlash, syncToParent, richInputRef])
 
   // Handle inline mention selection (inserts appropriate mention text)
   const handleInlineMentionSelect = React.useCallback((item: MentionItem) => {
@@ -1294,7 +1308,7 @@ export function FreeFormInput({
       richInputRef.current?.focus()
       richInputRef.current?.setSelectionRange(cursorPosition, cursorPosition)
     }, 0)
-  }, [inlineMention, syncToParent])
+  }, [inlineMention, syncToParent, richInputRef])
 
   // Handle inline label selection (removes the #label text from input)
   const handleInlineLabelSelect = React.useCallback((labelId: string) => {
@@ -1302,7 +1316,7 @@ export function FreeFormInput({
     setInput(newValue)
     syncToParent(newValue)
     richInputRef.current?.focus()
-  }, [inlineLabel, syncToParent])
+  }, [inlineLabel, syncToParent, richInputRef])
 
   // Handle inline state selection from # menu (removes #text, changes session state)
   const handleInlineStateSelect = React.useCallback((stateId: string) => {
@@ -1313,7 +1327,7 @@ export function FreeFormInput({
       onTodoStateChange?.(sessionId, stateId)
     }
     richInputRef.current?.focus()
-  }, [inlineLabel, syncToParent, sessionId, onTodoStateChange])
+  }, [inlineLabel, syncToParent, sessionId, onTodoStateChange, richInputRef])
 
   const hasContent = input.trim() || attachments.length > 0
 
@@ -1856,6 +1870,18 @@ Model
               )}
             </StyledDropdownMenuContent>
           </DropdownMenu>
+          )}
+
+          {/* 5.25 Session Controls Dropdown (Agent Teams + YOLO Mode) — Implements REQ-001 */}
+          {!compactMode && onAgentTeamsChange && onYoloModeChange && (
+            <div className="relative">
+              <SessionControlsDropdown
+                agentTeamsEnabled={agentTeamsEnabled}
+                onAgentTeamsChange={onAgentTeamsChange}
+                yoloModeEnabled={yoloModeEnabled}
+                onYoloModeChange={onYoloModeChange}
+              />
+            </div>
           )}
 
           {/* 5.5 Context Usage Warning Badge - shows when approaching auto-compaction threshold */}

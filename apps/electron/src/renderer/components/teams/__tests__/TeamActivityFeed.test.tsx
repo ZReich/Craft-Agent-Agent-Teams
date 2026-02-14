@@ -1,8 +1,8 @@
 ﻿/**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, beforeAll } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, it, expect, beforeAll, afterEach } from 'vitest'
+import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import * as matchers from '@testing-library/jest-dom/matchers'
 import { TeamActivityFeed } from '../TeamActivityFeed'
 import type { TeamActivityEvent } from '../../../../shared/types'
@@ -13,6 +13,10 @@ beforeAll(() => {
   if (!Element.prototype.scrollIntoView) {
     Element.prototype.scrollIntoView = () => {}
   }
+})
+
+afterEach(() => {
+  cleanup()
 })
 
 function makeEvent(partial: Partial<TeamActivityEvent>): TeamActivityEvent {

@@ -404,7 +404,7 @@ export function NavigationProvider({
           console.warn('[Navigation] Unknown action:', parsed.name)
       }
     },
-    [workspaceId, onCreateSession, onInputChange, setSession]
+    [workspaceId, onCreateSession, onInputChange, setSession, updateSessionMeta]
   )
 
 
@@ -584,7 +584,7 @@ export function NavigationProvider({
       setCanGoBack(newCanGoBack)
       setCanGoForward(newCanGoForward)
     },
-    [isReady, handleActionNavigation, applyNavigationState]
+    [isReady, handleActionNavigation, applyNavigationState, navigationState]
   )
 
   // Keep navigateRef in sync with latest navigate function

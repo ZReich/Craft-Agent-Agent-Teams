@@ -10,7 +10,36 @@ import type {
   TicketProvider,
   TicketProviderConfig,
   TicketProviderType,
+  TicketStatus,
 } from './types.ts';
+
+class UnavailableLinearTicketProvider implements TicketProvider {
+  readonly type = 'linear' as const;
+  readonly name = 'Linear (Unavailable)';
+
+  async listTickets(_filter?: TicketFilter): Promise<Ticket[]> { return []; }
+  async getTicket(_ticketId: string): Promise<Ticket | null> { return null; }
+  async updateTicketStatus(_ticketId: string, _status: TicketStatus): Promise<void> {
+    throw new Error('Linear provider is configured but not yet implemented in this build.');
+  }
+  async linkToRequirement(_ticketId: string, _requirementId: string): Promise<void> {
+    throw new Error('Linear provider is configured but not yet implemented in this build.');
+  }
+  async unlinkFromRequirement(_ticketId: string, _requirementId: string): Promise<void> {
+    throw new Error('Linear provider is configured but not yet implemented in this build.');
+  }
+  async getTicketsForRequirement(_requirementId: string): Promise<Ticket[]> { return []; }
+  async sync(): Promise<SyncResult> {
+    return {
+      added: 0,
+      updated: 0,
+      removed: 0,
+      errors: ['Linear provider is configured but not yet implemented in this build.'],
+      lastSyncAt: new Date().toISOString(),
+    };
+  }
+  isAuthenticated(): boolean { return false; }
+}
 
 export class TicketService {
   private readonly providers = new Map<TicketProviderType, TicketProvider>();
@@ -155,8 +184,8 @@ export class TicketService {
         return new CraftTicketProvider(this.workspaceRoot, config.craft);
 
       case 'linear':
-        debug('[TicketService] Linear provider configured but not yet implemented');
-        return null;
+        debug('[TicketService] Linear provider configured but not implemented yet; using unavailable placeholder provider');
+        return new UnavailableLinearTicketProvider();
 
       default:
         return null;

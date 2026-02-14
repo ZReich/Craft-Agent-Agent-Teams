@@ -1017,12 +1017,25 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   })
 
   // Git Bash detection and configuration (Windows only)
+  // In-memory override set from onboarding/manual selection.
+  let customGitBashPath: string | null = null
   ipcMain.handle(IPC_CHANNELS.GITBASH_CHECK, async () => {
     const platform = process.platform as 'win32' | 'darwin' | 'linux'
 
     // Non-Windows platforms don't need Git Bash
     if (platform !== 'win32') {
       return { found: true, path: null, platform }
+    }
+
+    // Check user-selected path first (if provided during this app run)
+    if (customGitBashPath) {
+      try {
+        await stat(customGitBashPath)
+        return { found: true, path: customGitBashPath, platform }
+      } catch {
+        // Stale path: reset and continue with auto-detection
+        customGitBashPath = null
+      }
     }
 
     // Check common Git Bash installation paths
@@ -1088,8 +1101,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         return { success: false, error: 'Path must be an executable (.exe) file' }
       }
 
-      // TODO: Persist this path to config if needed
-      // For now, we just validate it exists
+      // Persist for current process lifetime so re-checks and setup flow use it.
+      customGitBashPath = bashPath
       return { success: true }
     } catch {
       return { success: false, error: 'File does not exist at the specified path' }
@@ -1855,6 +1868,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       qualityGatesReviewModel: qg?.reviewModel ?? 'kimi-k2.5',
       qualityGatesBaselineAwareTests: qg?.baselineAwareTests ?? true,
       qualityGatesKnownFailingTests: qg?.knownFailingTests ?? [],
+      qualityGatesTestScope: qg?.testScope ?? 'affected',
       qualityGatesSyntaxEnabled: qg?.stages?.syntax?.enabled ?? true,
       qualityGatesTestsEnabled: qg?.stages?.tests?.enabled ?? true,
       qualityGatesArchEnabled: qg?.stages?.architecture?.enabled ?? true,
@@ -1885,7 +1899,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate', 'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
+    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesTestScope', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate', 'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -1956,6 +1970,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         qualityGatesReviewModel: 'reviewModel',
         qualityGatesBaselineAwareTests: 'baselineAwareTests',
         qualityGatesKnownFailingTests: 'knownFailingTests',
+        qualityGatesTestScope: 'testScope',
       }
 
       // Per-stage enabled toggles
