@@ -63,8 +63,8 @@ export function readSessionHeader(sessionFile: string): SessionHeader | null {
     const firstLine = firstNewline > 0 ? content.slice(0, firstNewline) : content;
 
     return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
-  } catch (error) {
-    debug('[jsonl] Failed to read session header:', sessionFile, error);
+  } catch {
+    // Silently return null — caller (listSessions) tracks and summarizes failures
     return null;
   }
 }

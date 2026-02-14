@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useAction, useActionLabel } from "@/actions"
 import { formatDistanceToNow, formatDistanceToNowStrict, isToday, isYesterday, format, startOfDay } from "date-fns"
 import type { Locale } from "date-fns"
-import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive,  Users } from "lucide-react"
+import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive,  Users, Clock } from "lucide-react"
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
@@ -630,6 +630,14 @@ function SessionItem({
                     <Flag className="h-[10px] w-[10px] text-info fill-info" />
                   </span>
                 )}
+                {item.labels?.includes('Scheduled') && (
+                  <span
+                    className="shrink-0 h-[18px] w-[18px] flex items-center justify-center rounded bg-foreground/5"
+                    title="Triggered by scheduled task"
+                  >
+                    <Clock className="h-[10px] w-[10px] text-foreground/70" />
+                  </span>
+                )}
                 {item.lastMessageRole === 'plan' && (
                   <span className="shrink-0 h-[18px] px-1.5 text-[10px] font-medium rounded bg-success/10 text-success flex items-center whitespace-nowrap">
                     Plan
@@ -962,6 +970,8 @@ interface SessionListProps {
   statusFilter?: Map<string, FilterMode>
   /** Secondary label filter (label chips) - for search result grouping */
   labelFilterMap?: Map<string, FilterMode>
+  /** Full session meta map for resolving archived teammates in team groups */
+  allSessionMetaMap?: Map<string, SessionMeta>
 }
 
 // Re-export TodoStateId for use by parent components
@@ -1002,6 +1012,7 @@ export function SessionList({
   workspaceId,
   statusFilter,
   labelFilterMap,
+  allSessionMetaMap,
 }: SessionListProps) {
   const {
     state: selectionState,
@@ -1874,8 +1885,9 @@ export function SessionList({
                     // Team lead — render as a collapsible TeamGroup
                     if (item.isTeamLead && item.teammateSessionIds && item.teammateSessionIds.length > 0) {
                       // Find teammate SessionMeta objects from the full list
+                      // Implements REQ-001: Also check allSessionMetaMap for archived teammates
                       const teammates = (item.teammateSessionIds || [])
-                        .map(tid => group.sessions.find(s => s.id === tid) || paginatedItems.find(s => s.id === tid))
+                        .map(tid => group.sessions.find(s => s.id === tid) || paginatedItems.find(s => s.id === tid) || allSessionMetaMap?.get(tid))
                         .filter((t): t is SessionMeta => t != null)
                         // Newest/active teammates first so newly spawned members are immediately visible.
                         .sort((a, b) => {

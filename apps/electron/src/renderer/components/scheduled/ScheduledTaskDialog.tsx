@@ -154,7 +154,7 @@ export function ScheduledTaskDialog({ open, onClose, onSave, task }: ScheduledTa
           <div className="space-y-1.5">
             <Label className="text-xs text-muted-foreground">Schedule</Label>
             <div className="flex gap-1">
-              {(['daily', 'weekly', 'monthly', 'custom'] as const).map((p) => (
+              {(['hourly', 'daily', 'weekly', 'monthly', 'custom'] as const).map((p) => (
                 <button
                   key={p}
                   onClick={() => setPreset(p)}
@@ -171,8 +171,30 @@ export function ScheduledTaskDialog({ open, onClose, onSave, task }: ScheduledTa
             </div>
           </div>
 
+          {/* Minute Picker (for hourly) */}
+          {preset === 'hourly' && (
+            <div className="flex gap-3 items-end">
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">At minute</Label>
+                <Select value={String(minute)} onValueChange={(v) => setMinute(parseInt(v, 10))}>
+                  <SelectTrigger className="w-[80px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((m) => (
+                      <SelectItem key={m} value={String(m)}>
+                        :{m.toString().padStart(2, '0')}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <span className="text-xs text-muted-foreground pb-2">past every hour</span>
+            </div>
+          )}
+
           {/* Time Picker (for daily/weekly/monthly) */}
-          {preset !== 'custom' && (
+          {(preset === 'daily' || preset === 'weekly' || preset === 'monthly') && (
             <div className="flex gap-3 items-end">
               <div className="space-y-1.5">
                 <Label className="text-xs text-muted-foreground">Time</Label>

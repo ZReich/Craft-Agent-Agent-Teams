@@ -2279,6 +2279,7 @@ function AppShellContent({
                       label: String(scheduledTasks.length),
                       icon: Clock,
                       variant: "ghost" as const,
+                      onClick: handleOpenCreateScheduledTask,
                       expandable: true,
                       expanded: isExpanded('nav:scheduled'),
                       onToggle: () => toggleExpanded('nav:scheduled'),
@@ -2286,27 +2287,53 @@ function AppShellContent({
                         type: 'scheduled' as const,
                         onAddScheduledTask: handleOpenCreateScheduledTask,
                       },
-                      items: scheduledTasks.map((task) => ({
-                        id: `nav:scheduled:${task.index}`,
-                        title: task.name || task.hooks.find(h => h.type === 'prompt')?.prompt?.slice(0, 30) || 'Unnamed',
-                        label: task.scheduleDescription,
-                        icon: Clock,
-                        iconColor: task.enabled
-                          ? undefined
-                          : 'color-mix(in oklch, var(--foreground) 30%, transparent)',
-                        compact: true,
-                        variant: "ghost" as const,
-                        contextMenu: {
-                          type: 'scheduled' as const,
-                          onAddScheduledTask: handleOpenCreateScheduledTask,
-                          scheduledTaskIndex: task.index,
-                          onEditScheduledTask: handleEditScheduledTask,
-                          onDeleteScheduledTask: handleDeleteScheduledTask,
-                          onToggleScheduledTask: handleToggleScheduledTask,
-                          scheduledTaskEnabled: task.enabled,
-                        },
-                        onClick: () => handleEditScheduledTask(task.index),
-                      })),
+                      items: scheduledTasks.map((task) => {
+                        // Build a descriptive title: name + schedule description
+                        const taskName = task.name || task.hooks.find(h => h.type === 'prompt')?.prompt?.slice(0, 40) || 'Unnamed Task'
+                        const titleWithSchedule = task.name ? `${task.name} · ${task.scheduleDescription}` : task.scheduleDescription || taskName
+
+                        // Build label: show next run if enabled, "Disabled" if not
+                        let label: string | undefined
+                        if (!task.enabled) {
+                          label = 'Disabled'
+                        } else if (task.nextRun) {
+                          const nextDate = new Date(task.nextRun)
+                          const now = new Date()
+                          const diff = nextDate.getTime() - now.getTime()
+                          const hours = Math.floor(diff / (1000 * 60 * 60))
+                          const days = Math.floor(hours / 24)
+
+                          if (days > 1) {
+                            label = `in ${days}d`
+                          } else if (hours > 1) {
+                            label = `in ${hours}h`
+                          } else {
+                            label = 'soon'
+                          }
+                        }
+
+                        return {
+                          id: `nav:scheduled:${task.index}`,
+                          title: titleWithSchedule,
+                          label,
+                          icon: Clock,
+                          iconColor: task.enabled
+                            ? undefined
+                            : 'color-mix(in oklch, var(--foreground) 30%, transparent)',
+                          compact: true,
+                          variant: "ghost" as const,
+                          contextMenu: {
+                            type: 'scheduled' as const,
+                            onAddScheduledTask: handleOpenCreateScheduledTask,
+                            scheduledTaskIndex: task.index,
+                            onEditScheduledTask: handleEditScheduledTask,
+                            onDeleteScheduledTask: handleDeleteScheduledTask,
+                            onToggleScheduledTask: handleToggleScheduledTask,
+                            scheduledTaskEnabled: task.enabled,
+                          },
+                          onClick: () => handleEditScheduledTask(task.index),
+                        }
+                      }),
                     }] : [{
                       id: "nav:scheduled",
                       title: "Scheduled",
@@ -3173,6 +3200,7 @@ function AppShellContent({
                   workspaceId={activeWorkspaceId ?? undefined}
                   statusFilter={listFilter}
                   labelFilterMap={labelFilter}
+                  allSessionMetaMap={sessionMetaMap}
                 />
               </>
             )}

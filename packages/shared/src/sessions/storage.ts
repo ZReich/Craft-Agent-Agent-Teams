@@ -382,6 +382,7 @@ export function listSessions(workspaceRootPath: string): SessionMetadata[] {
   const entries = readdirSync(sessionsDir, { withFileTypes: true });
   span.mark('readdir');
   const sessions: SessionMetadata[] = [];
+  let skippedHeaders = 0;
 
   for (const entry of entries) {
     if (entry.isDirectory()) {
@@ -401,9 +402,15 @@ export function listSessions(workspaceRootPath: string): SessionMetadata[] {
         if (header) {
           const metadata = headerToMetadata(header, workspaceRootPath);
           if (metadata) sessions.push(metadata);
+        } else {
+          skippedHeaders++;
         }
       }
     }
+  }
+
+  if (skippedHeaders > 0) {
+    debug(`[jsonl] Skipped ${skippedHeaders} sessions with unreadable headers`);
   }
   span.mark('parsed');
   span.setMetadata('count', sessions.length);

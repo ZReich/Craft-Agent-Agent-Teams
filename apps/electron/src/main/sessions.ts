@@ -1689,6 +1689,29 @@ export class SessionManager {
   }
 
   /**
+   * Stop runtime monitoring for a teammate without modifying team metadata.
+   * Implements REQ-001: Used during termination/completion to clean up runtime state
+   * while preserving team identity for sidebar grouping.
+   */
+  private detachTeammateRuntimeTracking(teammate: ManagedSession): void {
+    const resolvedTeamId = teammate.teamId
+      ? teamManager.resolveTeamId(teammate.teamId)
+      : undefined
+    if (resolvedTeamId) {
+      this.healthMonitor.removeTeammate(resolvedTeamId, teammate.id)
+      const hasLiveTeammates = Array.from(this.sessions.values()).some(s => {
+        if (s.id === teammate.id) return false
+        if (!s.parentSessionId || !s.teamId) return false
+        if (!s.isProcessing) return false
+        return teamManager.resolveTeamId(s.teamId) === resolvedTeamId
+      })
+      if (!hasLiveTeammates) {
+        this.stopTeamHealthMonitoring(resolvedTeamId)
+      }
+    }
+  }
+
+  /**
    * Remove a teammate from lead tracking and health monitoring.
    * Safe to call repeatedly.
    */
@@ -1742,11 +1765,10 @@ export class SessionManager {
 
     this.destroyManagedAgent(teammate, reason)
     this.stopComplianceWatcher(teammateId)
-    this.detachTeammateTracking(teammate)
+    // Implements REQ-001: Preserve team metadata on termination for sidebar grouping
+    // Only clean up runtime tracking (health monitor), NOT persisted team identity
+    this.detachTeammateRuntimeTracking(teammate)
 
-    teammate.teamId = undefined
-    teammate.parentSessionId = undefined
-    teammate.teammateName = undefined
     teammate.isProcessing = false
     this.persistSession(teammate)
     return true
@@ -4170,12 +4192,8 @@ export class SessionManager {
       await teamManager.cleanupTeam(resolvedTeamId)
     }
 
-    // Clear team state on lead
-    lead.teamId = undefined
-    lead.isTeamLead = undefined
-    lead.teammateSessionIds = undefined
-    lead.teamColor = undefined
-    this.persistSession(lead)
+    // Implements REQ-001: Preserve team metadata on lead for sidebar grouping
+    // Runtime agents are terminated above, but team identity is kept for display
   }
 
   /**
@@ -5253,10 +5271,9 @@ export class SessionManager {
       this.destroyManagedAgent(managed, 'autoArchiveCompletedTeammateSession')
     }
 
-    this.detachTeammateTracking(managed)
-    managed.teamId = undefined
-    managed.parentSessionId = undefined
-    managed.teammateName = undefined
+    // Implements REQ-001: Preserve team metadata on completion for sidebar grouping
+    // Only clean up runtime tracking (health monitor), NOT persisted team identity
+    this.detachTeammateRuntimeTracking(managed)
 
     let changed = false
     if (managed.todoState !== 'done') {

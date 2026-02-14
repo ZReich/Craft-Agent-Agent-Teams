@@ -12,7 +12,7 @@
  * - day-of-week (dow): 0-6 (0=Sunday) or *
  */
 
-export type SchedulePreset = 'daily' | 'weekly' | 'monthly' | 'custom';
+export type SchedulePreset = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'custom';
 
 export const DAYS_OF_WEEK = [
   { value: 0, label: 'Sun' },
@@ -39,6 +39,9 @@ export function detectPreset(cron: string): SchedulePreset {
   const dom = parts[2]; // day-of-month
   const month = parts[3];
   const dow = parts[4]; // day-of-week
+
+  // Hourly: runs every hour at specific minute (hour=*, dom=*, month=*, dow=*)
+  if (min && min.match(/^\d+$/) && hour === '*' && dom === '*' && month === '*' && dow === '*') return 'hourly';
 
   // Validate time fields are numeric
   if (!min || !min.match(/^\d+$/) || !hour || !hour.match(/^\d+$/)) {
@@ -152,6 +155,8 @@ export function buildCron(
   customCron: string
 ): string {
   switch (preset) {
+    case 'hourly':
+      return `${minute} * * * *`;
     case 'daily':
       return `${minute} ${hour} * * *`;
     case 'weekly': {
