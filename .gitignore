@@ -62,3 +62,10 @@ id_ed25519*
 # Credentials files
 credentials.enc
 *.credentials
+
+# Debug/exploration scripts (auto-generated during development)
+find_*.py
+print_*.py
+view_*.py
+search_*.py
+temp_script.py

@@ -125,7 +125,7 @@ export interface ClaudeAgentConfig {
   /** Callback when a teammate spawn is requested (agent teams) */
   onTeammateSpawnRequested?: (params: {
     teamName: string;
-    teammateName: string;
+    teammateName: string | undefined;
     prompt: string;
     model?: string;
     role?: string;
@@ -476,6 +476,8 @@ export class ClaudeAgent extends BaseAgent {
       onSdkSessionIdUpdate: config.onSdkSessionIdUpdate,
       onSdkSessionIdCleared: config.onSdkSessionIdCleared,
       getRecoveryMessages: config.getRecoveryMessages,
+      onTeammateSpawnRequested: config.onTeammateSpawnRequested,
+      onTeammateMessage: config.onTeammateMessage,
     };
 
     // Call BaseAgent constructor - initializes model, thinkingLevel, permissionManager, sourceManager, etc.
@@ -949,16 +951,20 @@ export class ClaudeAgent extends BaseAgent {
                 const teamName = explicitTeamName || this.activeTeamName || this.config.session?.id;
 
                 if (teamName) {
-                  const teammateName = (toolInput.name as string) || `teammate-${Date.now()}`;
-                  const prompt = (toolInput.prompt as string) || '';
-                  const model = toolInput.model as string | undefined;
-                  const role = toolInput.role as string | undefined;
+                  // Implements REQ-001: Let session manager generate witty codenames
+                  const teammateName: string | undefined = (typeof toolInput.name === 'string' && toolInput.name) ? toolInput.name : undefined;
+                  const prompt: string = (toolInput.prompt as string) || '';
+                  const model: string | undefined = toolInput.model as string | undefined;
+                  const role: string | undefined = toolInput.role as string | undefined;
 
                   if (!explicitTeamName) {
                     this.onDebug?.(`[AgentTeams] No team_name provided; defaulting to "${teamName}"`);
                   }
                   if (!role) {
-                    this.onDebug?.(`[AgentTeams] No role provided for teammate "${teammateName}"; defaulting to worker at session manager`);
+                    this.onDebug?.(`[AgentTeams] No role provided for teammate; defaulting to worker at session manager`);
+                  }
+                  if (!teammateName) {
+                    this.onDebug?.(`[AgentTeams] No teammate name provided; session manager will generate codename`);
                   }
 
                   // CRITICAL: Set activeTeamName/Count NOW (before returning synthetic result)
@@ -968,7 +974,7 @@ export class ClaudeAgent extends BaseAgent {
                   }
                   this.activeTeammateCount++;
 
-                  this.onDebug?.(`[AgentTeams] Intercepting teammate spawn: ${teammateName} for team "${teamName}" (count: ${this.activeTeammateCount})`);
+                  this.onDebug?.(`[AgentTeams] Intercepting teammate spawn: ${teammateName || '(auto-generated)'} for team "${teamName}" (count: ${this.activeTeammateCount})`);
 
                   try {
                     const result = await this.onTeammateSpawnRequested({
@@ -979,10 +985,11 @@ export class ClaudeAgent extends BaseAgent {
                       role,
                     });
 
-                    this.onDebug?.(`[AgentTeams] Teammate ${teammateName} spawned as session ${result.sessionId}`);
+                    const displayName = teammateName || 'teammate';
+                    this.onDebug?.(`[AgentTeams] Teammate ${displayName} spawned as session ${result.sessionId}`);
 
                     return {
-                      outputContent: `Teammate "${teammateName}" spawned successfully as a separate session.\nagent_id: ${result.sessionId}\nname: ${teammateName}\nstatus: running\n\nThe teammate is now working independently in its own context window. You will receive their results when they complete.`,
+                      outputContent: `Teammate spawned successfully as a separate session.\nagent_id: ${result.sessionId}\nstatus: running\n\nThe teammate is now working independently in its own context window with an auto-generated codename. You will receive their results when they complete.`,
                     };
                   } catch (err) {
                     // Roll back count on failure
@@ -991,9 +998,10 @@ export class ClaudeAgent extends BaseAgent {
                       this.activeTeamName = null;
                       this.activeTeammateCount = 0;
                     }
-                    this.onDebug?.(`[AgentTeams] Failed to spawn teammate ${teammateName}: ${err}`);
+                    const displayName = teammateName || 'teammate';
+                    this.onDebug?.(`[AgentTeams] Failed to spawn teammate ${displayName}: ${err}`);
                     return {
-                      outputContent: `Failed to spawn teammate "${teammateName}": ${err instanceof Error ? err.message : String(err)}`,
+                      outputContent: `Failed to spawn teammate: ${err instanceof Error ? err.message : String(err)}`,
                     };
                   }
                 }
@@ -2334,8 +2342,8 @@ export class ClaudeAgent extends BaseAgent {
 
     // Debug: log all SDK message types to understand MCP tool result flow
     if (this.onDebug) {
-      const msgInfo = message.type === 'user' && 'tool_use_result' in message
-        ? `user (tool_result for ${(message as any).parent_tool_use_id})`
+      const msgInfo = message.type === 'user'
+        ? `user (tool_result for ${message.parent_tool_use_id})`
         : message.type;
       this.onDebug(`SDK message: ${msgInfo}`);
     }
@@ -2459,19 +2467,19 @@ export class ClaudeAgent extends BaseAgent {
         const event = message.event;
         // Debug: log all stream events to understand tool result flow
         if (this.onDebug && event.type !== 'content_block_delta') {
-          this.onDebug(`stream_event: ${event.type}, content_type=${(event as any).content_block?.type || (event as any).delta?.type || 'n/a'}`);
+          this.onDebug(`stream_event: ${event.type}, content_type=${'content_block' in event ? (event.content_block as { type?: string })?.type : 'delta' in event ? (event.delta as { type?: string })?.type : 'n/a'}`);
         }
         // Capture turn ID from message_start (arrives before any content events)
         // This ID correlates all events in an assistant turn
         if (event.type === 'message_start') {
-          const messageId = (event as any).message?.id;
+          const messageId = 'message' in event ? (event.message as { id?: string })?.id : undefined;
           if (messageId) {
             setTurnId(messageId);
           }
         }
         // message_delta contains the actual stop_reason - emit pending text now
         if (event.type === 'message_delta') {
-          const stopReason = (event as any).delta?.stop_reason;
+          const stopReason = 'delta' in event ? (event.delta as { stop_reason?: string })?.stop_reason : undefined;
           if (pendingText) {
             const isIntermediate = stopReason === 'tool_use';
             // SDK's parent_tool_use_id identifies the subagent context for this text
@@ -2619,7 +2627,7 @@ export class ClaudeAgent extends BaseAgent {
 
       case 'result': {
         // Debug: log result message details (stderr to avoid SDK JSON pollution)
-        console.error(`[ClaudeAgent] result message: subtype=${message.subtype}, errors=${'errors' in message ? JSON.stringify((message as any).errors) : 'none'}`);
+        console.error(`[ClaudeAgent] result message: subtype=${message.subtype}, errors=${'errors' in message ? JSON.stringify((message as { errors?: string[] }).errors) : 'none'}`);
 
         // Get contextWindow from modelUsage (this is correct - it's the model's context window size)
         const modelUsageEntries = Object.values(message.modelUsage || {});
@@ -2725,7 +2733,7 @@ export class ClaudeAgent extends BaseAgent {
       default: {
         // Log unhandled message types for debugging
         if (this.onDebug) {
-          this.onDebug(`Unhandled SDK message type: ${(message as any).type}`);
+          this.onDebug(`Unhandled SDK message type: ${message.type}`);
         }
         break;
       }

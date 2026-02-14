@@ -239,11 +239,12 @@ autoUpdater.on('error', (error) => {
 function checkElectronUpdaterState(): { ready: boolean; version?: string } {
   try {
     // Access electron-updater's internal downloadedUpdateHelper
-    // @ts-expect-error - accessing internal API for reliability
-    const helper = autoUpdater.downloadedUpdateHelper
+    const updaterInternal = autoUpdater as unknown as {
+      downloadedUpdateHelper?: { cacheDir?: string; versionInfo?: { version: string } };
+    }
+    const helper = updaterInternal.downloadedUpdateHelper
     if (helper) {
       mainLog.info(`[auto-update] downloadedUpdateHelper exists, cacheDir: ${helper.cacheDir}`)
-      // @ts-expect-error - accessing internal API
       const versionInfo = helper.versionInfo
       if (versionInfo) {
         mainLog.info(`[auto-update] electron-updater has validated download: ${JSON.stringify(versionInfo)}`)

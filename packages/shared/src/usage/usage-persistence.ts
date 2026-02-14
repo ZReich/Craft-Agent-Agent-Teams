@@ -243,7 +243,7 @@ export class UsagePersistence {
         try {
           const data = await fs.readFile(path.join(this.usagePath, file), 'utf-8');
           weeks.push(JSON.parse(data));
-        } catch { /* skip corrupted files */ }
+        } catch { /* skip corrupted/unreadable week files — non-critical */ }
       }
       return weeks;
     } catch {

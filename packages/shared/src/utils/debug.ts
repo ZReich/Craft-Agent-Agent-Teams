@@ -12,12 +12,12 @@ function detectEnvironment(): Environment {
   if (typeof process === 'undefined') {
     return 'electron-renderer';
   }
-  // Electron main process
-  if ((process as any).type === 'browser') {
+  // Electron adds a 'type' property to process ('browser' for main, 'renderer' for renderer)
+  const processType = (process as NodeJS.Process & { type?: string }).type;
+  if (processType === 'browser') {
     return 'electron-main';
   }
-  // Electron renderer process (with nodeIntegration)
-  if ((process as any).type === 'renderer') {
+  if (processType === 'renderer') {
     return 'electron-renderer';
   }
   // Default: CLI/scripts
