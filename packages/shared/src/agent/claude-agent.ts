@@ -948,7 +948,15 @@ export class ClaudeAgent extends BaseAgent {
                   : typeof toolInput.teamName === 'string'
                     ? toolInput.teamName
                     : undefined;
-                const teamName = explicitTeamName || this.activeTeamName || this.config.session?.id;
+
+                // Only intercept if team_name was EXPLICITLY provided in the tool call.
+                // Non-lead sessions (e.g., Heads) omitting team_name should spawn native
+                // subagents (invisible) instead of creating separate teammate sessions.
+                if (!explicitTeamName && this.activeTeamName) {
+                  this.onDebug?.(`[AgentTeams] Task call without explicit team_name from active team member — falling through to native subagent`);
+                  // Fall through — let SDK handle as normal in-process subagent
+                } else {
+                const teamName = explicitTeamName || this.config.session?.id;
 
                 if (teamName) {
                   // Implements REQ-001: Let session manager generate witty codenames
@@ -1005,6 +1013,7 @@ export class ClaudeAgent extends BaseAgent {
                     };
                   }
                 }
+              } // end else (explicit team_name provided)
               }
 
               // --- SendMessage tool: Route messages to teammate sessions ---

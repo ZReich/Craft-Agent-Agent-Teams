@@ -22,6 +22,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
+import { stripMarkdown } from '@/utils/text'
 import { sessionMetaMapAtom } from '@/atoms/sessions'
 import type { SessionMeta } from '@/atoms/sessions'
 import type {
@@ -55,6 +56,14 @@ import { SpecChecklistModal } from './SpecChecklistModal'
 import { useTeamStateSync } from '@/hooks/useTeamEvents'
 import { ToolActivityIndicator } from './ToolActivityIndicator'
 import type { ToolActivity } from './ToolActivityIndicator'
+
+const MODEL_NAMES: Record<string, string> = {
+  'claude-opus-4-6': 'Opus 4.6',
+  'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
+  'claude-haiku-4-5-20251001': 'Haiku 4.5',
+  'kimi-k2.5': 'Kimi K2.5',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
+}
 
 const MAX_REALTIME_MESSAGES = 2000
 const MAX_REALTIME_ACTIVITY = 1500
@@ -674,7 +683,7 @@ export function TeamDashboard({
                       <div className="min-w-0">
                         <h3 className="text-sm font-semibold truncate">{teammate.name}</h3>
                         <p className="text-[11px] text-muted-foreground truncate capitalize">
-                          {teammate.role} • {teammate.model}
+                          {teammate.role} • {MODEL_NAMES[teammate.model] || teammate.model}
                         </p>
                       </div>
                       <div className="flex items-center gap-1.5">
@@ -736,7 +745,7 @@ export function TeamDashboard({
                             <span className="font-medium text-foreground/85 mr-1">
                               {isFromTeammate ? teammate.name : msg.from === 'user' ? 'You' : msg.from}:
                             </span>
-                            <span className="text-muted-foreground">{msg.content.slice(0, 90)}</span>
+                            <span className="text-muted-foreground">{stripMarkdown(msg.content).slice(0, 90)}</span>
                           </div>
                         )
                       })

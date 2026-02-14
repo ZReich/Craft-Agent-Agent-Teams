@@ -336,15 +336,15 @@ export interface QualityGateConfig {
   enabled: boolean;
   /** Minimum aggregate score to pass (default: 90) */
   passThreshold: number;
-  /** Maximum review cycles before escalation (default: 5) */
+  /** Maximum review cycles before escalation (default: 3) */
   maxReviewCycles: number;
   /** Whether to enforce test-driven development for feature tasks */
   enforceTDD: boolean;
-  /** Model ID for AI review stages (default: 'kimi-k2.5') */
+  /** Model ID for AI review stages (default: 'claude-opus-4-6') */
   reviewModel: string;
-  /** Provider for AI review stages (default: 'moonshot') */
+  /** Provider for AI review stages (default: 'anthropic') */
   reviewProvider: string;
-  /** Model ID for escalation (default: 'claude-sonnet-4-5-20250929') */
+  /** Model ID for escalation (default: 'claude-opus-4-6') */
   escalationModel: string;
   /** Provider for escalation (default: 'anthropic') */
   escalationProvider: string;
@@ -366,12 +366,6 @@ export const CODE_TASK_TYPES: ReadonlySet<TaskType> = new Set(['feature', 'bugfi
 
 /** Task types that are non-code (research, planning, etc.) and should skip quality gates */
 export const NON_CODE_TASK_TYPES: ReadonlySet<TaskType> = new Set(['research', 'planning', 'search', 'explore', 'docs']);
-
-/** Check whether a task type should skip quality gates */
-export function shouldSkipQualityGates(taskType: TaskType | undefined): boolean {
-  if (!taskType) return false; // Default: run gates (backwards-compatible)
-  return NON_CODE_TASK_TYPES.has(taskType);
-}
 
 /** TDD phase state machine */
 export type TDDPhase = 'test-writing' | 'implementing' | 'review';

@@ -1873,6 +1873,9 @@ export function SessionList({
                 <div key={group.date.toISOString()}>
                   <SessionListSectionHeader label={group.label} />
                   {group.sessions.map((item, indexInGroup) => {
+                    // Defense-in-depth: hide worker/reviewer sessions that escaped team containment
+                    if (item.teammateRole === 'worker' || item.teammateRole === 'reviewer') return null
+
                     // Skip teammates only when their parent is visible on this page.
                     // If parent is outside pagination, render teammate normally so it
                     // doesn't disappear until more items are loaded.

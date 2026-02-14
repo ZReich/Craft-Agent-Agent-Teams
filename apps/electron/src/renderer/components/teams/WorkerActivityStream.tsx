@@ -25,6 +25,7 @@ import {
 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
+import { Markdown } from '@/components/markdown'
 import { useScrollAnchor } from '@/hooks/useScrollAnchor'
 import type { TeammateMessage } from '../../../shared/types'
 import type { ToolActivity } from './ToolActivityIndicator'
@@ -195,9 +196,9 @@ function MessageEntry({ message, teammateName }: { message: TeammateMessage; tea
             {new Date(message.timestamp).toLocaleTimeString()}
           </span>
         </div>
-        <p className={cn('whitespace-pre-wrap', isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>
-          {message.content}
-        </p>
+        <div className={cn(isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>
+          <Markdown mode="full">{message.content}</Markdown>
+        </div>
       </div>
     </div>
   )

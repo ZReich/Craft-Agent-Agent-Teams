@@ -27,8 +27,8 @@ import {
   formatSuccessReport,
   mergeQualityGateConfig,
   inferTaskType,
+  shouldSkipQualityGates,
 } from './quality-gates';
-import { shouldSkipQualityGates } from '@craft-agent/core/types';
 
 // ============================================================
 // Types

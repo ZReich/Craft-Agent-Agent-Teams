@@ -1,4 +1,4 @@
-import { app } from 'electron'
+﻿import { app } from 'electron'
 import * as Sentry from '@sentry/electron/main'
 import { basename, join } from 'path'
 import { homedir } from 'os'
@@ -81,9 +81,10 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, type SessionProcessReapOptions, type SessionProcessReapReport, type SessionProcessCandidate, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment } from '@craft-agent/core/types'
+import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, TeamTask, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment, YoloStateChangedEvent } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
-import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
+import { mergeQualityGateConfig, inferTaskType, shouldSkipQualityGates } from '@craft-agent/shared/agent-teams/quality-gates'
+import { IntegrationGate } from '@craft-agent/shared/agent-teams/integration-gate'
 import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/diff-collector'
 import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
@@ -103,6 +104,7 @@ import { UsagePersistence, UsageAlertChecker } from '@craft-agent/shared/usage'
 import type { SessionUsage as PersistedSessionUsage, UsageAlert, UsageAlertThresholds } from '@craft-agent/core'
 import type { FSWatcher } from 'fs'
 import { HookSystem, type HookSystemMetadataSnapshot } from '@craft-agent/shared/hooks-simple'
+import { AgentTeamCompletionCoordinator, type AgentTeamCompletionContext } from './agent-team-completion-coordinator'
 
 // Import and re-export (extracted to avoid Electron dependency in tests)
 import { sanitizeForTitle } from './title-sanitizer'
@@ -110,7 +112,7 @@ export { sanitizeForTitle }
 
 /**
  * Resolve the usage provider from a connection's providerType and model.
- * Replaces repeated nested ternary: openai → 'openai', openai_compat → infer from model, else → 'anthropic'.
+ * Replaces repeated nested ternary: openai -> 'openai', openai_compat -> infer from model, else -> 'anthropic'.
  */
 function resolveUsageProvider(providerType: string | undefined, model: string | undefined): UsageProvider {
   switch (providerType) {
@@ -221,11 +223,25 @@ function resolveConnectionForModel(options: {
 }
 
 const VALID_TEAM_ROLES: ReadonlySet<TeamRole> = new Set(['lead', 'head', 'worker', 'reviewer', 'escalation'])
+const TEAM_ROLE_HEAD: TeamRole = 'head'
+const TEAM_ROLE_ESCALATION: TeamRole = 'escalation'
+const TEAM_ROLE_WORKER: TeamRole = 'worker'
+const TEAM_ROLE_REVIEWER: TeamRole = 'reviewer'
 
-function normalizeTeamRole(rawRole?: string): TeamRole {
-  if (!rawRole) return 'worker'
-  if (VALID_TEAM_ROLES.has(rawRole as TeamRole)) return rawRole as TeamRole
-  return 'worker'
+function toValidatedTeamRole(rawRole?: string): TeamRole | null {
+  if (!rawRole) return null
+  return VALID_TEAM_ROLES.has(rawRole as TeamRole) ? (rawRole as TeamRole) : null
+}
+
+function inferTeamRoleFromName(teammateName?: string): TeamRole | null {
+  if (!teammateName) return null
+  // Infer from name prefix as fallback (e.g. "head-california" -> "head")
+  const prefix = teammateName.toLowerCase().split('-')[0]
+  return VALID_TEAM_ROLES.has(prefix as TeamRole) ? (prefix as TeamRole) : null
+}
+
+function normalizeTeamRole(rawRole?: string, teammateName?: string): TeamRole {
+  return toValidatedTeamRole(rawRole) ?? inferTeamRoleFromName(teammateName) ?? TEAM_ROLE_WORKER
 }
 
 // Codename generation functions moved to ./teammate-codenames.ts for testability
@@ -267,7 +283,7 @@ function qualityStageSummaryLines(result: QualityGateResult): string[] {
   for (const stageName of orderedStages) {
     const stage = result.stages[stageName]
     if (!stage) continue
-    const icon = stage.passed ? '✅' : '❌'
+    const icon = stage.passed ? '\u2705' : '\u274c'
     if (stageName === 'tests') {
       const tests = stage as typeof result.stages.tests
       lines.push(
@@ -286,7 +302,7 @@ function buildQualityLeadSummary(
   status: 'passed' | 'failed' | 'escalated',
 ): string {
   const statusLabel = status === 'passed' ? 'PASSED' : status === 'escalated' ? 'ESCALATED' : 'FAILED'
-  const icon = status === 'passed' ? '✅' : status === 'escalated' ? '🚨' : '⚠️'
+  const icon = status === 'passed' ? '\u2705' : status === 'escalated' ? '\ud83d\udea8' : '\u26a0\ufe0f'
   const lines = [
     `### ${icon} Quality Gate ${statusLabel}`,
     `Teammate: ${teammateName}`,
@@ -322,7 +338,7 @@ function formatHealthAlertMessage(issue: HealthIssue): string {
         ? 'RETRY STORM'
         : 'CONTEXT EXHAUSTION'
   return [
-    `### ⚠️ Team Health Alert (${typeLabel})`,
+    `### Ã¢Å¡Â Ã¯Â¸Â Team Health Alert (${typeLabel})`,
     `Teammate: ${issue.teammateName}`,
     `Issue: ${issue.details}`,
   ].join('\n')
@@ -330,7 +346,7 @@ function formatHealthAlertMessage(issue: HealthIssue): string {
 
 function formatHealthAlertSummaryMessage(issues: HealthIssue[]): string {
   if (issues.length === 0) {
-    return '### ⚠️ Team Health Summary\nNo active issues.'
+    return '### Ã¢Å¡Â Ã¯Â¸Â Team Health Summary\nNo active issues.'
   }
 
   type GroupKey = string
@@ -370,7 +386,7 @@ function formatHealthAlertSummaryMessage(issues: HealthIssue[]): string {
   )
 
   return [
-    `### ⚠️ Team Health Summary`,
+    `### Ã¢Å¡Â Ã¯Â¸Â Team Health Summary`,
     `Window issues: ${issues.length}`,
     ...lines,
   ].join('\n')
@@ -380,13 +396,7 @@ function buildTeamDeliveryMetadata(options: {
   outputPresent: boolean
   receiverId: string
 }): string {
-  return [
-    '### Delivery Metadata',
-    `- delivery_status: delivered`,
-    `- ack_received: true`,
-    `- receiver_id: ${options.receiverId}`,
-    `- output_present: ${options.outputPresent ? 'true' : 'false'}`,
-  ].join('\n')
+  return `<details><summary>Delivery details</summary>\n\nstatus: delivered | output: ${options.outputPresent ? 'present' : 'empty'}\n\n</details>`
 }
 
 // teammateMatchesTargetName moved to ./teammate-codenames.ts for testability
@@ -403,7 +413,7 @@ interface RuntimeProcessRow {
 
 function commandPreview(commandLine: string): string {
   const compact = commandLine.replace(/\s+/g, ' ').trim()
-  return compact.length > 220 ? `${compact.slice(0, 220)}…` : compact
+  return compact.length > 220 ? `${compact.slice(0, 220)}...` : compact
 }
 
 function extractSessionIdFromCommand(commandLine: string): string | undefined {
@@ -429,7 +439,7 @@ export const AGENT_FLAGS = {
   defaultModesEnabled: true,
 } as const
 
-/** Predefined team colors — high-contrast, accessible palette. Rotates by active team count. */
+/** Predefined team colors Ã¢â‚¬â€ high-contrast, accessible palette. Rotates by active team count. */
 const TEAM_COLORS = [
   '#7c3aed', // violet
   '#0891b2', // cyan
@@ -1008,7 +1018,7 @@ async function setupCodexSessionConfig(
 
 /**
  * Write bridge-config.json and credential cache files for Copilot API sources.
- * Mirrors the bridge setup in setupCodexSessionConfig() but without TOML generation —
+ * Mirrors the bridge setup in setupCodexSessionConfig() but without TOML generation Ã¢â‚¬â€
  * Copilot passes MCP config directly at session creation via buildMcpConfig().
  *
  * Called before setSourceServers() so the bridge MCP server subprocess can read them
@@ -1116,7 +1126,7 @@ function resolveToolDisplayMeta(
       let sourceSlug = serverSlug
 
       // Special case: api-bridge server embeds source slug in tool name as "api_{slug}"
-      // e.g., mcp__api-bridge__api_stripe → sourceSlug = "stripe"
+      // e.g., mcp__api-bridge__api_stripe Ã¢â€ â€™ sourceSlug = "stripe"
       if (sourceSlug === 'api-bridge' && toolSlug.startsWith('api_')) {
         sourceSlug = toolSlug.slice(4)
       }
@@ -1347,8 +1357,11 @@ interface ManagedSession {
   teamId?: string
   isTeamLead?: boolean
   teammateName?: string
+  teammateRole?: TeamRole
   teammateSessionIds?: string[]
   teamColor?: string
+  /** Re-entry guard: prevents team-level QG from firing multiple times */
+  teamLevelQgRunning?: boolean
   // SDD fields
   sddEnabled?: boolean
   activeSpecId?: string
@@ -1553,8 +1566,10 @@ export class SessionManager {
   // Quality gate runner (lazy-initialized) and cycle tracking
   private qualityGateRunner: QualityGateRunner | null = null
   private qualityGateCycles: Map<string, number> = new Map()
+  private readonly agentTeamCompletionContext: AgentTeamCompletionContext = this.createAgentTeamCompletionContext()
+  private readonly agentTeamCompletionCoordinator = new AgentTeamCompletionCoordinator(this.agentTeamCompletionContext)
 
-  // Teammate health monitor — detects stalls, error loops, retry storms
+  // Teammate health monitor -> detects stalls, error loops, retry storms
   private healthMonitor = new TeammateHealthMonitor()
   private healthMonitorTeams = new Set<string>() // teams with active monitoring
   private teamStatusIntervals = new Map<string, NodeJS.Timeout>() // periodic status checks
@@ -1594,6 +1609,42 @@ export class SessionManager {
       })
     }
     return this.qualityGateRunner
+  }
+
+  private createAgentTeamCompletionContext(): AgentTeamCompletionContext {
+    return {
+      sessions: {
+        getById: (sessionId: string) => this.sessions.get(sessionId),
+      },
+      teammate: {
+        updateTaskStatus: this.updateTeammateTasks.bind(this),
+        autoArchiveCompletedSession: this.autoArchiveCompletedTeammateSession.bind(this),
+        getQualityGateSkipReason: (managed) => this.getQualityGateSkipReason(managed as ManagedSession),
+      },
+      messaging: {
+        sendToSession: this.sendMessage.bind(this),
+        clearLeadTeamState: (lead) => {
+          if (lead.agent instanceof CraftAgent) {
+            lead.agent.clearTeamState()
+          }
+        },
+        buildTeamDeliveryMetadata,
+      },
+      quality: {
+        getRunner: this.getQualityGateRunner.bind(this),
+        cycles: this.qualityGateCycles,
+        resolveReviewInput: resolveQualityGateReviewInput,
+        buildLeadSummary: buildQualityLeadSummary,
+        buildWorkerFeedback: buildWorkerQualityFeedback,
+        formatPercentScore,
+      },
+      team: {
+        resolveTeamId: teamManager.resolveTeamId.bind(teamManager),
+        getTeamSpec: teamManager.getTeamSpec.bind(teamManager),
+        storeQualityResult: teamManager.storeQualityResult.bind(teamManager),
+        logActivity: teamManager.logActivity.bind(teamManager),
+      },
+    }
   }
 
   /**
@@ -1679,7 +1730,7 @@ export class SessionManager {
 
       const lead = this.sessions.get(leadSessionId)
       if (!lead || !lead.isTeamLead) {
-        // Lead gone — stop periodic checks
+        // Lead gone Ã¢â‚¬â€ stop periodic checks
         clearInterval(statusInterval)
         this.teamStatusIntervals.delete(teamId)
         return
@@ -1900,7 +1951,7 @@ export class SessionManager {
       .map(stage => {
         const stageResult = result.stages[stage]
         if (!stageResult) return null
-        const status = stageResult.passed ? '✅' : '❌'
+        const status = stageResult.passed ? '\u2705' : '\u274c'
         return `- ${status} **${labelFor(stage)}:** ${Math.round(stageResult.score)}%`
       })
       .filter((line): line is string => Boolean(line))
@@ -1908,7 +1959,7 @@ export class SessionManager {
     return [
       `### Quality Gate`,
       ``,
-      `**Overall:** ${result.passed ? '✅ PASS' : '❌ FAIL'} · **Score:** ${Math.round(result.aggregateScore)}% · **Cycle:** ${result.cycleCount ?? 1}/${result.maxCycles ?? 1}`,
+      `**Overall:** ${result.passed ? '\u2705 PASS' : '\u274c FAIL'} | **Score:** ${Math.round(result.aggregateScore)}% | **Cycle:** ${result.cycleCount ?? 1}/${result.maxCycles ?? 1}`,
       ``,
       ...stageLines,
     ].join('\n')
@@ -1928,7 +1979,7 @@ export class SessionManager {
 
     const reviewLoop = teamManager.getReviewLoop()
     if (!reviewLoop) {
-      sessionLog.warn('[YOLO] Cannot start YOLO — no review loop attached')
+      sessionLog.warn('[YOLO] Cannot start YOLO Ã¢â‚¬â€ no review loop attached')
       return null
     }
 
@@ -1937,7 +1988,7 @@ export class SessionManager {
         // Instruct the lead to generate a spec by sending a structured message
         await this.sendMessage(leadSessionId,
           `[YOLO] Generate a specification for the following objective. Output a structured spec with requirements, risks, and acceptance tests.\n\nObjective: ${objective}`)
-        // Poll for the spec — the lead processes the message asynchronously
+        // Poll for the spec Ã¢â‚¬â€ the lead processes the message asynchronously
         const MAX_SPEC_WAIT_MS = 5 * 60 * 1000 // 5 minutes
         const SPEC_POLL_MS = 2000
         const specStart = Date.now()
@@ -1960,45 +2011,42 @@ export class SessionManager {
       },
 
       spawnAndAssign: async (_teamId: string, taskIds: string[]) => {
-        const tasks = teamManager.getTasks(_teamId)
-        // Resolve the worker model from presets instead of using the lead's model
-        const workerAssignment = resolveTeamModelForRole(wsConfig, 'worker', undefined, lead.model)
-        const workerModel = workerAssignment.model !== 'unknown' ? workerAssignment.model : lead.model
-        for (const taskId of taskIds) {
-          const task = tasks.find(t => t.id === taskId)
-          if (!task) continue
-          try {
-            const teammateSession = await this.createTeammateSession({
-              parentSessionId: leadSessionId,
-              workspaceId: lead.workspace.id,
-              teamId: _teamId,
-              teammateName: `worker-${taskId.slice(-6)}`,
-              prompt: task.description || task.title,
-              model: workerModel,
-            })
-            // Assign the task to the spawned teammate
-            const team = teamManager.getTeam(_teamId)
-            const teammate = team?.members.find(m => m.sessionId === teammateSession.id)
-            if (teammate) {
-              teamManager.assignTask(_teamId, taskId, teammate.id)
-            }
-          } catch (err) {
-            sessionLog.error(`[YOLO] Failed to spawn teammate for task ${taskId}:`, err)
-          }
-        }
+        await this.spawnYoloHeadsByPhase({
+          teamId: _teamId,
+          leadSessionId,
+          workspaceId: lead.workspace.id,
+          fallbackModel: lead.model || 'claude-opus-4-6',
+          wsConfig,
+          taskIds,
+        })
       },
 
       runIntegrationCheck: async (_teamId: string) => {
         try {
-          const runner = this.getQualityGateRunner()
-          const syntaxResult = await runner.runSyntaxCheck(workingDirectory)
-          const testResult = await runner.runTestExecution(workingDirectory)
+          const gate = new IntegrationGate({
+            workingDirectory: workingDirectory,
+            typeCheckTimeoutMs: 60000,
+            testSuiteTimeoutMs: 180000,
+            skipTests: false,
+          })
+          const result = await gate.runCheck()
           const issues: string[] = [
-            ...syntaxResult.issues,
-            ...testResult.issues,
+            ...result.typeCheck.errors,
+            ...result.testSuite.failedTests,
           ]
+          if (result.conflicts.hasConflicts) {
+            issues.push(`Git merge conflicts in: ${result.conflicts.conflictFiles.join(', ')}`)
+          }
+          // Wiring verification: warn about new files not connected to the project
+          if (result.wiring && !result.wiring.passed) {
+            issues.push(
+              `WIRING WARNING: ${result.wiring.unwiredFiles.length} new file(s) are not imported anywhere in the project:`,
+              ...result.wiring.unwiredFiles.map(f => `  - ${f} (not imported by any existing code)`),
+              'These files may be built correctly but are not connected to the application.',
+            )
+          }
           return {
-            passed: syntaxResult.passed && testResult.passed,
+            passed: result.passed,
             issues,
           }
         } catch (err) {
@@ -2026,7 +2074,7 @@ export class SessionManager {
         // Also broadcast as a team event for the dashboard hook
         if (this.windowManager) {
           const phases = teamManager.getTeamPhases(_teamId)
-          const envelope: import('@craft-agent/core/types').YoloStateChangedEvent = {
+          const envelope: YoloStateChangedEvent = {
             type: 'yolo:state_changed',
             teamId: _teamId,
             payload: { state, phases: phases.length > 0 ? phases : undefined },
@@ -2042,6 +2090,175 @@ export class SessionManager {
 
     sessionLog.info(`[YOLO] Orchestrator created for team ${teamId} (mode: ${yoloConfig.mode})`)
     return orchestrator
+  }
+
+  private resolveRoleModel(
+    wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined,
+    role: TeamRole,
+    fallbackModel: string,
+  ): string {
+    const assignment = resolveTeamModelForRole(wsConfig, role, undefined, fallbackModel)
+    return assignment.model !== 'unknown' ? assignment.model : fallbackModel
+  }
+
+  private groupTasksByPhase(tasks: TeamTask[], taskIds: string[]): Map<string, string[]> {
+    const taskMap = new Map(tasks.map(task => [task.id, task]))
+    const grouped = new Map<string, string[]>()
+
+    for (const taskId of taskIds) {
+      const task = taskMap.get(taskId)
+      if (!task) continue
+      const phase = task.phase || 'default'
+      const ids = grouped.get(phase) ?? []
+      ids.push(taskId)
+      grouped.set(phase, ids)
+    }
+    return grouped
+  }
+
+  private buildPhaseTaskSelection(tasks: TeamTask[], taskIds: string[]): TeamTask[] {
+    const taskById = new Map(tasks.map(task => [task.id, task]))
+    return taskIds.map(taskId => taskById.get(taskId)).filter((task): task is TeamTask => Boolean(task))
+  }
+
+  private buildHeadSpecSection(teamSpec: Spec | undefined, phaseTasks: TeamTask[]): string {
+    if (!teamSpec) return ''
+
+    const reqIds = new Set<string>()
+    for (const task of phaseTasks) {
+      for (const reqId of task.requirementIds ?? []) reqIds.add(reqId)
+    }
+
+    const relevantReqs = teamSpec.requirements.filter(req => reqIds.has(req.id))
+    if (relevantReqs.length === 0) return ''
+
+    const requirementLines = relevantReqs.map(req => {
+      const acceptance = req.acceptanceTests.length
+        ? req.acceptanceTests.map(test => `- ${test}`).join('\n')
+        : '- (no acceptance criteria defined)'
+      const definitionOfDone = req.acceptanceTests.length
+        ? req.acceptanceTests.map(test => `- [ ] ${test}`).join('\n')
+        : '- [ ] Define concrete deliverables for this requirement'
+
+      return [
+        `Requirement ${req.id} [${req.priority}]: ${req.description}`,
+        'Acceptance criteria:',
+        acceptance,
+        'Definition of done:',
+        definitionOfDone,
+      ].join('\n')
+    }).join('\n\n')
+
+    return [
+      '',
+      'SPEC REQUIREMENTS ASSIGNED TO YOU',
+      requirementLines,
+      '',
+      'GUARD ROLE: verify every Definition of Done checkbox before marking a requirement as done.',
+      'Include REQUIREMENT COVERAGE and Definition of Done verification in your final message to the lead.',
+    ].join('\n')
+  }
+
+  private buildHeadPrompt(params: {
+    workerModel: string
+    reviewerModel: string
+    phaseTasks: TeamTask[]
+    specSection: string
+  }): string {
+    const { workerModel, reviewerModel, phaseTasks, specSection } = params
+    const taskLines = phaseTasks.map(task => `- ${task.title}: ${task.description || ''}`).join('\n')
+
+    return [
+      `You are a Head agent. Coordinate these tasks using Worker subagents (model="${workerModel}") and Reviewer subagents (model="${reviewerModel}").`,
+      '',
+      'TASKS ASSIGNED',
+      taskLines || '- No tasks provided',
+      specSection,
+      '',
+      'SPAWNING RULES',
+      '- Spawn Workers as subagents (Task without team_name).',
+      '- Spawn Reviewers as subagents (Task without team_name).',
+      '- Workers must follow TDD: tests first, implementation second, then run tests.',
+      '- Pass acceptance criteria and Definition of Done items to each Worker.',
+      '- Verify every Definition of Done item before review.',
+      '- After Worker completion, run Reviewer quality scoring.',
+      '- If any review stage is below 90, rerun the Worker with feedback (max 3 retries).',
+      '- Send final results with requirement coverage and Definition of Done verification to team-lead.',
+    ].join('\n')
+  }
+
+  private async spawnYoloHeadsByPhase(params: {
+    teamId: string
+    leadSessionId: string
+    workspaceId: string
+    fallbackModel: string
+    wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined
+    taskIds: string[]
+  }): Promise<void> {
+    const { teamId, leadSessionId, workspaceId, fallbackModel, wsConfig, taskIds } = params
+    const tasks = teamManager.getTasks(teamId)
+    const teamSpec = teamManager.getTeamSpec(teamId)
+    const tasksByPhase = this.groupTasksByPhase(tasks, taskIds)
+
+    const headModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_HEAD, fallbackModel)
+    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel)
+    const reviewerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_REVIEWER, fallbackModel)
+
+    const phasePlans = [...tasksByPhase.entries()].map(([phase, phaseTaskIds]) => {
+      const phaseTasks = this.buildPhaseTaskSelection(tasks, phaseTaskIds)
+      const specSection = this.buildHeadSpecSection(teamSpec, phaseTasks)
+      const prompt = this.buildHeadPrompt({ workerModel, reviewerModel, phaseTasks, specSection })
+      return { phase, phaseTaskIds, prompt }
+    })
+
+    for (const phasePlan of phasePlans) {
+      try {
+        const headSession = await this.createHeadForPhase({
+          parentSessionId: leadSessionId,
+          workspaceId,
+          teamId,
+          phase: phasePlan.phase,
+          model: headModel,
+          prompt: phasePlan.prompt,
+        })
+
+        this.assignTasksToSessionMember(teamId, headSession.id, phasePlan.phaseTaskIds)
+      } catch (err) {
+        sessionLog.error(`[YOLO] Failed to spawn head for phase ${phasePlan.phase}:`, err)
+      }
+    }
+  }
+
+  private async createHeadForPhase(params: {
+    parentSessionId: string
+    workspaceId: string
+    teamId: string
+    phase: string
+    model: string
+    prompt: string
+  }): Promise<import('../shared/types').Session> {
+    return this.createTeammateSession({
+      parentSessionId: params.parentSessionId,
+      workspaceId: params.workspaceId,
+      teamId: params.teamId,
+      teammateName: `head-${params.phase}`,
+      role: TEAM_ROLE_HEAD,
+      model: params.model,
+      prompt: params.prompt,
+    })
+  }
+
+  private assignTasksToSessionMember(teamId: string, sessionId: string, taskIds: string[]): void {
+    const team = teamManager.getTeam(teamId)
+    const member = team?.members.find(entry => entry.sessionId === sessionId)
+    if (!member) {
+      sessionLog.warn(`[AgentTeams] Could not assign ${taskIds.length} task(s): member for session ${sessionId} not found in team ${teamId}`)
+      return
+    }
+
+    for (const taskId of taskIds) {
+      teamManager.assignTask(teamId, taskId, member.id)
+    }
   }
 
   private deriveYoloObjectiveFromLead(managed: ManagedSession, fallbackTeamName?: string): string {
@@ -2436,7 +2653,7 @@ export class SessionManager {
         const managed = this.sessions.get(sessionId)
         if (!managed) return
 
-        // Skip if session is currently processing — in-memory state is authoritative during streaming
+        // Skip if session is currently processing Ã¢â‚¬â€ in-memory state is authoritative during streaming
         if (managed.isProcessing) return
 
         let changed = false
@@ -2641,7 +2858,7 @@ export class SessionManager {
    * SECURITY NOTE: These env vars are propagated to the SDK subprocess via options.ts.
    * Bun's automatic .env loading is disabled in the subprocess (--env-file=/dev/null)
    * to prevent a user's project .env from injecting ANTHROPIC_API_KEY and overriding
-   * OAuth auth — Claude Code prioritizes API key over OAuth token when both are set.
+   * OAuth auth Ã¢â‚¬â€ Claude Code prioritizes API key over OAuth token when both are set.
    * See: https://github.com/lukilabs/craft-agents-oss/issues/39
    */
   /**
@@ -2760,7 +2977,7 @@ export class SessionManager {
       this.copilotCliPath = copilotPath
       sessionLog.info('Resolved Copilot CLI path:', copilotPath)
     } else {
-      sessionLog.warn('Copilot CLI not found — Copilot sessions will try SDK default resolution')
+      sessionLog.warn('Copilot CLI not found Ã¢â‚¬â€ Copilot sessions will try SDK default resolution')
     }
 
     // Set path to fetch interceptor for SDK subprocess
@@ -2785,7 +3002,7 @@ export class SessionManager {
     // Use bundled Bun binary (packaged app) or system bun.exe (dev mode)
     // Resolve Copilot network interceptor (loaded via NODE_OPTIONS="--require ..." into Copilot CLI subprocess)
     // Must be bundled CJS since it runs under Electron's Node.js, not Bun
-    // Built by `bun run build:copilot-interceptor` → apps/electron/dist/copilot-interceptor.cjs
+    // Built by `bun run build:copilot-interceptor` Ã¢â€ â€™ apps/electron/dist/copilot-interceptor.cjs
     // In dev: basePath is monorepo root, so add apps/electron/ prefix
     // In packaged: basePath is the app dir, dist/ is directly inside
     let copilotInterceptorPath = join(basePath, 'dist', 'copilot-interceptor.cjs')
@@ -2796,7 +3013,7 @@ export class SessionManager {
       this.copilotInterceptorPath = copilotInterceptorPath
       sessionLog.info('Resolved Copilot interceptor path:', copilotInterceptorPath)
     } else {
-      sessionLog.warn('Copilot network interceptor not found — run `bun run build:copilot-interceptor` in apps/electron/')
+      sessionLog.warn('Copilot network interceptor not found Ã¢â‚¬â€ run `bun run build:copilot-interceptor` in apps/electron/')
     }
 
     // In packaged app: use bundled Bun binary
@@ -2892,6 +3109,7 @@ export class SessionManager {
             isTeamLead: meta.isTeamLead,
             parentSessionId: meta.parentSessionId,
             teammateName: meta.teammateName,
+            teammateRole: meta.teammateRole as TeamRole | undefined,
             teammateSessionIds: meta.teammateSessionIds,
             teamColor: meta.teamColor,
             sddEnabled: meta.sddEnabled,
@@ -3060,6 +3278,7 @@ export class SessionManager {
         isTeamLead: managed.isTeamLead,
         parentSessionId: managed.parentSessionId,
         teammateName: managed.teammateName,
+        teammateRole: managed.teammateRole,
         teammateSessionIds: managed.teammateSessionIds,
         teamColor: managed.teamColor,
         sddEnabled: managed.sddEnabled,
@@ -3853,7 +4072,7 @@ export class SessionManager {
     const defaultModel = wsConfig?.defaults?.model
     // Get default SDD mode from workspace config
     const defaultSddEnabled = options?.sddEnabled ?? wsConfig?.sdd?.sddEnabled ?? false
-    const defaultSpecId = options?.activeSpecId
+    const defaultSpecId = options?.activeSpecId ?? wsConfig?.sdd?.activeSpecId
     // Get default enabled sources from workspace config
     const defaultEnabledSourceSlugs = options?.enabledSourceSlugs ?? wsConfig?.defaults?.enabledSourceSlugs
 
@@ -3884,6 +4103,7 @@ export class SessionManager {
       isTeamLead: options?.isTeamLead,
       parentSessionId: options?.parentSessionId,
       teammateName: options?.teammateName,
+      teammateRole: options?.teammateRole,
       teamColor: options?.teamColor,
     })
 
@@ -3919,7 +4139,7 @@ export class SessionManager {
 
     // Log mini agent session creation
     if (options?.systemPromptPreset === 'mini' || options?.model) {
-      sessionLog.info(`🤖 Creating mini agent session: model=${resolvedModel}, systemPromptPreset=${options?.systemPromptPreset}`)
+      sessionLog.info(`Creating mini agent session: model=${resolvedModel}, systemPromptPreset=${options?.systemPromptPreset}`)
     }
 
     const managed: ManagedSession = {
@@ -3956,6 +4176,7 @@ export class SessionManager {
       isTeamLead: options?.isTeamLead,
       parentSessionId: options?.parentSessionId,
       teammateName: options?.teammateName,
+      teammateRole: options?.teammateRole as TeamRole | undefined,
       teamColor: options?.teamColor,
       sddEnabled: defaultSddEnabled,
       activeSpecId: defaultSpecId,
@@ -4103,7 +4324,7 @@ export class SessionManager {
     if (parent.sddEnabled && !parent.activeSpecId) {
       throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
     }
-    const teammateRole = normalizeTeamRole(params.role)
+    const teammateRole = normalizeTeamRole(params.role, params.teammateName)
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
     const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
     // Implements REQ-002: Use witty codename as primary name, honor explicit custom names
@@ -4113,6 +4334,20 @@ export class SessionManager {
 
     if (params.role && params.role !== teammateRole) {
       sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested; defaulting to "${teammateRole}"`)
+    }
+    // Warn when no role was provided - indicates the Lead may be skipping the Head layer
+    if (!params.role) {
+      sessionLog.warn(
+        `[AgentTeams] Teammate "${params.teammateName || '(auto)'}" spawned without explicit role - defaulted to "worker". ` +
+        `The Lead should specify role="head" for coordinators or role="escalation" for escalation agents.`
+      )
+    }
+    // Warn when a worker is explicitly spawned as a teammate - workers should be subagents inside Heads
+    if (teammateRole === TEAM_ROLE_WORKER && params.role === TEAM_ROLE_WORKER) {
+      sessionLog.info(
+        `[AgentTeams] Worker "${params.teammateName || '(auto)'}" spawned directly as teammate. ` +
+        `Workers should normally be subagents inside a Head's context, not separate teammates.`
+      )
     }
     if (isAutoGenerated) {
       sessionLog.info(`[AgentTeams] No teammate name provided; generated codename: ${teammateCodename}`)
@@ -4270,7 +4505,7 @@ export class SessionManager {
   }
 
   /**
-   * Clean up an agent team — interrupt all running teammates and clear team state.
+   * Clean up an agent team Ã¢â‚¬â€ interrupt all running teammates and clear team state.
    */
   async cleanupTeam(leadSessionId: string): Promise<void> {
     const lead = this.sessions.get(leadSessionId)
@@ -4325,7 +4560,7 @@ export class SessionManager {
       ?? globalDefaults.workspaceDefaults.permissionMode
     const defaultThinkingLevel = wsConfig?.defaults?.thinkingLevel ?? globalDefaults.workspaceDefaults.thinkingLevel
     const defaultSddEnabled = options?.sddEnabled ?? wsConfig?.sdd?.sddEnabled ?? false
-    const defaultSpecId = options?.activeSpecId
+    const defaultSpecId = options?.activeSpecId ?? wsConfig?.sdd?.activeSpecId
 
     const managed: ManagedSession = {
       id: storedSession.id,
@@ -4611,7 +4846,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              role: (params.role as TeamRole | undefined) ?? 'worker',
+              role: (params.role as TeamRole | undefined) ?? TEAM_ROLE_WORKER,
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -4733,8 +4968,8 @@ export class SessionManager {
         const codexAuthType = connection?.authType || authType
 
         // Determine auth method based on connection authType
-        // - 'oauth' → ChatGPT Plus OAuth tokens
-        // - 'api_key' or 'api_key_with_endpoint' → OpenAI API key
+        // - 'oauth' Ã¢â€ â€™ ChatGPT Plus OAuth tokens
+        // - 'api_key' or 'api_key_with_endpoint' Ã¢â€ â€™ OpenAI API key
         const useApiKey = codexAuthType === 'api_key' || codexAuthType === 'api_key_with_endpoint'
 
         if (useApiKey) {
@@ -4748,7 +4983,7 @@ export class SessionManager {
             this.sendEvent({
               type: 'info',
               sessionId: managed.id,
-              message: 'No OpenAI API key available. Please configure your API key in Settings → AI.',
+              message: 'No OpenAI API key available. Please configure your API key in Settings Ã¢â€ â€™ AI.',
               level: 'error',
             }, managed.workspace.id)
           }
@@ -4776,7 +5011,7 @@ export class SessionManager {
             this.sendEvent({
               type: 'info',
               sessionId: managed.id,
-              message: 'No ChatGPT tokens available. Please check your Codex login in Settings → AI.',
+              message: 'No ChatGPT tokens available. Please check your Codex login in Settings Ã¢â€ â€™ AI.',
               level: 'error',
             }, managed.workspace.id)
           }
@@ -4977,7 +5212,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              role: (params.role as TeamRole | undefined) ?? 'worker',
+              role: (params.role as TeamRole | undefined) ?? TEAM_ROLE_WORKER,
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -6286,7 +6521,7 @@ export class SessionManager {
         sessionLog.info(`Refreshed title for session ${sessionId}: "${title}"`)
         return { success: true, title }
       }
-      // AI title generation failed — fall back to extractive title from user messages
+      // AI title generation failed Ã¢â‚¬â€ fall back to extractive title from user messages
       sessionLog.info(`refreshTitle: AI title generation returned null, using extractive fallback`)
       const lastUserMsg = userMessages[userMessages.length - 1] || ''
       const cleanMsg = lastUserMsg.replace(/[\n\r]+/g, ' ').replace(/\s+/g, ' ').trim()
@@ -6307,7 +6542,7 @@ export class SessionManager {
         sessionLog.info(`Refreshed title for session ${sessionId} (fallback): "${fallbackTitle}"`)
         return { success: true, title: fallbackTitle }
       }
-      // No usable content — clear regenerating state
+      // No usable content Ã¢â‚¬â€ clear regenerating state
       this.sendEvent({ type: 'title_regenerating', sessionId, isRegenerating: false }, managed.workspace.id)
       return { success: false, error: 'Failed to generate title' }
     } catch (error) {
@@ -6526,7 +6761,7 @@ export class SessionManager {
 
     // If currently processing, queue the message and interrupt via forceAbort.
     // The abort throws an AbortError (caught in the catch block) which calls
-    // onProcessingStopped → processNextQueuedMessage to drain the queue.
+    // onProcessingStopped Ã¢â€ â€™ processNextQueuedMessage to drain the queue.
     if (managed.isProcessing) {
       sessionLog.info(`Session ${sessionId} is processing, queueing message and interrupting`)
 
@@ -6556,7 +6791,7 @@ export class SessionManager {
       }, managed.workspace.id)
 
       // Force-abort via Query.close() - immediately stops processing.
-      // The for-await loop will complete, triggering onProcessingStopped → queue drain.
+      // The for-await loop will complete, triggering onProcessingStopped Ã¢â€ â€™ queue drain.
       managed.agent?.forceAbort(AbortReason.Redirect)
 
       return
@@ -6611,7 +6846,7 @@ export class SessionManager {
         }
         // Sanitize: strip any remaining bracket mentions, XML blocks, tags
         const sanitized = sanitizeForTitle(titleSource)
-        const initialTitle = sanitized.slice(0, 50) + (sanitized.length > 50 ? '…' : '')
+        const initialTitle = sanitized.slice(0, 50) + (sanitized.length > 50 ? '...' : '')
         managed.name = initialTitle
         this.persistSession(managed)
         // Flush immediately so disk is authoritative before notifying renderer
@@ -7256,6 +7491,27 @@ export class SessionManager {
    * @param sessionId - The session that stopped processing
    * @param reason - Why processing stopped ('complete' | 'interrupted' | 'error')
    */
+  private getQualityGateSkipReason(managed: ManagedSession): string | null {
+    if (managed.teammateRole === TEAM_ROLE_HEAD || managed.teammateRole === TEAM_ROLE_ESCALATION) {
+      return `role=${managed.teammateRole} (team-level quality gate will run after all teammates complete)`
+    }
+
+    const inferredTaskType = inferTaskType(managed.name || '')
+    if (shouldSkipQualityGates(inferredTaskType)) {
+      return `taskType=${inferredTaskType} (non-code task)`
+    }
+
+    return null
+  }
+  private async handleAgentTeamCompletionOnStop(
+    managed: ManagedSession,
+    sessionId: string,
+    reason: 'complete' | 'interrupted' | 'error' | 'timeout'
+  ): Promise<void> {
+    await this.agentTeamCompletionCoordinator.handleAgentTeamCompletionOnStop(managed, sessionId, reason)
+  }
+
+
   private async onProcessingStopped(
     sessionId: string,
     reason: 'complete' | 'interrupted' | 'error' | 'timeout'
@@ -7343,314 +7599,7 @@ export class SessionManager {
       await this.setTodoState(sessionId, 'done')
     }
 
-    // 4. Agent Teams: When a teammate session completes, run quality gates then relay results
-    //    This MUST happen before step 5 (queue/complete) so the lead gets the message
-    //    while it's still alive and listening.
-    if (reason === 'complete' && managed.parentSessionId && managed.teammateName) {
-      const lead = this.sessions.get(managed.parentSessionId)
-        if (lead && lead.isTeamLead) {
-          const lastAssistantMsg = [...managed.messages].reverse().find(m =>
-            m.role === 'assistant' && !m.isIntermediate
-          )
-          // Implements REQ-002: explicit output semantics for teammate completion relay.
-          const outputPresent = Boolean(lastAssistantMsg?.content?.trim())
-          const resultContent = outputPresent
-            ? (lastAssistantMsg?.content ?? '')
-            : '_No assistant output captured from teammate session._'
-          const teammateName = managed.teammateName
-          const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId)
-          const deliveryMeta = buildTeamDeliveryMetadata({
-            outputPresent,
-            receiverId: managed.parentSessionId!,
-          })
-
-          // Load quality gate config from workspace
-          const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
-          const qgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
-          const clearLeadTeamState = (): void => {
-            if (lead.agent instanceof CraftAgent) {
-              lead.agent.clearTeamState()
-            }
-          }
-
-        // Run quality gate pipeline if enabled
-        if (qgConfig.enabled) {
-          sessionLog.info(`[AgentTeams] Running quality gate pipeline for teammate "${teammateName}"`)
-
-          const cycleKey = `${sessionId}-qg`
-          const currentCycle = (this.qualityGateCycles.get(cycleKey) || 0) + 1
-          this.qualityGateCycles.set(cycleKey, currentCycle)
-
-          const runner = this.getQualityGateRunner()
-          const taskContext: TaskContext = {
-            taskDescription: managed.name || 'Teammate task',
-            workingDirectory: managed.workingDirectory,
-          }
-
-          try {
-            const spec = managed.teamId ? teamManager.getTeamSpec(teamManager.resolveTeamId(managed.teamId)) : undefined
-            const reviewDiff = managed.workingDirectory
-              ? await DiffCollector.collectWorkingDiff(managed.workingDirectory)
-              : null
-            const reviewInput = resolveQualityGateReviewInput(reviewDiff)
-
-            if (!reviewInput.usesGitDiff) {
-              sessionLog.warn(`[AgentTeams] Quality gate blocked for "${teammateName}" due to missing diff evidence`)
-              if (currentCycle >= qgConfig.maxReviewCycles) {
-                this.qualityGateCycles.delete(cycleKey)
-                setTimeout(async () => {
-                  try {
-                    const relayMessage = [
-                      `## Team Result - ${teammateName}`,
-                      '',
-                      deliveryMeta,
-                      '',
-                      '### Quality Gate Escalated',
-                      `Cycle: ${currentCycle}/${qgConfig.maxReviewCycles}`,
-                      `Reason: ${reviewInput.failureReason}`,
-                      '',
-                      'Action required: ensure teammate changes are present in the git working tree before re-running quality gates.',
-                      '',
-                      '---',
-                      '',
-                      resultContent,
-                    ].join('\n')
-                    await this.sendMessage(managed.parentSessionId!, relayMessage)
-                    await this.autoArchiveCompletedTeammateSession(sessionId)
-                  } catch (err) {
-                    sessionLog.error(`[AgentTeams] Failed to relay missing-diff escalation from ${teammateName}:`, err)
-                  }
-                }, 200)
-              } else {
-                setTimeout(async () => {
-                  try {
-                    const feedbackMessage = [
-                      '## Quality Gate Feedback',
-                      `Cycle ${currentCycle}/${qgConfig.maxReviewCycles}`,
-                      '',
-                      'Your work did not pass quality checks.',
-                      '',
-                      `Blocking issue: ${reviewInput.failureReason}`,
-                      '',
-                      'Please make sure implementation changes are written to files in the working directory, then try again.',
-                    ].join('\n')
-                    await this.sendMessage(sessionId, feedbackMessage)
-                  } catch (err) {
-                    sessionLog.error(`[AgentTeams] Failed to send missing-diff feedback to ${teammateName}:`, err)
-                  }
-                }, 200)
-              }
-            }
-
-            if (reviewInput.usesGitDiff) {
-              const result = await runner.runProgressive(reviewInput.reviewInput, taskContext, qgConfig, spec)
-            result.cycleCount = currentCycle
-            result.maxCycles = qgConfig.maxReviewCycles
-
-            // Implements BUG-7: store quality gate result for dashboard access
-            teamManager.storeQualityResult(resolvedTeamId, managed.id, result)
-
-            if (result.passed) {
-              // PASSED — relay to lead with quality report
-              sessionLog.info(`[AgentTeams] Quality gate PASSED for "${teammateName}" (score: ${result.aggregateScore})`)
-              this.qualityGateCycles.delete(cycleKey) // Reset cycle counter
-
-              const successReport = formatSuccessReport(result)
-              const leadQualitySummary = buildQualityLeadSummary(teammateName, result, 'passed')
-              teamManager.logActivity(
-                resolvedTeamId,
-                'quality-gate-passed',
-                `Quality gate passed at ${formatPercentScore(result.aggregateScore)}`,
-                managed.id,
-                teammateName,
-              )
-              this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
-
-              setTimeout(async () => {
-                try {
-                  const relayMessage = [
-                    `## Team Result - ${teammateName}`,
-                    '',
-                    deliveryMeta,
-                    '',
-                    leadQualitySummary,
-                    '',
-                    successReport,
-                    '',
-                    '---',
-                    '',
-                    resultContent,
-                  ].join('\n')
-                  await this.sendMessage(managed.parentSessionId!, relayMessage)
-                  await this.autoArchiveCompletedTeammateSession(sessionId)
-
-                  // Check if ALL teammates are now done
-                  const allDone = (lead.teammateSessionIds || []).every(tid => {
-                    const t = this.sessions.get(tid)
-                    return t && !t.isProcessing
-                  })
-                  if (allDone) {
-                    sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
-                    clearLeadTeamState()
-                    setTimeout(async () => {
-                      try {
-                        await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
-                      } catch (err) {
-                        sessionLog.error('[AgentTeams] Failed to send synthesis prompt:', err)
-                      }
-                    }, 500)
-                  }
-                } catch (err) {
-                  sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, err)
-                }
-              }, 200)
-
-            } else if (currentCycle >= qgConfig.maxReviewCycles) {
-              // MAX CYCLES REACHED — escalate and relay with warning
-              sessionLog.warn(`[AgentTeams] Quality gate max cycles (${qgConfig.maxReviewCycles}) reached for "${teammateName}", escalating`)
-              this.qualityGateCycles.delete(cycleKey)
-
-              let escalationNote = ''
-              try {
-                escalationNote = await runner.escalate(result, resultContent, taskContext, qgConfig)
-                result.escalatedTo = qgConfig.escalationModel
-              } catch (err) {
-                sessionLog.error('[AgentTeams] Escalation failed:', err)
-                escalationNote = 'Escalation failed — manual review required.'
-              }
-
-              const failureReport = formatFailureReport(result, qgConfig)
-              const leadQualitySummary = buildQualityLeadSummary(teammateName, result, 'escalated')
-              teamManager.logActivity(
-                resolvedTeamId,
-                'escalation',
-                `Quality gate escalated at ${formatPercentScore(result.aggregateScore)} after ${currentCycle} cycles`,
-                managed.id,
-                teammateName,
-              )
-
-              setTimeout(async () => {
-                try {
-                  const relayMessage = [
-                    `## Team Result - ${teammateName}`,
-                    '',
-                    deliveryMeta,
-                    '',
-                    leadQualitySummary,
-                    '',
-                    failureReport,
-                    '',
-                    '**Escalation Diagnosis:**',
-                    escalationNote,
-                    '',
-                    '---',
-                    '',
-                    resultContent,
-                  ].join('\n')
-                  await this.sendMessage(managed.parentSessionId!, relayMessage)
-                  await this.autoArchiveCompletedTeammateSession(sessionId)
-                } catch (err) {
-                  sessionLog.error(`[AgentTeams] Failed to relay escalated results from ${teammateName}:`, err)
-                }
-              }, 200)
-
-            } else {
-              // FAILED — auto-cycle: send feedback back to teammate for fixes
-              sessionLog.info(`[AgentTeams] Quality gate FAILED for "${teammateName}" (score: ${result.aggregateScore}, cycle ${currentCycle}/${qgConfig.maxReviewCycles})`)
-
-              const failureReport = formatFailureReport(result, qgConfig)
-              const workerFeedbackSummary = buildWorkerQualityFeedback(result, qgConfig.maxReviewCycles)
-              teamManager.logActivity(
-                resolvedTeamId,
-                'quality-gate-failed',
-                `Quality gate failed at ${formatPercentScore(result.aggregateScore)} (cycle ${currentCycle}/${qgConfig.maxReviewCycles})`,
-                managed.id,
-                teammateName,
-              )
-
-              setTimeout(async () => {
-                try {
-                  const feedbackMessage = [
-                    workerFeedbackSummary,
-                    '',
-                    failureReport,
-                  ].join('\n')
-                  await this.sendMessage(sessionId, feedbackMessage)
-                  teamManager.logActivity(
-                    resolvedTeamId,
-                    'review-feedback-sent',
-                    `Quality feedback sent (cycle ${currentCycle}/${qgConfig.maxReviewCycles})`,
-                    managed.id,
-                    teammateName,
-                  )
-                } catch (err) {
-                  sessionLog.error(`[AgentTeams] Failed to send quality gate feedback to ${teammateName}:`, err)
-                }
-              }, 200)
-            }
-            }
-          } catch (err) {
-            // Quality gate pipeline itself errored — don't block relay, just warn
-            sessionLog.error(`[AgentTeams] Quality gate pipeline error for "${teammateName}":`, err)
-            this.qualityGateCycles.delete(cycleKey)
-
-            // Fallback: relay without quality report
-            setTimeout(async () => {
-              try {
-                const relayMessage = [
-                  `[Team Result] Teammate "${teammateName}" has completed their work (quality gate skipped due to error):`,
-                  '',
-                  deliveryMeta,
-                  '',
-                  resultContent,
-                ].join('\n')
-                await this.sendMessage(managed.parentSessionId!, relayMessage)
-                await this.autoArchiveCompletedTeammateSession(sessionId)
-              } catch (relayErr) {
-                sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, relayErr)
-              }
-            }, 200)
-          }
-        } else {
-          // Quality gates disabled — original behavior
-          sessionLog.info(`[AgentTeams] Relaying results from teammate "${teammateName}" back to lead ${managed.parentSessionId}`)
-          const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId!)
-          this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
-
-          setTimeout(async () => {
-            try {
-              const relayMessage = [
-                `[Team Result] Teammate "${teammateName}" has completed their work:`,
-                '',
-                deliveryMeta,
-                '',
-                resultContent,
-              ].join('\n')
-              await this.sendMessage(managed.parentSessionId!, relayMessage)
-              await this.autoArchiveCompletedTeammateSession(sessionId)
-
-              const allDone = (lead.teammateSessionIds || []).every(tid => {
-                const t = this.sessions.get(tid)
-                return t && !t.isProcessing
-              })
-               if (allDone) {
-                 sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
-                 clearLeadTeamState()
-                 setTimeout(async () => {
-                  try {
-                    await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
-                  } catch (err) {
-                    sessionLog.error('[AgentTeams] Failed to send synthesis prompt:', err)
-                  }
-                }, 500)
-              }
-            } catch (err) {
-              sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, err)
-            }
-          }, 200)
-        }
-      }
-    }
+    await this.handleAgentTeamCompletionOnStop(managed, sessionId, reason)
 
     const keepAliveForTeam = this.shouldDelayCompletionForAgentTeam(managed)
 
@@ -7701,7 +7650,7 @@ export class SessionManager {
     const next = managed.messageQueue.shift()!
     sessionLog.info(`Processing queued message for session ${sessionId}`)
 
-    // Update UI: queued → processing
+    // Update UI: queued Ã¢â€ â€™ processing
     if (next.messageId) {
       const existingMessage = managed.messages.find(m => m.id === next.messageId)
       if (existingMessage) {
@@ -7730,7 +7679,7 @@ export class SessionManager {
         next.messageId
       ).catch(err => {
         sessionLog.error('Error processing queued message:', err)
-        // Report queued message failures to Sentry — these indicate SDK/chat pipeline errors
+        // Report queued message failures to Sentry Ã¢â‚¬â€ these indicate SDK/chat pipeline errors
         Sentry.captureException(err, {
           tags: { errorSource: 'chat-queue', sessionId },
         })
@@ -8032,7 +7981,7 @@ export class SessionManager {
     } catch (error) {
       sessionLog.error(`Failed to generate title for session ${managed.id}:`, error)
 
-      // Surface quota/auth errors to the user — these indicate the main chat call will also fail
+      // Surface quota/auth errors to the user Ã¢â‚¬â€ these indicate the main chat call will also fail
       const errorMsg = error instanceof Error ? error.message : String(error)
       if (errorMsg.includes('quota') || errorMsg.includes('429') || errorMsg.includes('401') || errorMsg.includes('insufficient')) {
         this.sendEvent({
@@ -8255,7 +8204,7 @@ export class SessionManager {
         const existingStartMsg = managed.messages.find(m => m.toolUseId === event.toolUseId)
         const isDuplicateEvent = !!existingStartMsg
 
-        // Use parentToolUseId directly from the event — CraftAgent resolves this
+        // Use parentToolUseId directly from the event Ã¢â‚¬â€ CraftAgent resolves this
         // from SDK's parent_tool_use_id (authoritative, handles parallel Tasks correctly).
         // No stack or map needed; the event carries the correct parent from the start.
         const parentToolUseId = event.parentToolUseId
@@ -8358,7 +8307,7 @@ export class SessionManager {
             existingToolMsg.parentToolUseId = event.parentToolUseId
           }
         } else {
-          // No matching tool_start found — create message from result.
+          // No matching tool_start found Ã¢â‚¬â€ create message from result.
           // This is normal for background subagent child tools where tool_result arrives
           // without a prior tool_start. If tool_start arrives later, findToolMessage will
           // locate this message by toolUseId and update it with input/intent/displayMeta.
@@ -8686,7 +8635,7 @@ export class SessionManager {
             } catch (retryError) {
               managed.authRetryInProgress = false
               sessionLog.error(`[auth-retry] Failed to retry after auth refresh for session ${sessionId}:`, retryError)
-              // Report auth retry failures to Sentry — indicates credential/SDK issues
+              // Report auth retry failures to Sentry Ã¢â‚¬â€ indicates credential/SDK issues
               Sentry.captureException(retryError, {
                 tags: { errorSource: 'auth-retry', sessionId },
               })
@@ -9113,3 +9062,5 @@ export class SessionManager {
     sessionLog.info('Cleanup complete')
   }
 }
+
+

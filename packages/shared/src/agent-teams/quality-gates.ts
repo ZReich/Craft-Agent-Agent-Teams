@@ -16,6 +16,7 @@ import type {
   QualityGateStageConfig,
   TaskType,
 } from '@craft-agent/core/types';
+import { NON_CODE_TASK_TYPES } from '@craft-agent/core/types';
 import { resolveReviewProvider } from './review-provider';
 
 // ============================================================
@@ -30,9 +31,9 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
   baselineAwareTests: true,
   knownFailingTests: [],
   testScope: 'affected',
-  reviewModel: 'kimi-k2.5',
-  reviewProvider: 'moonshot',
-  escalationModel: 'claude-sonnet-4-5-20250929',
+  reviewModel: 'claude-opus-4-6',
+  reviewProvider: 'anthropic',
+  escalationModel: 'claude-opus-4-6',
   escalationProvider: 'anthropic',
   stages: {
     syntax: { enabled: true, weight: 0, binary: true },
@@ -47,6 +48,12 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
     rollout_safety: { enabled: false, weight: 10 },
   },
 };
+
+/** Check whether a task type should skip quality gates. */
+export function shouldSkipQualityGates(taskType: TaskType | undefined): boolean {
+  if (!taskType) return false; // Default: run gates (backwards-compatible)
+  return NON_CODE_TASK_TYPES.has(taskType);
+}
 
 // ============================================================
 // Score Computation

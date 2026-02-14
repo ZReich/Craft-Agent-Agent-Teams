@@ -335,6 +335,11 @@ export class TeammateHealthMonitor extends EventEmitter {
     }
   }
 
+  /** High-volume web tools that may legitimately repeat identical queries */
+  private static readonly RESEARCH_EXEMPT_TOOLS = new Set([
+    'WebSearch', 'WebFetch',
+  ]);
+
   /**
    * Check for retry storms: multiple similar tool calls in recent history.
    */
@@ -355,6 +360,12 @@ export class TeammateHealthMonitor extends EventEmitter {
     );
 
     if (allSimilar) {
+      // Research tools (WebSearch, Read, Grep, etc.) naturally make many similar calls
+      // during exploration — use a higher threshold to avoid false positives
+      if (TeammateHealthMonitor.RESEARCH_EXEMPT_TOOLS.has(firstTool) && recentSlice.length < 10) {
+        return;
+      }
+
       this.emitIssue(teamId, {
         type: 'retry-storm',
         teammateId: state.teammateId,

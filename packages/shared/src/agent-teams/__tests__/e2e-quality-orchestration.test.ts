@@ -844,12 +844,12 @@ describe('Health Monitor Integration', () => {
 
     monitor.startMonitoring('team-1');
 
-    // Record 5 identical tool calls
+    // Record 5 identical tool calls (use a non-research tool)
     for (let i = 0; i < 5; i++) {
       monitor.recordActivity('team-1', 'mate-1', 'Worker A', {
         type: 'tool_call',
-        toolName: 'Read',
-        toolInput: '/src/app.ts',
+        toolName: 'Bash',
+        toolInput: 'echo test',
       });
     }
 
@@ -857,7 +857,7 @@ describe('Health Monitor Integration', () => {
 
     expect(issues).toHaveLength(1);
     expect(issues[0].type).toBe('retry-storm');
-    expect(issues[0].details).toContain('5 similar calls to "Read"');
+    expect(issues[0].details).toContain('5 similar calls to "Bash"');
   });
 
   it('detects context exhaustion above threshold', () => {

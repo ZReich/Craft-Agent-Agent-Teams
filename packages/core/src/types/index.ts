@@ -88,7 +88,7 @@ export type {
   // Phase types
   TeamPhase,
 } from './agent-teams.ts';
-export { DEFAULT_YOLO_CONFIG, CODE_TASK_TYPES, NON_CODE_TASK_TYPES, shouldSkipQualityGates } from './agent-teams.ts';
+export { DEFAULT_YOLO_CONFIG, CODE_TASK_TYPES, NON_CODE_TASK_TYPES } from './agent-teams.ts';
 
 // Team Dashboard View State types (Phase 1)
 export type {

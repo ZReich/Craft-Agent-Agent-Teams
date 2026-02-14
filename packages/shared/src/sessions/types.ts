@@ -379,6 +379,8 @@ export interface SessionMetadata {
   isTeamLead?: boolean;
   /** Display name for teammate sessions */
   teammateName?: string;
+  /** Role label for teammate sessions (e.g., head, worker, reviewer, escalation) */
+  teammateRole?: string;
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
