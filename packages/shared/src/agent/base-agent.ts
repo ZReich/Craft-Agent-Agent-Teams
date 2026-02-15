@@ -58,7 +58,7 @@ import {
 
 // Skill extraction for Codex/Copilot backends (Claude uses native SDK Skill tool)
 import { parseMentions, stripAllMentions } from '../mentions/index.ts';
-import { loadWorkspaceSkills } from '../skills/storage.ts';
+import { loadAllSkills } from '../skills/storage.ts';
 
 // ============================================================
 // Mini Agent Configuration
@@ -704,7 +704,9 @@ Please continue the conversation naturally from where we left off.
     cleanMessage: string;
   } {
     const workspaceRoot = this.config.workspace?.rootPath ?? this.workingDirectory;
-    const skills = loadWorkspaceSkills(workspaceRoot);
+    // Implements REQ-006: load skills from all sources so projects can ship
+    // their own skills in `.agents/skills/` without requiring workspace writes.
+    const skills = loadAllSkills(workspaceRoot, this.workingDirectory);
     const skillSlugs = skills.map(s => s.slug);
 
     this.debug(`[extractSkillContent] Available skills: ${skillSlugs.join(', ')}`);

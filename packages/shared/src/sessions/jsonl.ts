@@ -20,6 +20,9 @@ import { pickSessionFields } from './utils.ts';
 
 const SESSION_PATH_TOKEN = '{{SESSION_PATH}}';
 
+// Implements BUG-E: Strip trailing \r from JSONL lines (Windows CRLF handling)
+const stripCR = (line: string): string => line.endsWith('\r') ? line.slice(0, -1) : line;
+
 /**
  * Replace absolute session directory paths with a portable token.
  * Applied after JSON.stringify so paths embedded anywhere in message content
@@ -60,7 +63,7 @@ export function readSessionHeader(sessionFile: string): SessionHeader | null {
 
     const content = buffer.toString('utf-8', 0, bytesRead);
     const firstNewline = content.indexOf('\n');
-    const firstLine = firstNewline > 0 ? content.slice(0, firstNewline) : content;
+    const firstLine = stripCR(firstNewline > 0 ? content.slice(0, firstNewline) : content);
 
     return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
   } catch {
@@ -76,7 +79,7 @@ export function readSessionHeader(sessionFile: string): SessionHeader | null {
 export function readSessionJsonl(sessionFile: string): StoredSession | null {
   try {
     const content = readFileSync(sessionFile, 'utf-8');
-    const lines = content.split('\n').filter(Boolean);
+    const lines = content.split('\n').map(stripCR).filter(Boolean);
 
     const firstLine = lines[0];
     if (!firstLine) return null;
@@ -248,7 +251,7 @@ export async function readSessionHeaderAsync(sessionFile: string): Promise<Sessi
 export function readSessionMessages(sessionFile: string): StoredMessage[] {
   try {
     const content = readFileSync(sessionFile, 'utf-8');
-    const lines = content.split('\n').filter(Boolean);
+    const lines = content.split('\n').map(stripCR).filter(Boolean);
     // Skip first line (header), expand session path tokens, parse rest as messages resiliently
     const sessionDir = dirname(sessionFile);
     const expandedLines = lines.slice(1).map(line => expandSessionPath(line, sessionDir));

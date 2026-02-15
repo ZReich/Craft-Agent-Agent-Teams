@@ -67,6 +67,7 @@ export const FocusPage = React.memo(function FocusPage({
     onDeleteSession,
     chatDisplayRef,
     onChatMatchInfoChange,
+    workspaceAgentTeamsEnabled,
   } = useAppShellContext()
 
   const { navigate: navNavigate } = useNavigation()
@@ -316,9 +317,9 @@ export const FocusPage = React.memo(function FocusPage({
             skills={skills}
             workspaceId={activeWorkspaceId || undefined}
             agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
-            onAgentTeamsChange={handleAgentTeamsChange}
+            onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
             yoloModeEnabled={sessionOpts.yoloModeEnabled}
-            onYoloModeChange={handleYoloModeChange}
+            onYoloModeChange={workspaceAgentTeamsEnabled ? handleYoloModeChange : undefined}
           />
         </div>
 

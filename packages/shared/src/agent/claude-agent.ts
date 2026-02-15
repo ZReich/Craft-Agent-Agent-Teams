@@ -2018,6 +2018,12 @@ export class ClaudeAgent extends BaseAgent {
   private buildTextPrompt(text: string, attachments?: FileAttachment[]): string {
     const parts: string[] = [];
 
+    // ============================================================
+    // SKILL MENTION EXTRACTION (delegated to BaseAgent)
+    // Implements REQ-006: support [skill:...] mentions for Claude teammates
+    // ============================================================
+    const { skillContents, cleanMessage: effectiveText } = this.extractSkillContent(text);
+
     // Add context parts using centralized PromptBuilder
     // This includes: date/time, session state (with plansFolderPath),
     // workspace capabilities, and working directory context
@@ -2027,6 +2033,7 @@ export class ClaudeAgent extends BaseAgent {
     );
 
     parts.push(...contextParts);
+    parts.push(...skillContents);
 
     // Add file attachments with stored path info (agent uses Read tool to access content)
     // Text files are NOT embedded inline to prevent context overflow from large files
@@ -2044,8 +2051,8 @@ export class ClaudeAgent extends BaseAgent {
     }
 
     // Add user's message
-    if (text) {
-      parts.push(text);
+    if (effectiveText) {
+      parts.push(effectiveText);
     }
 
     return parts.join('\n\n');
@@ -2059,6 +2066,12 @@ export class ClaudeAgent extends BaseAgent {
   private buildSDKUserMessage(text: string, attachments?: FileAttachment[]): SDKUserMessage {
     const contentBlocks: ContentBlockParam[] = [];
 
+    // ============================================================
+    // SKILL MENTION EXTRACTION (delegated to BaseAgent)
+    // Implements REQ-006: support [skill:...] mentions for Claude teammates
+    // ============================================================
+    const { skillContents, cleanMessage: effectiveText } = this.extractSkillContent(text);
+
     // Add context parts using centralized PromptBuilder
     // This includes: date/time, session state (with plansFolderPath),
     // workspace capabilities, and working directory context
@@ -2069,6 +2082,11 @@ export class ClaudeAgent extends BaseAgent {
 
     for (const part of contextParts) {
       contentBlocks.push({ type: 'text', text: part });
+    }
+
+    // Add skill content blocks after context (keeps date/time first for caching)
+    for (const skill of skillContents) {
+      contentBlocks.push({ type: 'text', text: skill });
     }
 
     // Add attachments - images/PDFs are uploaded inline, text files are path-only
@@ -2116,8 +2134,8 @@ export class ClaudeAgent extends BaseAgent {
     }
 
     // Add user's text message
-    if (text.trim()) {
-      contentBlocks.push({ type: 'text', text });
+    if (effectiveText.trim()) {
+      contentBlocks.push({ type: 'text', text: effectiveText });
     }
 
     return {

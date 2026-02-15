@@ -31,6 +31,7 @@
     "./agent-teams/yolo-orchestrator": "./src/agent-teams/yolo-orchestrator.ts",
     "./agent-teams/sdd-exports": "./src/agent-teams/sdd-exports.ts",
     "./agent-teams/model-resolution": "./src/agent-teams/model-resolution.ts",
+    "./agent-teams/routing-policy": "./src/agent-teams/routing-policy.ts",
     "./auth": "./src/auth/index.ts",
     "./auth/callback-page": "./src/auth/callback-page.ts",
     "./auth/types": "./src/auth/types.ts",

@@ -89,6 +89,7 @@ import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/
 import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
 import { resolveTeamModelForRole } from '@craft-agent/shared/agent-teams/model-resolution'
+import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
 import { YoloOrchestrator, mergeYoloConfig, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
 import type { YoloConfig, YoloState } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
@@ -1548,6 +1549,9 @@ export class SessionManager {
   // SDD compliance report watchers - one per session
   private complianceWatchers: Map<string, FSWatcher> = new Map()
   private complianceSyncTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+  // Implements BUG-C fix: debounced source reload to coalesce cascading change events
+  private sourceReloadTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+  private readonly SOURCE_RELOAD_DEBOUNCE_MS = 300
   // Hook systems for workspace event hooks - one per workspace (includes scheduler, diffing, and handlers)
   private hookSystems: Map<string, HookSystem> = new Map()
   // Pending credential request resolvers (keyed by requestId)
@@ -1699,6 +1703,11 @@ export class SessionManager {
     this.healthMonitor.startMonitoring(teamId)
 
     // Relay health alerts to the lead session + broadcast to dashboard
+    // Implements BUG-002 fix: Auto-terminate zombie teammates that exceed health thresholds
+    const AUTO_KILL_STALL_MS = 10 * 60 * 1000 // 10 minutes stalled → force-kill
+    const AUTO_KILL_RETRY_STORM_COUNT = 2 // Second retry-storm detection → force-kill
+    const retryStormCounts = new Map<string, number>()
+
     const alertHandler = (issue: HealthIssue): void => {
       // Only relay alerts for teammates belonging to this team.
       const teammate = this.sessions.get(issue.teammateId)
@@ -1723,6 +1732,51 @@ export class SessionManager {
           timestamp: issue.detectedAt || new Date().toISOString(),
         }
         this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
+      }
+
+      // Auto-terminate zombie teammates that exceed health thresholds.
+      // Shutdown requests via inbox are cooperative and fail when the agent is stuck.
+      // This uses process-level force-abort instead.
+      let shouldAutoKill = false
+      let autoKillReason = ''
+
+      if (issue.type === 'stall' && issue.duration && issue.duration >= AUTO_KILL_STALL_MS) {
+        shouldAutoKill = true
+        autoKillReason = `stall exceeded ${AUTO_KILL_STALL_MS / 60000}min (actual: ${Math.round((issue.duration) / 60000)}min)`
+      }
+
+      if (issue.type === 'retry-storm') {
+        const count = (retryStormCounts.get(issue.teammateId) || 0) + 1
+        retryStormCounts.set(issue.teammateId, count)
+        if (count >= AUTO_KILL_RETRY_STORM_COUNT) {
+          shouldAutoKill = true
+          autoKillReason = `retry-storm detected ${count} times`
+        }
+      }
+
+      if (issue.type === 'context-exhaustion') {
+        shouldAutoKill = true
+        autoKillReason = `context window exhausted`
+      }
+
+      if (shouldAutoKill) {
+        sessionLog.warn(`[AgentTeams] Auto-terminating zombie teammate "${issue.teammateName}" (${issue.teammateId}): ${autoKillReason}`)
+        this.terminateTeammateSession(issue.teammateId, `health-auto-kill:${autoKillReason}`).then(killed => {
+          if (killed) {
+            // Relay termination notice to lead
+            const resolvedTeamId = teamManager.resolveTeamId(teamId)
+            this.updateTeammateTasks(resolvedTeamId, issue.teammateId, 'failed')
+            this.sendMessage(leadSessionId, [
+              `**${issue.teammateName}** was auto-terminated by the health monitor.`,
+              `Reason: ${autoKillReason}`,
+              '',
+              'The teammate was unresponsive to shutdown requests and consuming resources.',
+              'Its task has been marked as failed. You may re-assign the work or complete it yourself.',
+            ].join('\n')).catch(() => {})
+          }
+        }).catch(err => {
+          sessionLog.error(`[AgentTeams] Auto-kill failed for ${issue.teammateId}:`, err)
+        })
       }
     }
     this.healthMonitor.on('health:stall', alertHandler)
@@ -1868,36 +1922,6 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Remove a teammate from lead tracking and health monitoring.
-   * Safe to call repeatedly.
-   */
-  private detachTeammateTracking(teammate: ManagedSession): void {
-    const parentSessionId = teammate.parentSessionId
-    if (parentSessionId) {
-      const lead = this.sessions.get(parentSessionId)
-      if (lead?.teammateSessionIds?.length) {
-        const next = lead.teammateSessionIds.filter(id => id !== teammate.id)
-        lead.teammateSessionIds = next.length > 0 ? next : undefined
-        this.persistSession(lead)
-      }
-    }
-
-    const resolvedTeamId = teammate.teamId
-      ? teamManager.resolveTeamId(teammate.teamId)
-      : undefined
-    if (resolvedTeamId) {
-      this.healthMonitor.removeTeammate(resolvedTeamId, teammate.id)
-      const hasLiveTeammates = Array.from(this.sessions.values()).some(s => {
-        if (s.id === teammate.id) return false
-        if (!s.parentSessionId || !s.teamId) return false
-        return teamManager.resolveTeamId(s.teamId) === resolvedTeamId
-      })
-      if (!hasLiveTeammates) {
-        this.stopTeamHealthMonitoring(resolvedTeamId)
-      }
-    }
-  }
 
   /**
    * Deterministically terminate a teammate session runtime and detach all team tracking.
@@ -2564,43 +2588,15 @@ export class SessionManager {
     const callbacks: ConfigWatcherCallbacks = {
       onSourcesListChange: async (sources: LoadedSource[]) => {
         sessionLog.info(`Sources list changed in ${workspaceRootPath} (${sources.length} sources)`)
-        // Broadcast to UI
-        this.broadcastSourcesChanged(sources)
-        // Reload sources for all sessions in this workspace
-        // Skip sessions that are currently processing to avoid interrupting tool calls
-        for (const [_, managed] of this.sessions) {
-          if (managed.workspace.rootPath === workspaceRootPath) {
-            if (managed.isProcessing) {
-              sessionLog.info(`Skipping source reload for session ${managed.id} (processing)`)
-              continue
-            }
-            await this.reloadSessionSources(managed)
-          }
-        }
+        this.debouncedSourceReload(workspaceRootPath)
       },
       onSourceChange: async (slug: string, source: LoadedSource | null) => {
         sessionLog.info(`Source '${slug}' changed:`, source ? 'updated' : 'deleted')
-        // Broadcast updated list to UI
-        const sources = loadWorkspaceSources(workspaceRootPath)
-        this.broadcastSourcesChanged(sources)
-        // Reload sources for all sessions in this workspace
-        // Skip sessions that are currently processing to avoid interrupting tool calls
-        for (const [_, managed] of this.sessions) {
-          if (managed.workspace.rootPath === workspaceRootPath) {
-            if (managed.isProcessing) {
-              sessionLog.info(`Skipping source reload for session ${managed.id} (processing)`)
-              continue
-            }
-            await this.reloadSessionSources(managed)
-          }
-        }
+        this.debouncedSourceReload(workspaceRootPath)
       },
       onSourceGuideChange: (sourceSlug: string) => {
         sessionLog.info(`Source guide changed: ${sourceSlug}`)
-        // Broadcast the updated sources list so sidebar picks up guide changes
-        // Note: Guide changes don't require session source reload (no server changes)
-        const sources = loadWorkspaceSources(workspaceRootPath)
-        this.broadcastSourcesChanged(sources)
+        this.debouncedSourceReload(workspaceRootPath)
       },
       onStatusConfigChange: () => {
         sessionLog.info(`Status config changed in ${workspaceId}`)
@@ -2758,6 +2754,31 @@ export class SessionManager {
       this.hookSystems.set(workspaceRootPath, hookSystem)
       sessionLog.info(`Initialized HookSystem for workspace ${workspaceId}`)
     }
+  }
+
+  /**
+   * Debounced source reload — coalesces rapid cascading events (config change +
+   * icon download + dir change) into a single broadcast + session reload cycle.
+   * Implements BUG-C fix: reduces 3 broadcasts + 3N session reloads to 1 + N.
+   */
+  private debouncedSourceReload(workspaceRootPath: string): void {
+    const existing = this.sourceReloadTimers.get(workspaceRootPath)
+    if (existing) clearTimeout(existing)
+
+    const timer = setTimeout(async () => {
+      this.sourceReloadTimers.delete(workspaceRootPath)
+      const sources = loadWorkspaceSources(workspaceRootPath)
+      this.broadcastSourcesChanged(sources)
+      for (const [_, managed] of this.sessions) {
+        if (managed.workspace.rootPath !== workspaceRootPath) continue
+        if (managed.isProcessing) {
+          sessionLog.info(`Skipping source reload for session ${managed.id} (processing)`)
+          continue
+        }
+        await this.reloadSessionSources(managed)
+      }
+    }, this.SOURCE_RELOAD_DEBOUNCE_MS)
+    this.sourceReloadTimers.set(workspaceRootPath, timer)
   }
 
   /**
@@ -3171,11 +3192,52 @@ export class SessionManager {
   /**
    * Best-effort repair for team metadata consistency after loading sessions.
    * This keeps team grouping stable in the sidebar after crashes/restarts.
+   *
+   * Runs three passes:
+   *   Pass 0 — Recover orphaned teammates whose parentSessionId was stripped
+   *            by matching teamColor + same-day creation (YYMMDD prefix).
+   *   Pass 1 — Fill missing parentSessionId from teamId when lead is known.
+   *   Pass 2 — Rebuild lead → teammate mapping from parentSessionId refs and
+   *            propagate lead metadata down to teammates.
    */
   private repairTeamSessionLinks(): void {
     let repairedLeads = 0
     let repairedTeammates = 0
 
+    // ── Pass 0: Heuristic recovery for historically stripped teammates ──
+    // Older code stripped parentSessionId/teamId/teammateName on completion.
+    // The only surviving signal is teamColor. Match orphans to leads by
+    // teamColor + same-day session-ID prefix (YYMMDD).
+    const leadsByColorAndDay = new Map<string, ManagedSession[]>()
+    for (const session of this.sessions.values()) {
+      if (session.isTeamLead && session.teamId && session.teamColor) {
+        const datePrefix = session.id.slice(0, 6) // YYMMDD
+        const key = `${session.teamColor}:${datePrefix}`
+        const arr = leadsByColorAndDay.get(key) ?? []
+        arr.push(session)
+        leadsByColorAndDay.set(key, arr)
+      }
+    }
+
+    for (const session of this.sessions.values()) {
+      // Orphan: has teamColor but lost parentSessionId and teamId, not a lead
+      if (session.teamColor && !session.parentSessionId && !session.teamId && !session.isTeamLead) {
+        const datePrefix = session.id.slice(0, 6)
+        const key = `${session.teamColor}:${datePrefix}`
+        const candidates = leadsByColorAndDay.get(key)
+        if (candidates && candidates.length === 1) {
+          const lead = candidates[0]!
+          session.parentSessionId = lead.id
+          session.teamId = lead.teamId
+          session.teamColor = lead.teamColor
+          repairedTeammates++
+          this.persistSession(session)
+          sessionLog.info(`[AgentTeams] Recovered orphaned teammate ${session.id} → lead ${lead.id} (teamColor match)`)
+        }
+      }
+    }
+
+    // ── Pass 1: Fill missing parentSessionId from teamId ──
     const leadsByTeamId = new Map<string, ManagedSession>()
     for (const session of this.sessions.values()) {
       if (session.isTeamLead && session.teamId) {
@@ -3183,7 +3245,6 @@ export class SessionManager {
       }
     }
 
-    // Fill missing parent/team metadata on teammate sessions when we can infer it
     for (const teammate of this.sessions.values()) {
       if (teammate.isTeamLead) continue
 
@@ -3198,7 +3259,7 @@ export class SessionManager {
       }
     }
 
-    // Rebuild lead -> teammate mapping from child parentSessionId references
+    // ── Pass 2: Rebuild lead → teammate mapping ──
     const teammateIdsByLead = new Map<string, string[]>()
     for (const teammate of this.sessions.values()) {
       if (!teammate.parentSessionId) continue
@@ -3872,6 +3933,36 @@ export class SessionManager {
     let refreshed = 0
     let skipped = 0
 
+    // Implements BUG-001 fix: When agent teams are toggled OFF, force-terminate all
+    // active teammate sessions instead of skipping them. Without this, running teammates
+    // survive the settings change and continue operating as zombies.
+    const isAgentTeamsDisable = reason.includes('agentTeamsEnabled=false')
+
+    if (isAgentTeamsDisable) {
+      const terminatedIds: string[] = []
+      for (const managed of this.sessions.values()) {
+        if (managed.workspace.id !== workspaceId) continue
+        if (managed.parentSessionId && managed.teammateName) {
+          // This is a teammate session — force-terminate it regardless of isProcessing
+          this.terminateTeammateSession(managed.id, 'agent-teams-disabled').catch(err => {
+            sessionLog.warn(`[AgentTeams] Failed to terminate teammate ${managed.id} during kill switch:`, err)
+          })
+          terminatedIds.push(managed.id)
+        } else if (managed.agent) {
+          // Lead or non-teammate session — destroy agent to pick up new settings.
+          // CraftAgent's activeTeamName/activeTeammateCount are cleared when the
+          // agent is disposed; the new agent instance starts clean.
+          if (managed.isTeamLead && managed.agent instanceof CraftAgent) {
+            managed.agent.clearTeamState()
+          }
+          this.destroyManagedAgent(managed, `refreshWorkspaceAgentRuntime:${reason}`)
+          refreshed++
+        }
+      }
+      sessionLog.info(`[AgentTeams] Kill switch activated for workspace ${workspaceId}: terminated=${terminatedIds.length} refreshed=${refreshed}`)
+      return
+    }
+
     for (const managed of this.sessions.values()) {
       if (managed.workspace.id !== workspaceId) continue
       if (managed.isProcessing) {
@@ -4350,7 +4441,14 @@ export class SessionManager {
     if (parent.sddEnabled && !parent.activeSpecId) {
       throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
     }
-    const teammateRole = normalizeTeamRole(params.role, params.teammateName)
+    // Implements REQ-004/REQ-005/REQ-006: classify + route teammate work and enforce UX/Design policy
+    const routing = decideTeammateRouting({
+      prompt: params.prompt,
+      requestedRole: params.role,
+      requestedModel: params.model,
+    })
+
+    const teammateRole = normalizeTeamRole(routing.role, params.teammateName)
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
     const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
     // Implements REQ-002: Use witty codename as primary name, honor explicit custom names
@@ -4358,11 +4456,16 @@ export class SessionManager {
     const teammateDisplayName = customName || teammateCodename
     const isAutoGenerated = !customName
 
-    if (params.role && params.role !== teammateRole) {
+    if (params.role && params.role !== teammateRole && !routing.roleEnforced) {
       sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested; defaulting to "${teammateRole}"`)
     }
+
+    // Implements REQ-005: surface UX/Design enforcement explicitly in logs
+    if (routing.roleEnforced) {
+      sessionLog.info(`[AgentTeams] Routing policy enforced role: requested="${params.role}" → routed="${teammateRole}" (${routing.reason})`)
+    }
     // Warn when no role was provided - indicates the Lead may be skipping the Head layer
-    if (!params.role) {
+    if (!params.role && !routing.roleEnforced) {
       sessionLog.warn(
         `[AgentTeams] Teammate "${params.teammateName || '(auto)'}" spawned without explicit role - defaulted to "worker". ` +
         `The Lead should specify role="head" for coordinators or role="escalation" for escalation agents.`
@@ -4394,8 +4497,9 @@ export class SessionManager {
       )
     }
 
-    // Implements REQ-001: honor workspace role model defaults for teammates
-    const teammateModel = configuredModel ?? normalizedRequestedModel ?? parent.model ?? workspaceConfig?.defaults?.model ?? DEFAULT_MODEL
+    // Implements REQ-001/REQ-005: honor workspace role model defaults, but allow hard policy overrides.
+    // UX/Design is always Opus (hard-enforced) regardless of preset/override.
+    const teammateModel = routing.modelOverride ?? configuredModel ?? normalizedRequestedModel ?? parent.model ?? workspaceConfig?.defaults?.model ?? DEFAULT_MODEL
 
     if (!teammateModel) {
       throw new Error(
@@ -4403,7 +4507,17 @@ export class SessionManager {
       )
     }
 
-    sessionLog.info(`[AgentTeams] Resolved teammate spawn: name=${teammateDisplayName}${isAutoGenerated ? ' (auto-generated)' : ''} role=${teammateRole} model=${teammateModel}`)
+    if (routing.modelOverride && configuredModel && routing.modelOverride !== configuredModel) {
+      sessionLog.info(
+        `[AgentTeams] Routing policy enforced model override for domain=${routing.domain}: ` +
+        `"${configuredModel}" → "${routing.modelOverride}" (${routing.reason})`
+      )
+    }
+
+    sessionLog.info(
+      `[AgentTeams] Resolved teammate spawn: name=${teammateDisplayName}${isAutoGenerated ? ' (auto-generated)' : ''} ` +
+      `role=${teammateRole} model=${teammateModel} (${routing.reason})`
+    )
 
     // Implements REQ-004: choose a provider/connection compatible with the resolved model
     const teammateConnectionSlug = resolveConnectionForModel({
@@ -4471,7 +4585,7 @@ export class SessionManager {
     teamManager.logActivity(
       resolvedTeamId,
       'teammate-spawned',
-      `${teammateDisplayName} spawned`,
+      `${teammateDisplayName} spawned (${routing.reason})`,
       teammateSession.id,
       teammateDisplayName
     )
@@ -4506,6 +4620,7 @@ export class SessionManager {
         {
           requirementIds,
           driOwner: parsedSpec.ownerDRI,
+          driReviewer: parsedSpec.ownerDRI,
           assignee: teammateSession.id,
         }
       )
@@ -4513,7 +4628,16 @@ export class SessionManager {
       teamManager.updateTaskStatus(resolvedTeamId, task.id, 'in_progress', teammateSession.id)
     }
 
-    const teammatePrompt = buildTeammatePromptWithCompactSpec(params.prompt, compactSpecContext)
+    // Implements REQ-006: auto-attach skill packs via explicit skill mentions.
+    // Skills are resolved from workspace + project `.agents/skills/` (see BaseAgent.extractSkillContent).
+    const skillMentions = routing.skillSlugs.length > 0
+      ? routing.skillSlugs.map(slug => `[skill:${slug}]`).join(' ')
+      : ''
+    const promptWithSkills = skillMentions
+      ? `${skillMentions}\n\n${params.prompt}`
+      : params.prompt
+
+    const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithSkills, compactSpecContext)
 
     // Kick off the teammate by sending the prompt
     // Use setTimeout to avoid blocking the caller, but track timer so cleanup can cancel it.
@@ -6305,7 +6429,8 @@ export class SessionManager {
     return managed.sddComplianceReports ?? []
   }
 
-  private startComplianceWatcher(sessionId: string): void {
+  // Implements BUG-B fix: await mkdir before watch() to prevent ENOENT on nonexistent dir
+  private async startComplianceWatcher(sessionId: string): Promise<void> {
     if (this.complianceWatchers.has(sessionId)) return
     const managed = this.sessions.get(sessionId)
     if (!managed || !managed.sddEnabled) return
@@ -6313,7 +6438,7 @@ export class SessionManager {
     const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
     const reportsDir = join(sessionPath, 'reports')
     if (!existsSync(reportsDir)) {
-      void mkdir(reportsDir, { recursive: true })
+      await mkdir(reportsDir, { recursive: true })
     }
 
     try {
@@ -6702,6 +6827,29 @@ export class SessionManager {
     // Ensure team resources are released before deleting a lead session.
     if (managed.isTeamLead && managed.teammateSessionIds?.length) {
       await this.cleanupTeam(sessionId)
+      // Clear team refs on teammates so they don't point to a deleted lead
+      for (const tid of managed.teammateSessionIds ?? []) {
+        const teammate = this.sessions.get(tid)
+        if (teammate) {
+          teammate.parentSessionId = undefined
+          teammate.teamId = undefined
+          teammate.teammateName = undefined
+          teammate.teamColor = undefined
+          this.persistSession(teammate)
+        }
+      }
+    }
+
+    // If this is a teammate, remove it from the lead's teammateSessionIds
+    if (managed.parentSessionId) {
+      const lead = this.sessions.get(managed.parentSessionId)
+      if (lead?.teammateSessionIds?.length) {
+        lead.teammateSessionIds = lead.teammateSessionIds.filter(id => id !== sessionId)
+        if (lead.teammateSessionIds.length === 0) {
+          lead.teammateSessionIds = undefined
+        }
+        this.persistSession(lead)
+      }
     }
 
     // Get workspace slug before deleting
@@ -8886,6 +9034,54 @@ export class SessionManager {
     tasks
       .filter(task => task.assignee === teammateId && task.status === 'in_progress')
       .forEach(task => teamManager.updateTaskStatus(teamId, task.id, status))
+
+    // Implements BUG-004 fix: Also update the Claude Code SDK's .claude/tasks/ files on disk.
+    // The SDK maintains its own task files at ~/.claude/tasks/{teamId}/*.json which are
+    // separate from our teamManager state. Without this, task files remain "in_progress" forever.
+    this.syncSdkTaskFiles(teamId, teammateId, status).catch(err => {
+      sessionLog.warn(`[AgentTeams] Failed to sync SDK task files for team ${teamId}:`, err)
+    })
+  }
+
+  /**
+   * Sync Claude Code SDK task files on disk with our team manager's state.
+   * The SDK stores tasks at ~/.claude/tasks/{teamId}/{id}.json.
+   * When we mark a task completed/failed via teamManager, also update the disk file.
+   */
+  private async syncSdkTaskFiles(
+    teamId: string,
+    teammateId: string,
+    status: 'completed' | 'failed'
+  ): Promise<void> {
+    const tasksDir = join(homedir(), '.claude', 'tasks', teamId)
+    if (!existsSync(tasksDir)) return
+
+    const { readdir } = await import('fs/promises')
+    const files = await readdir(tasksDir)
+    const jsonFiles = files.filter(f => f.endsWith('.json') && f !== '.lock')
+
+    for (const file of jsonFiles) {
+      const filePath = join(tasksDir, file)
+      try {
+        const content = await readFile(filePath, 'utf-8')
+        const task = JSON.parse(content)
+
+        // Match by subject (teammate name) or description containing the teammate session ID
+        const isMatch = task.status === 'in_progress' && (
+          task.subject === teammateId ||
+          (typeof task.subject === 'string' && this.sessions.get(teammateId)?.teammateName &&
+            task.subject === this.sessions.get(teammateId)?.teammateName)
+        )
+
+        if (isMatch) {
+          task.status = status === 'completed' ? 'completed' : 'failed'
+          await writeFile(filePath, JSON.stringify(task, null, 2), 'utf-8')
+          sessionLog.info(`[AgentTeams] Updated SDK task file ${filePath} → ${status}`)
+        }
+      } catch {
+        // File may have been deleted or is not valid JSON — skip
+      }
+    }
   }
 
   private sendEvent(event: SessionEvent, workspaceId?: string): void {
@@ -9044,6 +9240,11 @@ export class SessionManager {
       clearTimeout(timer)
     }
     this.complianceSyncTimers.clear()
+    // Clear debounced source reload timers
+    for (const [_, timer] of this.sourceReloadTimers) {
+      clearTimeout(timer)
+    }
+    this.sourceReloadTimers.clear()
     // Dispose all HookSystems (includes scheduler, handlers, and event loggers)
     for (const [workspacePath, hookSystem] of this.hookSystems) {
       try {

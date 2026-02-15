@@ -80,6 +80,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onChatMatchInfoChange,
     isFocusModeActive,
     onToggleFocusMode,
+    workspaceAgentTeamsEnabled,
   } = useAppShellContext()
 
   // Use the unified session options hook for clean access
@@ -960,9 +961,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 onMatchInfoChange={onChatMatchInfoChange}
                 connectionUnavailable={connectionUnavailable}
                 agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
-                onAgentTeamsChange={handleAgentTeamsChange}
+                onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
                 yoloModeEnabled={sessionOpts.yoloModeEnabled}
-                onYoloModeChange={handleYoloModeChange}
+                onYoloModeChange={workspaceAgentTeamsEnabled ? handleYoloModeChange : undefined}
               />
             </div>
           </div>
@@ -1080,9 +1081,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             onMatchInfoChange={onChatMatchInfoChange}
             connectionUnavailable={connectionUnavailable}
             agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
-            onAgentTeamsChange={handleAgentTeamsChange}
+            onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
             yoloModeEnabled={sessionOpts.yoloModeEnabled}
-            onYoloModeChange={handleYoloModeChange}
+            onYoloModeChange={workspaceAgentTeamsEnabled ? handleYoloModeChange : undefined}
           />
         </div>
         )}

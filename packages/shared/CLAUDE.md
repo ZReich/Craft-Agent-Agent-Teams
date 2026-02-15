@@ -36,6 +36,7 @@ import { debug } from '@craft-agent/shared/utils';
 ```
 src/
 ├── agent/              # CraftAgent, session-scoped-tools, mode-manager, mode-types, permissions-config
+├── agent-teams/        # Multi-agent orchestration — has its own CLAUDE.md with full architecture docs
 ├── auth/               # OAuth, craft-token, claude-token, state
 ├── config/             # Storage, preferences, models, theme, watcher
 ├── credentials/        # Secure credential storage (AES-256-GCM)
@@ -177,6 +178,13 @@ File watcher for live config updates:
 
 ### Sources (`src/sources/`)
 Sources are external data connections (MCP servers, APIs, local filesystems). Stored at `~/.craft-agent/workspaces/{id}/sources/{slug}/` with config.json and guide.md. Types: `mcp`, `api`, `local`, `gmail`.
+
+### Agent Teams (`src/agent-teams/`)
+Multi-agent orchestration subsystem. **Read `src/agent-teams/CLAUDE.md` for the full architecture reference** — it covers the 5-role hierarchy, 9-stage quality gate pipeline, review loop, integration gate, health monitoring, YOLO autonomous mode, routing policy, configuration, and design patterns.
+
+Key modules: `quality-gates.ts`, `review-loop.ts`, `integration-gate.ts`, `health-monitor.ts`, `yolo-orchestrator.ts`, `model-resolution.ts`, `routing-policy.ts`.
+
+Team lifecycle is managed by `AgentTeamManager` in `src/agent/agent-team-manager.ts`.
 
 ## Dependencies
 

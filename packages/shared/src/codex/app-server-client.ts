@@ -500,6 +500,29 @@ export class AppServerClient extends EventEmitter {
   }
 
   /**
+   * Force-kill the app-server process regardless of connection state.
+   * Implements BUG-A fix: safety net for dispose paths where disconnect() may be
+   * skipped due to state machine guards (e.g., client still in 'connecting' state).
+   */
+  forceKill(): void {
+    if (!this.process) return;
+    try {
+      if (process.platform === 'win32') {
+        // Tree kill on Windows — kills the process and all its children
+        spawn('taskkill', ['/PID', String(this.process.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+      } else {
+        this.process.kill('SIGKILL');
+      }
+    } catch {
+      // Process may have already exited
+    }
+    this.cleanup();
+  }
+
+  /**
    * Check if connected.
    */
   isConnected(): boolean {

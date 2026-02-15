@@ -2467,7 +2467,11 @@ export class CodexAgent extends BaseAgent {
    */
   override destroy(): void {
     // Codex-specific cleanup
+    // Implements BUG-A fix: disconnect() may be skipped if client is still in
+    // 'connecting' state (state guard). forceKill() bypasses the state machine
+    // as a safety net to prevent zombie AppServer processes.
     this.client?.disconnect().catch(() => {});
+    this.client?.forceKill();
     this.client = null;
 
     // Clear all pending permission/approval promises

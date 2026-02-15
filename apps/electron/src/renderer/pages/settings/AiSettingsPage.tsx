@@ -54,30 +54,35 @@ import { getModelsForProviderType } from '@config/llm-connections'
  * Derive model dropdown options from a connection's models array,
  * falling back to registry models for the connection's provider type.
  */
+// Implements BUG-D fix: deduplicate model options by ID to prevent duplicate React keys
 function getModelOptionsForConnection(
   connection: LlmConnectionWithStatus | undefined,
 ): Array<{ value: string; label: string; description: string }> {
   if (!connection) return []
 
+  const seen = new Set<string>()
+  const dedup = <T extends { value: string }>(opts: T[]): T[] =>
+    opts.filter(o => { if (seen.has(o.value)) return false; seen.add(o.value); return true })
+
   // If connection has explicit models, use those
   if (connection.models && connection.models.length > 0) {
-    return connection.models.map((m) => {
+    return dedup(connection.models.map((m) => {
       if (typeof m === 'string') {
         return { value: m, label: getModelShortName(m), description: '' }
       }
       // ModelDefinition object
       const def = m as ModelDefinition
       return { value: def.id, label: def.name, description: def.description }
-    })
+    }))
   }
 
   // Fall back to registry models for this provider type
   const registryModels = getModelsForProviderType(connection.providerType)
-  return registryModels.map((m) => ({
+  return dedup(registryModels.map((m) => ({
     value: m.id,
     label: m.name,
     description: m.description,
-  }))
+  })))
 }
 
 export const meta: DetailsPageMeta = {
