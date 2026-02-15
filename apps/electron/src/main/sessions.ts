@@ -227,6 +227,8 @@ const TEAM_ROLE_HEAD: TeamRole = 'head'
 const TEAM_ROLE_ESCALATION: TeamRole = 'escalation'
 const TEAM_ROLE_WORKER: TeamRole = 'worker'
 const TEAM_ROLE_REVIEWER: TeamRole = 'reviewer'
+const MAX_TEAMMATES_PER_TEAM = 6
+const MAX_TEAMMATE_MESSAGES = 500
 
 function toValidatedTeamRole(rawRole?: string): TeamRole | null {
   if (!rawRole) return null
@@ -1362,6 +1364,8 @@ interface ManagedSession {
   teamColor?: string
   /** Re-entry guard: prevents team-level QG from firing multiple times */
   teamLevelQgRunning?: boolean
+  /** Persisted QG cycle count — survives app restarts */
+  qgCycleCount?: number
   // SDD fields
   sddEnabled?: boolean
   activeSpecId?: string
@@ -1620,6 +1624,10 @@ export class SessionManager {
         updateTaskStatus: this.updateTeammateTasks.bind(this),
         autoArchiveCompletedSession: this.autoArchiveCompletedTeammateSession.bind(this),
         getQualityGateSkipReason: (managed) => this.getQualityGateSkipReason(managed as ManagedSession),
+        disposeAgent: (sessionId: string, reason: string) => {
+          const session = this.sessions.get(sessionId)
+          if (session) this.destroyManagedAgent(session, reason)
+        },
       },
       messaging: {
         sendToSession: this.sendMessage.bind(this),
@@ -3110,6 +3118,7 @@ export class SessionManager {
             parentSessionId: meta.parentSessionId,
             teammateName: meta.teammateName,
             teammateRole: meta.teammateRole as TeamRole | undefined,
+            qgCycleCount: typeof meta.qgCycleCount === 'number' ? meta.qgCycleCount : undefined,
             teammateSessionIds: meta.teammateSessionIds,
             teamColor: meta.teamColor,
             sddEnabled: meta.sddEnabled,
@@ -3243,6 +3252,11 @@ export class SessionManager {
   // Persist a session to disk (async with debouncing)
   private persistSession(managed: ManagedSession): void {
     try {
+      // Cap message history for teammate sessions to prevent unbounded memory growth
+      if (managed.parentSessionId && managed.messages.length > MAX_TEAMMATE_MESSAGES) {
+        managed.messages = managed.messages.slice(-MAX_TEAMMATE_MESSAGES)
+      }
+
       // Filter out transient status messages (progress indicators like "Compacting...")
       // Error messages are now persisted with rich fields for diagnostics
       const persistableMessages = managed.messages.filter(m =>
@@ -3279,6 +3293,7 @@ export class SessionManager {
         parentSessionId: managed.parentSessionId,
         teammateName: managed.teammateName,
         teammateRole: managed.teammateRole,
+        qgCycleCount: managed.qgCycleCount,
         teammateSessionIds: managed.teammateSessionIds,
         teamColor: managed.teamColor,
         sddEnabled: managed.sddEnabled,
@@ -4272,6 +4287,17 @@ export class SessionManager {
       throw new Error(`Parent session ${params.parentSessionId} not found`)
     }
 
+    // KILL SWITCH: Refuse to spawn teammates if agent teams are disabled
+    if (!isAgentTeamsEnabled(parent.workspace.rootPath)) {
+      throw new Error('Agent teams are disabled for this workspace. Enable agent teams in workspace settings to spawn teammates.')
+    }
+
+    // CONCURRENCY LIMIT: Prevent resource explosion from too many teammates
+    const currentTeammateCount = parent.teammateSessionIds?.length ?? 0
+    if (currentTeammateCount >= MAX_TEAMMATES_PER_TEAM) {
+      throw new Error(`Team has reached the maximum of ${MAX_TEAMMATES_PER_TEAM} teammates. Complete or terminate existing teammates before spawning new ones.`)
+    }
+
     // Pick team color: count existing teams to rotate through the palette
     let teamColor = parent.teamColor
     if (!teamColor) {
@@ -4878,7 +4904,7 @@ export class SessionManager {
               isLeadTargetName(params.targetName || '', managed.teamId)
             ) {
               try {
-                await this.sendMessage(managed.parentSessionId, `[Team Result] ${params.content}`)
+                await this.sendMessage(managed.parentSessionId, `**${managed.teammateName || 'Teammate'}** completed:\n\n---\n\n${params.content}`)
                 return { delivered: true }
               } catch (err) {
                 return { delivered: false, error: String(err) }
@@ -5245,7 +5271,7 @@ export class SessionManager {
               isLeadTargetName(params.targetName || '', managed.teamId)
             ) {
               try {
-                await this.sendMessage(managed.parentSessionId, `[Team Result] ${params.content}`)
+                await this.sendMessage(managed.parentSessionId, `**${managed.teammateName || 'Teammate'}** completed:\n\n---\n\n${params.content}`)
                 return { delivered: true }
               } catch (err) {
                 return { delivered: false, error: String(err) }

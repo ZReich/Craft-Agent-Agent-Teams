@@ -22,6 +22,7 @@ type ManagedSessionLike = {
   isTeamLead?: boolean
   isProcessing?: boolean
   teamLevelQgRunning?: boolean
+  qgCycleCount?: number
 }
 
 export type AgentTeamCompletionContext = {
@@ -32,6 +33,7 @@ export type AgentTeamCompletionContext = {
     updateTaskStatus: (teamId: string, sessionId: string, status: 'completed' | 'failed') => void
     autoArchiveCompletedSession: (sessionId: string) => Promise<void>
     getQualityGateSkipReason: (managed: ManagedSessionLike) => string | null
+    disposeAgent: (sessionId: string, reason: string) => void
   }
   messaging: {
     sendToSession: (sessionId: string, message: string) => Promise<void>
@@ -61,6 +63,9 @@ export type AgentTeamCompletionContext = {
 }
 
 export class AgentTeamCompletionCoordinator {
+  // Sequential QG execution: one QG pipeline at a time per team to prevent CPU/RAM spikes
+  private teamQgQueue = new Map<string, Promise<void>>()
+
   constructor(private readonly context: AgentTeamCompletionContext) {}
 
   async handleAgentTeamCompletionOnStop(managed: ManagedSessionLike, sessionId: string, reason: StopReason): Promise<void> {
@@ -83,7 +88,7 @@ export class AgentTeamCompletionCoordinator {
 
     if (!qgConfig.enabled) {
       this.context.teammate.updateTaskStatus(resolvedTeamId, managed.id, 'completed')
-      await this.relayTeammateMessages(managed.parentSessionId, teammateName, resultContent, deliveryMeta, '[Team Result] Teammate "{name}" has completed their work:')
+      await this.relayTeammateMessages(managed.parentSessionId, teammateName, resultContent, deliveryMeta)
       await this.maybePromptLeadSynthesis(lead, managed.parentSessionId)
       return
     }
@@ -97,7 +102,8 @@ export class AgentTeamCompletionCoordinator {
       return
     }
 
-    await this.runIndividualQualityGates({
+    // Sequential QG: queue per team so only one QG pipeline runs at a time
+    await this.enqueueQualityGate(resolvedTeamId, () => this.runIndividualQualityGates({
       managed,
       lead,
       teammateName,
@@ -106,7 +112,14 @@ export class AgentTeamCompletionCoordinator {
       deliveryMeta,
       qgConfig,
       sessionId,
-    })
+    }))
+  }
+
+  private async enqueueQualityGate(teamId: string, fn: () => Promise<void>): Promise<void> {
+    const prev = this.teamQgQueue.get(teamId) ?? Promise.resolve()
+    const current = prev.then(fn, fn)  // Run even if previous rejected
+    this.teamQgQueue.set(teamId, current)
+    return current
   }
 
   private async relayTeammateMessages(parentSessionId: string, teammateName: string, resultContent: string, deliveryMeta: string, template = '**{name}** completed:'): Promise<void> {
@@ -204,8 +217,23 @@ export class AgentTeamCompletionCoordinator {
   }): Promise<void> {
     const { managed, lead, teammateName, resolvedTeamId, resultContent, deliveryMeta, qgConfig, sessionId } = params
     const cycleKey = `${sessionId}-qg`
-    const currentCycle = (this.context.quality.cycles.get(cycleKey) || 0) + 1
+    // Use persisted cycle count (survives app restarts) with in-memory Map as fallback
+    const previousCycle = managed.qgCycleCount ?? this.context.quality.cycles.get(cycleKey) ?? 0
+    const currentCycle = previousCycle + 1
+    managed.qgCycleCount = currentCycle
     this.context.quality.cycles.set(cycleKey, currentCycle)
+
+    // HARD CAP: Absolutely no more QG cycles after maxReviewCycles + 1 (post-escalation attempt)
+    const absoluteMax = qgConfig.maxReviewCycles + 1
+    if (currentCycle > absoluteMax) {
+      sessionLog.warn(`[AgentTeams] QG hard cap reached for "${teammateName}" (cycle ${currentCycle} > ${absoluteMax}). Force-relaying results.`)
+      this.context.quality.cycles.delete(cycleKey)
+      this.context.teammate.updateTaskStatus(resolvedTeamId, managed.id, 'completed')
+      await this.relayTeammateMessages(managed.parentSessionId!, teammateName, resultContent, deliveryMeta)
+      await this.maybeArchiveCompletedTeamSession(sessionId)
+      await this.maybePromptLeadSynthesis(lead, managed.parentSessionId!)
+      return
+    }
 
     const runner = this.context.quality.getRunner()
     const taskContext: TaskContext = { taskDescription: managed.name || 'Teammate task', workingDirectory: managed.workingDirectory }
@@ -256,6 +284,8 @@ export class AgentTeamCompletionCoordinator {
         ].join('\n')
 
         await this.context.messaging.sendToSession(managed.parentSessionId!, relayMessage)
+        // Free memory: dispose the teammate's agent subprocess now that QG passed
+        this.context.teammate.disposeAgent(sessionId, 'qg-passed')
         await this.maybeArchiveCompletedTeamSession(sessionId)
         await this.maybePromptLeadSynthesis(lead, managed.parentSessionId!)
         return
@@ -293,6 +323,8 @@ export class AgentTeamCompletionCoordinator {
           '',
           deliveryMeta,
         ].join('\n'))
+        // Free memory: dispose after escalation — no more cycles will run
+        this.context.teammate.disposeAgent(sessionId, 'qg-escalated')
         await this.maybeArchiveCompletedTeamSession(sessionId)
         return
       }

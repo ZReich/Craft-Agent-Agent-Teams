@@ -9,7 +9,7 @@ import type { BackendConfig, PermissionRequestType } from './backend/types.ts';
 import { parseError, type AgentError } from './errors.ts';
 import { runErrorDiagnostics } from './diagnostics.ts';
 import { loadStoredConfig, loadConfigDefaults, type Workspace, type AuthType, getDefaultLlmConnection, getLlmConnection } from '../config/storage.ts';
-import { isLocalMcpEnabled } from '../workspaces/storage.ts';
+import { isLocalMcpEnabled, isAgentTeamsEnabled } from '../workspaces/storage.ts';
 import { loadPlanFromPath, type SessionConfig as Session } from '../sessions/storage.ts';
 import { DEFAULT_MODEL, isClaudeModel, getDefaultSummarizationModel } from '../config/models.ts';
 import { getCredentialManager } from '../credentials/index.ts';
@@ -941,7 +941,8 @@ export class ClaudeAgent extends BaseAgent {
               // we intercept it and create a separate session instead of in-process execution.
               // ============================================================
               // --- Task tool: Spawn teammate as a separate session ---
-              if (this.isTeammateSpawnToolName(toolName) && this.onTeammateSpawnRequested) {
+              // KILL SWITCH: Only intercept if agent teams are enabled for this workspace
+              if (this.isTeammateSpawnToolName(toolName) && this.onTeammateSpawnRequested && isAgentTeamsEnabled(this.workspaceRootPath)) {
                 const toolInput = input.tool_input as Record<string, unknown>;
                 const explicitTeamName = typeof toolInput.team_name === 'string'
                   ? toolInput.team_name

@@ -381,6 +381,8 @@ export interface SessionMetadata {
   teammateName?: string;
   /** Role label for teammate sessions (e.g., head, worker, reviewer, escalation) */
   teammateRole?: string;
+  /** Persisted QG cycle count — survives app restarts */
+  qgCycleCount?: number;
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
