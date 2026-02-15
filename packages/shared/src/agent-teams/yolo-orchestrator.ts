@@ -26,8 +26,12 @@ import type {
   TeamPhase,
   SpecEvolutionProposal,
   Spec,
+  DesignFlowConfig,
+  DesignVariant,
+  DesignArtifact,
+  ProjectStack,
 } from '@craft-agent/core/types';
-import { DEFAULT_YOLO_CONFIG } from '@craft-agent/core/types';
+import { DEFAULT_YOLO_CONFIG, DEFAULT_DESIGN_FLOW_CONFIG, mergeDesignFlowConfig } from '@craft-agent/core/types';
 import type { AgentTeamManager } from '../agent/agent-team-manager';
 import type { ReviewLoopOrchestrator } from './review-loop';
 
@@ -67,6 +71,20 @@ export interface YoloCallbacks {
 
   /** Request approval for spec changes (smart mode, when requireApprovalForSpecChanges is true) */
   requestApproval?(teamId: string, proposals: SpecEvolutionProposal[]): Promise<SpecEvolutionProposal[]>;
+
+  // ── Design Flow Callbacks (REQ-003) ──────────────────────────
+
+  /** Detect the project's technology stack. Called during stack-detection phase. */
+  detectStack?(teamId: string, workingDir: string): Promise<ProjectStack>;
+
+  /** Generate design variants using Head-UX + Workers. Returns the generated variants. */
+  generateDesignVariants?(teamId: string, stack: ProjectStack, spec: Spec, count: number): Promise<DesignVariant[]>;
+
+  /**
+   * Present design variants to the user and wait for selection.
+   * Returns the selected variant ID, or 'regenerate' to generate more.
+   */
+  presentDesignVariants?(teamId: string, variants: DesignVariant[], round: number): Promise<string>;
 }
 
 // ============================================================
@@ -97,7 +115,7 @@ export class YoloOrchestrator extends EventEmitter {
    * Start an autonomous YOLO run for a team.
    * This is the main entry point — it drives the full lifecycle.
    */
-  async start(teamId: string, objective: string, config: Partial<YoloConfig> = {}): Promise<YoloState> {
+  async start(teamId: string, objective: string, config: Partial<YoloConfig> = {}, designFlowConfig?: Partial<DesignFlowConfig>): Promise<YoloState> {
     if (this.state && this.state.phase !== 'idle' && this.state.phase !== 'completed' && this.state.phase !== 'aborted') {
       throw new Error(`YOLO is already running (phase: ${this.state.phase})`);
     }
@@ -125,8 +143,10 @@ export class YoloOrchestrator extends EventEmitter {
 
     this.logActivity('yolo-started', `YOLO ${mergedConfig.mode} mode started — objective: "${objective.slice(0, 100)}"`);
 
+    const mergedDesignFlow = mergeDesignFlowConfig(designFlowConfig);
+
     try {
-      await this.runLifecycle(teamId, objective, mergedConfig);
+      await this.runLifecycle(teamId, objective, mergedConfig, mergedDesignFlow);
     } catch (err) {
       if (!this.aborted) {
         this.transition('aborted');
@@ -143,12 +163,15 @@ export class YoloOrchestrator extends EventEmitter {
 
   /**
    * Pause the YOLO run (can be resumed later).
+   * Implements PERF-002: Stops cost check interval and timeout during pause
+   * to eliminate idle CPU polling when the orchestrator is not executing.
    */
   pause(reason: YoloState['pauseReason'] = 'user-requested'): void {
     if (!this.state || this.state.phase === 'completed' || this.state.phase === 'aborted') return;
     this.state.pauseReason = reason;
     this.transition('paused');
     this.logActivity('yolo-paused', `YOLO paused: ${reason}`);
+    this.cleanup();
   }
 
   /**
@@ -187,7 +210,7 @@ export class YoloOrchestrator extends EventEmitter {
   // Core Lifecycle
   // ============================================================
 
-  private async runLifecycle(teamId: string, objective: string, config: YoloConfig): Promise<void> {
+  private async runLifecycle(teamId: string, objective: string, config: YoloConfig, designFlow: DesignFlowConfig = DEFAULT_DESIGN_FLOW_CONFIG): Promise<void> {
     // Phase 1: Generate spec
     this.transition('spec-generation');
     this.checkAborted();
@@ -217,6 +240,17 @@ export class YoloOrchestrator extends EventEmitter {
 
     // Build phases from task definitions (pass created tasks so IDs are populated)
     const phases = this.buildPhases(taskDefs, createdTasks);
+
+    // ── Design Flow Phases (REQ-003) ──────────────────────────
+    // When designFlow.enabled, inject stack-detection → design-generation → design-selection
+    // between task-decomposition and executing. Backend/research tasks can still run in parallel.
+    if (designFlow.enabled) {
+      const designArtifact = await this.runDesignFlow(teamId, spec, designFlow);
+      if (designArtifact && this.state) {
+        this.state.designArtifact = designArtifact;
+      }
+      if (this.aborted) return;
+    }
 
     // Phase 3: Execute (phase-aware)
     if (phases.length > 0) {
@@ -277,6 +311,100 @@ export class YoloOrchestrator extends EventEmitter {
     this.state!.completedAt = new Date().toISOString();
     this.transition('completed');
     this.logActivity('yolo-completed', `YOLO completed — ${createdTasks.length} tasks executed`);
+  }
+
+  // ============================================================
+  // Design Flow (REQ-003)
+  // ============================================================
+
+  /**
+   * Run the design flow: stack detection → variant generation → user selection.
+   * Supports multiple generation rounds (user can request "generate 4 more").
+   * Returns the selected DesignArtifact, or undefined if aborted.
+   */
+  private async runDesignFlow(
+    teamId: string,
+    spec: Spec,
+    designFlow: DesignFlowConfig,
+  ): Promise<DesignArtifact | undefined> {
+    // Step 1: Stack Detection
+    this.transition('stack-detection');
+    this.checkAborted();
+    this.logActivity('design-generation-started', 'Design flow started — detecting project stack');
+
+    if (!this.callbacks.detectStack) {
+      this.logActivity('error', 'Design flow enabled but detectStack callback not provided — skipping');
+      return undefined;
+    }
+
+    // Use the team manager's workspace root or fall back to cwd
+    const workingDir = process.cwd();
+    const stack = await this.callbacks.detectStack(teamId, workingDir);
+
+    if (!stack.framework) {
+      this.logActivity('error', 'Could not detect project framework — skipping design flow');
+      return undefined;
+    }
+
+    // Step 2: Design Generation (supports multiple rounds)
+    this.transition('design-generation');
+    this.checkAborted();
+
+    if (!this.callbacks.generateDesignVariants || !this.callbacks.presentDesignVariants) {
+      this.logActivity('error', 'Design flow callbacks not fully provided — skipping');
+      return undefined;
+    }
+
+    let allVariants: DesignVariant[] = [];
+    let round = 0;
+    let selectedVariantId: string | undefined;
+
+    while (!selectedVariantId) {
+      round++;
+      this.checkAborted();
+
+      this.logActivity('design-generation-started', `Generating ${designFlow.variantsPerRound} design variants (round ${round})`);
+      const variants = await this.callbacks.generateDesignVariants(teamId, stack, spec, designFlow.variantsPerRound);
+      allVariants.push(...variants);
+
+      // Mark each variant as ready
+      for (const v of variants) {
+        this.logActivity('design-variant-ready', `Design variant "${v.name}" ready (${v.status})`);
+      }
+
+      // Step 3: Design Selection
+      this.transition('design-selection');
+      this.checkAborted();
+
+      const selection = await this.callbacks.presentDesignVariants(teamId, allVariants, round);
+
+      if (selection === 'regenerate') {
+        // User wants more variants — loop back to generation
+        this.transition('design-generation');
+        continue;
+      }
+
+      selectedVariantId = selection;
+    }
+
+    // Build the design artifact from the selected variant
+    const selected = allVariants.find(v => v.id === selectedVariantId);
+    if (!selected) {
+      this.logActivity('error', `Selected variant ${selectedVariantId} not found`);
+      return undefined;
+    }
+
+    this.logActivity('design-selected', `Design "${selected.name}" selected — proceeding to implementation`);
+
+    return {
+      selectedVariantId: selected.id,
+      selectedVariantName: selected.name,
+      brief: selected.brief,
+      componentSpec: selected.componentSpec,
+      filePaths: selected.files.map(f => f.path),
+      projectStack: stack,
+      selectedAt: new Date().toISOString(),
+    };
   }
 
   // ============================================================

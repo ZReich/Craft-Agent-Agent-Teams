@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from "react"
+import React, { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useAction, useActionLabel } from "@/actions"
 import { formatDistanceToNow, formatDistanceToNowStrict, isToday, isYesterday, format, startOfDay } from "date-fns"
 import type { Locale } from "date-fns"
@@ -358,8 +358,8 @@ interface SessionItemProps {
   onUnarchive?: (sessionId: string) => void
   onMarkUnread: (sessionId: string) => void
   onDelete: (sessionId: string, skipConfirmation?: boolean) => Promise<boolean>
-  onSelect: () => void
-  onOpenInNewWindow: () => void
+  onSelect: (item: SessionMeta, index: number) => void
+  onOpenInNewWindow?: (session: SessionMeta) => void
   /** Current permission mode for this session (from real-time state) */
   permissionMode?: PermissionMode
   /** LLM connection slug for this session */
@@ -381,9 +381,9 @@ interface SessionItemProps {
   /** Whether this item is in the multi-select set */
   isInMultiSelect?: boolean
   /** Toggle this item in multi-select (cmd/ctrl+click) */
-  onToggleSelect?: () => void
+  onToggleSelect?: (item: SessionMeta, index: number) => void
   /** Range select to this item (shift+click) */
-  onRangeSelect?: () => void
+  onRangeSelect?: (toIndex: number) => void
   /** Callback to focus the session-list zone (enables keyboard shortcuts) */
   onFocusZone?: () => void
 }
@@ -391,8 +391,12 @@ interface SessionItemProps {
 /**
  * SessionItem - Individual session card with todo checkbox and dropdown menu
  * Tracks menu open state to keep "..." button visible
+ *
+ * Implements PERF-004: Wrapped in React.memo to prevent cascading re-renders.
+ * Without this, every SessionItem re-renders when SessionList re-renders
+ * (filter changes, new messages, context updates) even if its own props are unchanged.
  */
-function SessionItem({
+const SessionItem = React.memo(function SessionItem({
   item,
   index,
   itemProps,
@@ -475,21 +479,21 @@ function SessionItem({
     if (isMetaKey && onToggleSelect) {
       // Cmd/Ctrl+click: toggle selection
       e.preventDefault()
-      onToggleSelect()
+      onToggleSelect(item, index)
       return
     }
 
     if (isShiftKey && onRangeSelect) {
       // Shift+click: range select
       e.preventDefault()
-      onRangeSelect()
+      onRangeSelect(index)
       return
     }
 
     // Normal click: single select
     // Start perf tracking for session switch
     rendererPerf.startSessionSwitch(item.id)
-    onSelect()
+    onSelect(item, index)
   }
 
   const handleTodoStateSelect = (state: TodoStateId) => {
@@ -867,7 +871,7 @@ function SessionItem({
                     onUnarchive={() => onUnarchive?.(item.id)}
                     onMarkUnread={() => onMarkUnread(item.id)}
                     onTodoStateChange={(state) => onTodoStateChange(item.id, state)}
-                    onOpenInNewWindow={onOpenInNewWindow}
+                    onOpenInNewWindow={onOpenInNewWindow ? () => onOpenInNewWindow(item) : undefined}
                     onDelete={() => onDelete(item.id)}
                   />
                 </DropdownMenuProvider>
@@ -901,7 +905,7 @@ function SessionItem({
               onUnarchive={() => onUnarchive?.(item.id)}
               onMarkUnread={() => onMarkUnread(item.id)}
               onTodoStateChange={(state) => onTodoStateChange(item.id, state)}
-              onOpenInNewWindow={onOpenInNewWindow}
+              onOpenInNewWindow={onOpenInNewWindow ? () => onOpenInNewWindow(item) : undefined}
               onDelete={() => onDelete(item.id)}
             />
           </ContextMenuProvider>
@@ -909,7 +913,8 @@ function SessionItem({
       </ContextMenu>
     </div>
   )
-}
+})
+SessionItem.displayName = 'SessionItem'
 
 /**
  * SessionListSectionHeader - Section header for date groups and search result sections.
@@ -1417,6 +1422,11 @@ export function SessionList({
     selectRange(toIndex, allIds)
   }, [focusZone, flatItems, selectRange])
 
+  // PERF-004: Stable callback for SessionItem's onFocusZone prop (avoids inline closure)
+  const handleFocusZoneClick = useCallback(() => {
+    focusZone('session-list', { intent: 'click', moveFocus: false })
+  }, [focusZone])
+
   // NOTE: We intentionally do NOT auto-select sessions while typing in search.
   // Auto-selecting causes: 1) ChatDisplay to scroll, 2) focus loss from search input
   // Selection only changes via: Enter key activation or explicit click
@@ -1580,7 +1590,8 @@ export function SessionList({
     }
   }, [focusZone])
 
-  const handleRenameClick = (sessionId: string, currentName: string) => {
+  // PERF-004: Stabilized with useCallback for React.memo on SessionItem
+  const handleRenameClick = useCallback((sessionId: string, currentName: string) => {
     setRenameSessionId(sessionId)
     setRenameName(currentName)
     // Defer dialog open to next frame to let dropdown fully unmount first
@@ -1588,7 +1599,7 @@ export function SessionList({
     requestAnimationFrame(() => {
       setRenameDialogOpen(true)
     })
-  }
+  }, [])
 
   const handleRenameSubmit = () => {
     if (renameSessionId && renameName.trim()) {
@@ -1749,8 +1760,8 @@ export function SessionList({
                         onUnarchive={onUnarchive ? handleUnarchiveWithToast : undefined}
                         onMarkUnread={onMarkUnread}
                         onDelete={handleDeleteWithToast}
-                        onSelect={() => handleSelectSession(item, flatIndex)}
-                        onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
+                        onSelect={handleSelectSession}
+                        onOpenInNewWindow={onOpenInNewWindow}
                         permissionMode={sessionOptions?.get(item.id)?.permissionMode}
                         llmConnection={item.llmConnection}
                         searchQuery={highlightQuery}
@@ -1761,9 +1772,9 @@ export function SessionList({
                         chatMatchCount={isSearchMode ? contentSearchResults.get(item.id)?.matchCount : undefined}
                         isMultiSelectActive={isMultiSelectActive}
                         isInMultiSelect={isSessionSelected(item.id)}
-                        onToggleSelect={() => handleToggleSelect(item, flatIndex)}
-                        onRangeSelect={() => handleRangeSelect(flatIndex)}
-                        onFocusZone={() => focusZone('session-list', { intent: 'click', moveFocus: false })}
+                        onToggleSelect={handleToggleSelect}
+                        onRangeSelect={handleRangeSelect}
+                        onFocusZone={handleFocusZoneClick}
                       />
                     )
                   })}
@@ -1795,8 +1806,8 @@ export function SessionList({
                         onUnarchive={onUnarchive ? handleUnarchiveWithToast : undefined}
                         onMarkUnread={onMarkUnread}
                         onDelete={handleDeleteWithToast}
-                        onSelect={() => handleSelectSession(item, flatIndex)}
-                        onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
+                        onSelect={handleSelectSession}
+                        onOpenInNewWindow={onOpenInNewWindow}
                         permissionMode={sessionOptions?.get(item.id)?.permissionMode}
                         llmConnection={item.llmConnection}
                         searchQuery={highlightQuery}
@@ -1807,9 +1818,9 @@ export function SessionList({
                         chatMatchCount={isSearchMode ? contentSearchResults.get(item.id)?.matchCount : undefined}
                         isMultiSelectActive={isMultiSelectActive}
                         isInMultiSelect={isSessionSelected(item.id)}
-                        onToggleSelect={() => handleToggleSelect(item, flatIndex)}
-                        onRangeSelect={() => handleRangeSelect(flatIndex)}
-                        onFocusZone={() => focusZone('session-list', { intent: 'click', moveFocus: false })}
+                        onToggleSelect={handleToggleSelect}
+                        onRangeSelect={handleRangeSelect}
+                        onFocusZone={handleFocusZoneClick}
                       />
                     )
                   })}
@@ -1850,8 +1861,8 @@ export function SessionList({
                     onUnarchive={onUnarchive ? handleUnarchiveWithToast : undefined}
                     onMarkUnread={onMarkUnread}
                     onDelete={handleDeleteWithToast}
-                    onSelect={() => handleSelectSession(item, flatIndex)}
-                    onOpenInNewWindow={() => onOpenInNewWindow?.(item)}
+                    onSelect={handleSelectSession}
+                    onOpenInNewWindow={onOpenInNewWindow}
                     permissionMode={sessionOptions?.get(item.id)?.permissionMode}
                     llmConnection={item.llmConnection}
                     searchQuery={searchQuery}
@@ -1862,9 +1873,9 @@ export function SessionList({
                     chatMatchCount={contentSearchResults.get(item.id)?.matchCount}
                     isMultiSelectActive={isMultiSelectActive}
                     isInMultiSelect={isSessionSelected(item.id)}
-                    onToggleSelect={() => handleToggleSelect(item, flatIndex)}
-                    onRangeSelect={() => handleRangeSelect(flatIndex)}
-                    onFocusZone={() => focusZone('session-list', { intent: 'click', moveFocus: false })}
+                    onToggleSelect={handleToggleSelect}
+                    onRangeSelect={handleRangeSelect}
+                    onFocusZone={handleFocusZoneClick}
                   />
                 )
               }

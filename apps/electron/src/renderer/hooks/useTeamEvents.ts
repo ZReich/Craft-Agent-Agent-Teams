@@ -348,6 +348,9 @@ export function useTeamEvents(
 /**
  * Hook for subscribing to specific event type
  */
+// Implements PERF-005: Destructure stable `on`/`off` callbacks (wrapped in useCallback
+// with [] deps) so the effect doesn't re-fire on every render. Previously `events`
+// (a new object each render) was in the dep array, causing handler thrashing.
 export function useTeamEventHandler(
   teamId: string,
   eventType: string,
@@ -355,11 +358,12 @@ export function useTeamEventHandler(
   options?: Omit<TeamEventSubscriptionOptions, 'teamId' | 'eventTypes'>
 ): UseTeamEventsResult {
   const events = useTeamEvents({ ...options, teamId });
+  const { on, off } = events;
 
   useEffect(() => {
-    events.on(eventType, handler);
-    return () => events.off(eventType, handler);
-  }, [events, eventType, handler]);
+    on(eventType, handler);
+    return () => off(eventType, handler);
+  }, [on, off, eventType, handler]);
 
   return events;
 }
@@ -389,6 +393,8 @@ export function useTeamStateSync(
   options?: Omit<TeamEventSubscriptionOptions, 'teamId'>
 ): UseTeamEventsResult {
   const events = useTeamEvents({ ...options, teamId });
+  // PERF-005: Destructure stable callbacks to avoid re-subscribing every render
+  const { on, off } = events;
 
   useEffect(() => {
     const handler = (event: TeamEvent) => {
@@ -442,9 +448,9 @@ export function useTeamStateSync(
       }
     };
 
-    events.on('*', handler);
-    return () => events.off('*', handler);
-  }, [events, callbacks]);
+    on('*', handler);
+    return () => off('*', handler);
+  }, [on, off, callbacks]);
 
   return events;
 }
