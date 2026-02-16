@@ -110,6 +110,8 @@ export interface TeamTask {
   /** Phase execution order (lower = earlier; tasks in same phase can run in parallel) */
   phaseOrder?: number;
   createdAt: string;
+  /** When this task was first moved to in_progress */
+  startedAt?: string;
   completedAt?: string;
   /** Who created this task (teammate ID or 'user') */
   createdBy?: string;
@@ -175,7 +177,35 @@ export interface AvailableModel {
 }
 
 export type ModelCapability = 'reasoning' | 'coding' | 'tool-use' | 'fast' | 'vision' | 'long-context';
-export type TeamRole = 'lead' | 'head' | 'worker' | 'reviewer' | 'escalation';
+
+/**
+ * Team roles. Implements REQ-B7: New names alongside old for migration.
+ * - 'orchestrator' replaces 'lead' (decompose, delegate, synthesize)
+ * - 'team-manager' replaces 'head' (manages a sub-team of workers)
+ * Old values kept for one release cycle; normalizeTeamRole() maps old → new.
+ */
+export type TeamRole = 'lead' | 'head' | 'worker' | 'reviewer' | 'escalation'
+  | 'orchestrator' | 'team-manager';
+
+/** Implements REQ-B7: Map legacy role names to their new equivalents */
+export function normalizeTeamRole(role: string): TeamRole {
+  switch (role) {
+    case 'lead': return 'orchestrator';
+    case 'head': return 'team-manager';
+    default: return role as TeamRole;
+  }
+}
+
+/** Display-friendly role labels for the UI */
+export const TEAM_ROLE_DISPLAY: Record<TeamRole, string> = {
+  lead: 'Orchestrator',
+  orchestrator: 'Orchestrator',
+  head: 'Team Manager',
+  'team-manager': 'Team Manager',
+  worker: 'Worker',
+  reviewer: 'Reviewer',
+  escalation: 'Escalation',
+};
 
 /**
  * Model configuration for a team — specifies which model/provider to use per role
@@ -202,11 +232,14 @@ export interface ModelAssignment {
 // ============================================================
 
 export type ModelPresetId =
+  | 'smart'
+  | 'codex'
+  | 'budget'
+  | 'custom'
+  // Legacy aliases for migration — settings page will migrate them
   | 'max-quality'
   | 'balanced'
   | 'cost-optimized'
-  | 'budget'
-  | 'custom'
   | 'codex-balanced'
   | 'codex-full';
 
@@ -269,7 +302,7 @@ export interface ReviewResult {
 // ============================================================
 
 /** Names of each quality gate stage */
-export type QualityGateStageName = 'syntax' | 'tests' | 'architecture' | 'simplicity' | 'errors' | 'completeness' | 'spec_compliance' | 'traceability' | 'rollout_safety';
+export type QualityGateStageName = 'syntax' | 'tests' | 'architecture' | 'simplicity' | 'errors' | 'completeness' | 'spec_compliance' | 'traceability' | 'rollout_safety' | 'design_compliance';
 
 /** Result from a single quality gate stage */
 export interface QualityGateStageResult {
@@ -305,6 +338,8 @@ export interface QualityGateResult {
     spec_compliance?: QualityGateStageResult;
     traceability?: QualityGateStageResult;
     rollout_safety?: QualityGateStageResult;
+    /** Design flow stage — only present when a design artifact exists (REQ-011) */
+    design_compliance?: QualityGateStageResult;
   };
   /** How many review cycles have run for this task */
   cycleCount: number;
@@ -434,6 +469,9 @@ export type TeamActivityType =
   | 'yolo-spec-evolution-proposed'
   | 'phase-advanced'
   | 'phase-blocked'
+  | 'design-generation-started'  // Implements REQ-003: Design flow activity
+  | 'design-variant-ready'       // Implements REQ-003: Design flow activity
+  | 'design-selected'            // Implements REQ-003: Design flow activity
   | 'error';
 
 // ============================================================
@@ -467,6 +505,9 @@ export type YoloPhase =
   | 'idle'
   | 'spec-generation'
   | 'task-decomposition'
+  | 'stack-detection'       // Implements REQ-003: Design flow phase
+  | 'design-generation'     // Implements REQ-003: Design flow phase
+  | 'design-selection'      // Implements REQ-003: Design flow phase
   | 'executing'
   | 'reviewing'
   | 'integration-check'
@@ -505,7 +546,9 @@ export const DEFAULT_YOLO_CONFIG: YoloConfig = {
   adaptiveSpecs: true,
   costCapUsd: 5.00,
   timeoutMinutes: 60,
-  maxConcurrency: 3,
+  // Implements REQ-B4: Raised from 3 to 5 — modern machines handle 5+ agents;
+  // API rate limits are the practical bottleneck, not local resources.
+  maxConcurrency: 5,
   autoRemediate: true,
   requireApprovalForSpecChanges: true,
   maxRemediationRounds: 3,
@@ -536,6 +579,8 @@ export interface YoloState {
   pendingSpecChanges: SpecEvolutionProposal[];
   /** Summary of what happened */
   summary?: string;
+  /** Design artifact from the design flow phase (when designFlow enabled) */
+  designArtifact?: DesignArtifact;
 }
 
 /**
@@ -579,4 +624,200 @@ export interface TeamPhase {
   taskIds: string[];
   /** When this phase completed */
   completedAt?: string;
+}
+
+// ============================================================
+// Design Flow Types
+// ============================================================
+
+/**
+ * Detected project technology stack.
+ * Produced by `detectProjectStack()` and consumed by design Workers
+ * to generate stack-native design variants.
+ *
+ * Implements REQ-001: Automated Project Stack Detection
+ */
+export interface ProjectStack {
+  /** Detected framework (null if undetectable) */
+  framework: 'react' | 'nextjs' | 'remix' | 'vue' | 'svelte' | 'astro' | 'vanilla' | null;
+  /** Next.js router type (only when framework=nextjs) */
+  nextjsRouter?: 'app' | 'pages';
+  /** Whether TypeScript is used */
+  typescript: boolean;
+  /** CSS/styling approach */
+  styling: {
+    tailwind: boolean;
+    /** Raw Tailwind config (design tokens) — null if not found */
+    tailwindConfig: Record<string, unknown> | null;
+    cssModules: boolean;
+    styledComponents: boolean;
+    other: string[];
+  };
+  /** Animation library (null if none detected) */
+  animationLibrary: 'framer-motion' | 'react-spring' | 'gsap' | 'motion' | null;
+  /** Component inventory — names and file paths from the project */
+  components: Array<{ name: string; path: string }>;
+  /** UI library (e.g. 'shadcn', 'radix', 'mantine', 'mui') */
+  uiLibrary: string | null;
+  /** Dev server command from package.json scripts.dev */
+  devCommand: string | null;
+  /** Dev server port (parsed from devCommand or default for framework) */
+  devPort: number | null;
+  /** Existing layouts, pages, hooks discovered in the project */
+  patterns: {
+    layouts: string[];
+    pages: string[];
+    hooks: string[];
+    contexts: string[];
+  };
+  /** Raw package.json dependencies (name → version) */
+  dependencies: Record<string, string>;
+}
+
+/**
+ * Design flow configuration — stored in workspace config under `agentTeams.designFlow`.
+ *
+ * Implements REQ-002: Design Flow Configuration
+ */
+export interface DesignFlowConfig {
+  /** Master toggle for the design flow phase */
+  enabled: boolean;
+  /** Number of design variants per generation round (2, 4, or 6) */
+  variantsPerRound: 2 | 4 | 6;
+  /** Model override for design generation (null = inherit headModel) */
+  designModel: string | null;
+  /** Auto-save selected designs as workspace templates */
+  autoSaveTemplates: boolean;
+}
+
+/** Sensible defaults for design flow config */
+export const DEFAULT_DESIGN_FLOW_CONFIG: DesignFlowConfig = {
+  enabled: false,
+  variantsPerRound: 4,
+  designModel: null,
+  autoSaveTemplates: true,
+};
+
+/**
+ * Merge partial design flow config with defaults.
+ */
+export function mergeDesignFlowConfig(partial?: Partial<DesignFlowConfig>): DesignFlowConfig {
+  if (!partial) return { ...DEFAULT_DESIGN_FLOW_CONFIG };
+  return { ...DEFAULT_DESIGN_FLOW_CONFIG, ...partial };
+}
+
+/** Build status for a single design variant */
+export type DesignVariantStatus = 'generating' | 'compiling' | 'ready' | 'error';
+
+/**
+ * A single design variant produced by a Worker.
+ *
+ * Implements REQ-004: Design Variant Generation Pipeline
+ */
+export interface DesignVariant {
+  /** Unique variant identifier */
+  id: string;
+  /** Human-readable name (e.g. "Minimal", "Data-Dense", "Expressive", "Conventional") */
+  name: string;
+  /** Design direction description */
+  direction: string;
+  /** Current build status */
+  status: DesignVariantStatus;
+  /** Generated source files (relative to design-preview/) */
+  files: Array<{ path: string; content: string }>;
+  /** Brief markdown describing the design approach */
+  brief: string;
+  /** Component spec markdown */
+  componentSpec: string;
+  /** Preview URL (e.g. http://localhost:3000/design-preview/variant-abc) */
+  previewUrl: string | null;
+  /** Compilation error (when status=error) */
+  error: string | null;
+  /** Generation round (1-based) */
+  round: number;
+  /** Timestamp when variant was created */
+  createdAt: string;
+}
+
+/**
+ * Design artifact attached to a team spec after selection.
+ * Becomes the starting point for frontend implementation.
+ *
+ * Implements REQ-007: Design Selection → Implementation Handoff
+ */
+export interface DesignArtifact {
+  /** Selected variant ID */
+  selectedVariantId: string;
+  /** Selected variant name */
+  selectedVariantName: string;
+  /** Design brief (markdown) */
+  brief: string;
+  /** Component spec (markdown) */
+  componentSpec: string;
+  /** File paths of the selected design (moved to final location) */
+  filePaths: string[];
+  /** Stack snapshot at time of selection */
+  projectStack: ProjectStack;
+  /** When the design was selected */
+  selectedAt: string;
+}
+
+/**
+ * Metadata for all design variants in a session.
+ * Stored at `sessions/{sessionId}/designs/metadata.json`.
+ *
+ * Implements REQ-008: Design Artifact Storage
+ */
+export interface DesignMetadata {
+  /** Session ID */
+  sessionId: string;
+  /** Team ID */
+  teamId: string;
+  /** All generated variants across all rounds */
+  variants: DesignVariant[];
+  /** Current generation round */
+  currentRound: number;
+  /** Selected variant ID (null if no selection yet) */
+  selectedVariantId: string | null;
+  /** Stack snapshot used for generation */
+  projectStack: ProjectStack;
+  /** Timestamps */
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A saved design template in the workspace library.
+ * Templates are reusable starting points for future designs.
+ *
+ * Implements REQ-008: Design Artifact Storage
+ */
+export interface DesignTemplate {
+  /** Unique template ID */
+  id: string;
+  /** Human-readable template name */
+  name: string;
+  /** Description of the design */
+  description: string;
+  /** Source variant the template was saved from */
+  sourceVariantId: string;
+  /** Design direction */
+  direction: string;
+  /** Brief (markdown) */
+  brief: string;
+  /** Component spec (markdown) */
+  componentSpec: string;
+  /** Template file contents */
+  files: Array<{ path: string; content: string }>;
+  /** Stack requirements for compatibility checking */
+  stackRequirements: {
+    framework: ProjectStack['framework'];
+    typescript: boolean;
+    requiredDeps: string[];
+  };
+  /** When saved */
+  createdAt: string;
+  /** Source session and team */
+  sourceSessionId: string;
+  sourceTeamId: string;
 }

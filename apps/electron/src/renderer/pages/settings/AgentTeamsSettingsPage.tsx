@@ -26,6 +26,7 @@ import type { ModelPresetId, ModelAssignment, WorkspaceSettings } from '../../..
 import { OPENAI_MODELS, isCodexModel, getModelShortName } from '@config/models'
 import { isOpenAIProvider } from '@config/llm-connections'
 import { QUALITY_GATE_HELP, parseKnownFailingTests, stringifyKnownFailingTests } from './qualityGateHelp'
+import { DesignTemplateLibrary, type TemplateSummary, type TemplateDetail } from '@/components/designs'
 
 import {
   SettingsSection,
@@ -78,25 +79,51 @@ const ROLE_COLORS: Record<string, string> = {
   escalation: 'bg-rose-500',
 }
 
-// Preset configurations — all use non-thinking models by default; fast workers for throughput
-const PRESET_OPTIONS: { id: ModelPresetId; name: string; description: string; cost: string; costLevel: CostLevel | 0 }[] = [
-  { id: 'max-quality', name: 'Max Quality', description: 'Opus lead + Sonnet workers — best output quality', cost: '$$$$', costLevel: 4 },
-  { id: 'balanced', name: 'Balanced', description: 'Opus lead + Haiku workers — fast with smart planning', cost: '$$$', costLevel: 3 },
-  { id: 'cost-optimized', name: 'Cost Optimized', description: 'Opus lead + Kimi workers — quality plans, cheap execution', cost: '$$', costLevel: 2 },
-  { id: 'budget', name: 'Budget', description: 'Sonnet lead + Kimi workers — lowest cost', cost: '$', costLevel: 1 },
-  { id: 'codex-balanced', name: 'Codex Balanced', description: 'Codex lead + Sonnet workers — OpenAI planning', cost: '$$$', costLevel: 3 },
-  { id: 'codex-full', name: 'Codex Full', description: 'Codex everywhere — full OpenAI stack', cost: '$$$$', costLevel: 4 },
-  { id: 'custom', name: 'Custom', description: 'Choose model and thinking for every role', cost: '', costLevel: 0 },
+// Strategy configurations — 4 strategies replace the old 7 presets
+const STRATEGY_OPTIONS: { id: ModelPresetId; name: string; description: string; badge?: string; cost: string; costLevel: CostLevel | 0 }[] = [
+  { id: 'smart', name: 'Smart', badge: 'Recommended', description: 'Workers adapt to quality gates: Sonnet when QG on, Opus when off. Thinking auto-set per role.', cost: '$$$', costLevel: 3 },
+  { id: 'codex', name: 'Codex', description: 'OpenAI Codex for planning, Claude workers. Thinking auto-set.', cost: '$$$', costLevel: 3 },
+  { id: 'budget', name: 'Budget', description: 'Sonnet lead + Haiku workers. Thinking off. Lowest cost.', cost: '$', costLevel: 1 },
+  { id: 'custom', name: 'Custom', description: 'Full control over model and thinking for every role.', cost: '', costLevel: 0 },
 ]
 
-const PRESET_CONFIGS: Record<ModelPresetId, { lead: string; head: string; worker: string; reviewer: string; escalation: string }> = {
-  'max-quality': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
-  'balanced': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-haiku-4-5-20251001', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
-  'cost-optimized': { lead: 'claude-opus-4-6', head: 'claude-haiku-4-5-20251001', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
-  'budget': { lead: 'claude-sonnet-4-5-20250929', head: 'claude-haiku-4-5-20251001', worker: 'kimi-k2.5', reviewer: 'kimi-k2.5', escalation: 'claude-sonnet-4-5-20250929' },
+const STRATEGY_CONFIGS: Record<string, { lead: string; head: string; worker: string; reviewer: string; escalation: string }> = {
+  'smart': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-opus-4-6', escalation: 'claude-opus-4-6' },
+  'codex': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-haiku-4-5-20251001', escalation: 'gpt-5.3-codex' },
+  'budget': { lead: 'claude-sonnet-4-5-20250929', head: 'claude-haiku-4-5-20251001', worker: 'claude-haiku-4-5-20251001', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-sonnet-4-5-20250929' },
+  'custom': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-haiku-4-5-20251001', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
+  // Legacy migration targets — all map to smart
+  'max-quality': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-opus-4-6', escalation: 'claude-opus-4-6' },
+  'balanced': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-opus-4-6', escalation: 'claude-opus-4-6' },
+  'cost-optimized': { lead: 'claude-opus-4-6', head: 'claude-opus-4-6', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-opus-4-6', escalation: 'claude-opus-4-6' },
   'codex-balanced': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'claude-sonnet-4-5-20250929', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-sonnet-4-5-20250929' },
   'codex-full': { lead: 'gpt-5.3-codex', head: 'gpt-5.3-codex', worker: 'gpt-5.1-codex-mini', reviewer: 'claude-haiku-4-5-20251001', escalation: 'gpt-5.3-codex' },
-  'custom': { lead: 'claude-opus-4-6', head: 'claude-sonnet-4-5-20250929', worker: 'claude-haiku-4-5-20251001', reviewer: 'claude-haiku-4-5-20251001', escalation: 'claude-opus-4-6' },
+}
+
+// Implements REQ-P3: Thinking auto-set per strategy (only visible in Custom mode)
+const STRATEGY_THINKING: Record<string, Record<string, boolean>> = {
+  smart:  { lead: true,  head: true,  worker: false, reviewer: true,  escalation: true  },
+  codex:  { lead: false, head: false, worker: false, reviewer: true,  escalation: false },
+  budget: { lead: false, head: false, worker: false, reviewer: false, escalation: false },
+}
+
+/** Migrate old 7-preset IDs to new 4-strategy IDs */
+function migratePresetId(id: string): ModelPresetId {
+  switch (id) {
+    case 'max-quality':
+    case 'balanced':
+    case 'cost-optimized':
+      return 'smart'
+    case 'codex-balanced':
+    case 'codex-full':
+      return 'codex'
+    case 'budget':
+      return 'budget'
+    case 'custom':
+      return 'custom'
+    default:
+      return 'smart'
+  }
 }
 
 // Helper to get provider from model ID
@@ -108,6 +135,16 @@ function getProvider(model: string): string {
 
 export default function AgentTeamsSettingsPage() {
   const { activeWorkspaceId, llmConnections } = useAppShellContext()
+  const electronAPI = window.electronAPI as any
+
+  // Implements REQ-004: keep settings navigation resilient if Agent Teams IPC/preload is unavailable.
+  // This prevents a hard crash in feature-gated builds or during preload/renderer mismatches.
+  const hasAgentTeamsSettingsApi =
+    !!electronAPI &&
+    typeof electronAPI.getAgentTeamsEnabled === 'function' &&
+    typeof electronAPI.setAgentTeamsEnabled === 'function' &&
+    typeof electronAPI.getWorkspaceSettings === 'function' &&
+    typeof electronAPI.updateWorkspaceSetting === 'function'
 
   // Loading state
   const [isLoading, setIsLoading] = useState(true)
@@ -166,6 +203,16 @@ export default function AgentTeamsSettingsPage() {
     { value: 'default', label: 'Default Template', description: 'Balanced spec skeleton for most features' },
   ])
 
+  // Design Flow settings
+  const [designFlowEnabled, setDesignFlowEnabled] = useState(false)
+  const [designFlowVariantsPerRound, setDesignFlowVariantsPerRound] = useState<2 | 4 | 6>(4)
+  const [designFlowDesignModel, setDesignFlowDesignModel] = useState<string | null>(null)
+  const [designFlowAutoSaveTemplates, setDesignFlowAutoSaveTemplates] = useState(true)
+
+  // Design template library state
+  const [designTemplates, setDesignTemplates] = useState<TemplateSummary[]>([])
+  const [designTemplatesLoading, setDesignTemplatesLoading] = useState(false)
+
   // YOLO (autonomous execution) settings
   const [yoloMode, setYoloMode] = useState<'off' | 'fixed' | 'smart'>('off')
   const [yoloCostCapUsd, setYoloCostCapUsd] = useState('5')
@@ -179,20 +226,25 @@ export default function AgentTeamsSettingsPage() {
   // Load settings
   useEffect(() => {
     const loadSettings = async () => {
-      if (!window.electronAPI || !activeWorkspaceId) {
+      if (!hasAgentTeamsSettingsApi || !activeWorkspaceId) {
         setIsLoading(false)
         return
       }
 
       setIsLoading(true)
       try {
-        const enabled = await window.electronAPI.getAgentTeamsEnabled(activeWorkspaceId)
+        const enabled = await electronAPI.getAgentTeamsEnabled(activeWorkspaceId)
         setTeamsEnabled(enabled)
 
         // Load workspace settings for model config
-        const settings = await window.electronAPI.getWorkspaceSettings(activeWorkspaceId)
+        const settings = await electronAPI.getWorkspaceSettings(activeWorkspaceId)
         if (settings?.agentTeamsModelPreset) {
-          setSelectedPreset(settings.agentTeamsModelPreset as ModelPresetId)
+          const migrated = migratePresetId(settings.agentTeamsModelPreset)
+          setSelectedPreset(migrated)
+          // Persist migration if changed
+          if (migrated !== settings.agentTeamsModelPreset) {
+            saveSetting('agentTeamsModelPreset', migrated)
+          }
         }
         if (settings?.agentTeamsLeadModel) setLeadModel(settings.agentTeamsLeadModel)
         if (settings?.agentTeamsHeadModel) setHeadModel(settings.agentTeamsHeadModel)
@@ -254,10 +306,36 @@ export default function AgentTeamsSettingsPage() {
           })))
         }
 
+        // Load design flow settings
+        if (settings?.designFlowEnabled !== undefined) setDesignFlowEnabled(settings.designFlowEnabled)
+        if (settings?.designFlowVariantsPerRound) setDesignFlowVariantsPerRound(settings.designFlowVariantsPerRound)
+        if (settings?.designFlowDesignModel !== undefined) setDesignFlowDesignModel(settings.designFlowDesignModel)
+        if (settings?.designFlowAutoSaveTemplates !== undefined) setDesignFlowAutoSaveTemplates(settings.designFlowAutoSaveTemplates)
+
+        // Load design templates if design flow is enabled
+        if (settings?.designFlowEnabled) {
+          try {
+            setDesignTemplatesLoading(true)
+            const templates = typeof electronAPI.listDesignTemplates === 'function'
+              ? await electronAPI.listDesignTemplates(activeWorkspaceId)
+              : []
+            setDesignTemplates(templates.map(t => ({
+              ...t,
+              description: t.direction,
+              compatible: t.compatible,
+            })))
+          } catch {
+            // Templates are optional — don't block settings load
+          } finally {
+            setDesignTemplatesLoading(false)
+          }
+        }
+
         // Load provider API key status from secure storage
+        const canReadProviderKeys = typeof electronAPI.getAgentTeamsProviderKey === 'function'
         const [moonshotStatus, openrouterStatus] = await Promise.all([
-          window.electronAPI.getAgentTeamsProviderKey('moonshot'),
-          window.electronAPI.getAgentTeamsProviderKey('openrouter'),
+          canReadProviderKeys ? electronAPI.getAgentTeamsProviderKey('moonshot') : Promise.resolve(null),
+          canReadProviderKeys ? electronAPI.getAgentTeamsProviderKey('openrouter') : Promise.resolve(null),
         ])
         if (moonshotStatus?.hasKey) {
           setMoonshotKeyStored(true)
@@ -275,33 +353,33 @@ export default function AgentTeamsSettingsPage() {
     }
 
     loadSettings()
-  }, [activeWorkspaceId])
+  }, [activeWorkspaceId, hasAgentTeamsSettingsApi])
 
   // Save workspace setting helper
   const saveSetting = useCallback(
     async <K extends keyof WorkspaceSettings>(key: K, value: WorkspaceSettings[K]) => {
-      if (!window.electronAPI || !activeWorkspaceId) return
+      if (!hasAgentTeamsSettingsApi || !activeWorkspaceId) return
       try {
-        await window.electronAPI.updateWorkspaceSetting(activeWorkspaceId, key, value)
+        await electronAPI.updateWorkspaceSetting(activeWorkspaceId, key, value)
       } catch (error) {
         console.error(`Failed to save ${key}:`, error)
       }
     },
-    [activeWorkspaceId]
+    [activeWorkspaceId, hasAgentTeamsSettingsApi]
   )
 
   // Toggle handler
   const handleTeamsToggle = useCallback(
     async (enabled: boolean) => {
       setTeamsEnabled(enabled)
-      if (!window.electronAPI || !activeWorkspaceId) return
+      if (!hasAgentTeamsSettingsApi || !activeWorkspaceId) return
       try {
-        await window.electronAPI.setAgentTeamsEnabled(activeWorkspaceId, enabled)
+        await electronAPI.setAgentTeamsEnabled(activeWorkspaceId, enabled)
       } catch (error) {
         console.error('Failed to toggle agent teams:', error)
       }
     },
-    [activeWorkspaceId]
+    [activeWorkspaceId, hasAgentTeamsSettingsApi]
   )
 
   // Preset change handler
@@ -312,7 +390,7 @@ export default function AgentTeamsSettingsPage() {
       saveSetting('agentTeamsModelPreset', id)
 
       if (id !== 'custom') {
-        const config = PRESET_CONFIGS[id]
+        const config = STRATEGY_CONFIGS[id] ?? STRATEGY_CONFIGS['smart']
         setLeadModel(config.lead)
         setHeadModel(config.head)
         setWorkerModel(config.worker)
@@ -325,14 +403,21 @@ export default function AgentTeamsSettingsPage() {
         saveSetting('agentTeamsEscalationModel', config.escalation)
         setQgReviewModel(config.reviewer)
         saveSetting('qualityGatesReviewModel', config.reviewer)
-        // Presets use non-thinking models for speed
-        setLeadThinking(false); setHeadThinking(false); setWorkerThinking(false)
-        setReviewerThinking(false); setEscalationThinking(false)
-        saveSetting('agentTeamsLeadThinking', false)
-        saveSetting('agentTeamsHeadThinking', false)
-        saveSetting('agentTeamsWorkerThinking', false)
-        saveSetting('agentTeamsReviewerThinking', false)
-        saveSetting('agentTeamsEscalationThinking', false)
+
+        // Implements REQ-P3: Auto thinking per strategy
+        const thinking = STRATEGY_THINKING[id]
+        if (thinking) {
+          setLeadThinking(thinking.lead ?? false)
+          setHeadThinking(thinking.head ?? false)
+          setWorkerThinking(thinking.worker ?? false)
+          setReviewerThinking(thinking.reviewer ?? false)
+          setEscalationThinking(thinking.escalation ?? false)
+          saveSetting('agentTeamsLeadThinking', thinking.lead ?? false)
+          saveSetting('agentTeamsHeadThinking', thinking.head ?? false)
+          saveSetting('agentTeamsWorkerThinking', thinking.worker ?? false)
+          saveSetting('agentTeamsReviewerThinking', thinking.reviewer ?? false)
+          saveSetting('agentTeamsEscalationThinking', thinking.escalation ?? false)
+        }
       }
     },
     [saveSetting]
@@ -420,17 +505,20 @@ export default function AgentTeamsSettingsPage() {
   }, [moonshotKeyStored])
 
   const handleMoonshotKeyBlur = useCallback(async () => {
-    if (!window.electronAPI || !moonshotApiKey || moonshotApiKey.includes('*')) return
+    if (!electronAPI || typeof electronAPI.setAgentTeamsProviderKey !== 'function') return
+    if (!moonshotApiKey || moonshotApiKey.includes('*')) return
     try {
-      await window.electronAPI.setAgentTeamsProviderKey('moonshot', moonshotApiKey)
+      await electronAPI.setAgentTeamsProviderKey('moonshot', moonshotApiKey)
       setMoonshotKeyStored(true)
       // Replace with masked version for display
-      const status = await window.electronAPI.getAgentTeamsProviderKey('moonshot')
+      const status = typeof electronAPI.getAgentTeamsProviderKey === 'function'
+        ? await electronAPI.getAgentTeamsProviderKey('moonshot')
+        : null
       if (status?.maskedKey) setMoonshotApiKey(status.maskedKey)
     } catch (error) {
       console.error('Failed to save Moonshot API key:', error)
     }
-  }, [moonshotApiKey])
+  }, [electronAPI, moonshotApiKey])
 
   const handleOpenrouterKeyFocus = useCallback(() => {
     if (openrouterKeyStored) {
@@ -439,16 +527,19 @@ export default function AgentTeamsSettingsPage() {
   }, [openrouterKeyStored])
 
   const handleOpenrouterKeyBlur = useCallback(async () => {
-    if (!window.electronAPI || !openrouterApiKey || openrouterApiKey.includes('*')) return
+    if (!electronAPI || typeof electronAPI.setAgentTeamsProviderKey !== 'function') return
+    if (!openrouterApiKey || openrouterApiKey.includes('*')) return
     try {
-      await window.electronAPI.setAgentTeamsProviderKey('openrouter', openrouterApiKey)
+      await electronAPI.setAgentTeamsProviderKey('openrouter', openrouterApiKey)
       setOpenrouterKeyStored(true)
-      const status = await window.electronAPI.getAgentTeamsProviderKey('openrouter')
+      const status = typeof electronAPI.getAgentTeamsProviderKey === 'function'
+        ? await electronAPI.getAgentTeamsProviderKey('openrouter')
+        : null
       if (status?.maskedKey) setOpenrouterApiKey(status.maskedKey)
     } catch (error) {
       console.error('Failed to save OpenRouter API key:', error)
     }
-  }, [openrouterApiKey])
+  }, [electronAPI, openrouterApiKey])
 
   // Quality gate handlers
   const handleQgToggle = useCallback((enabled: boolean) => {
@@ -535,6 +626,75 @@ export default function AgentTeamsSettingsPage() {
   const handleSddTemplateChange = useCallback((templateId: string) => {
     setSddDefaultTemplate(templateId)
     saveSetting('sddDefaultSpecTemplate', templateId)
+  }, [saveSetting])
+
+  // Design template handlers
+  // NOTE: Must be defined BEFORE Design Flow handlers to avoid TDZ runtime errors
+  // ("Cannot access 'loadDesignTemplates' before initialization").
+  const loadDesignTemplates = useCallback(async () => {
+    if (!electronAPI || typeof electronAPI.listDesignTemplates !== 'function' || !activeWorkspaceId) return
+    setDesignTemplatesLoading(true)
+    try {
+      const templates = await electronAPI.listDesignTemplates(activeWorkspaceId)
+      setDesignTemplates(templates.map(t => ({
+        ...t,
+        description: t.direction,
+        compatible: t.compatible,
+      })))
+    } catch {
+      setDesignTemplates([])
+    } finally {
+      setDesignTemplatesLoading(false)
+    }
+  }, [activeWorkspaceId])
+
+  const handleLoadTemplateDetail = useCallback(async (templateId: string): Promise<TemplateDetail | null> => {
+    if (!electronAPI || typeof electronAPI.loadDesignTemplate !== 'function' || !activeWorkspaceId) return null
+    const full = await electronAPI.loadDesignTemplate(activeWorkspaceId, templateId)
+    if (!full) return null
+    return {
+      id: full.id,
+      name: full.name,
+      description: full.description ?? '',
+      direction: full.direction,
+      brief: full.brief,
+      componentSpec: full.componentSpec,
+      files: full.files,
+      stackRequirements: full.stackRequirements,
+      createdAt: full.createdAt,
+      sourceSessionId: full.sourceSessionId,
+      sourceTeamId: full.sourceTeamId,
+    }
+  }, [activeWorkspaceId])
+
+  const handleDeleteTemplate = useCallback(async (templateId: string) => {
+    if (!electronAPI || typeof electronAPI.deleteDesignTemplate !== 'function' || !activeWorkspaceId) return
+    await electronAPI.deleteDesignTemplate(activeWorkspaceId, templateId)
+    setDesignTemplates(prev => prev.filter(t => t.id !== templateId))
+  }, [activeWorkspaceId])
+
+  // Design Flow handlers
+  const handleDesignFlowToggle = useCallback((enabled: boolean) => {
+    setDesignFlowEnabled(enabled)
+    saveSetting('designFlowEnabled', enabled)
+    if (enabled) loadDesignTemplates()
+  }, [saveSetting, loadDesignTemplates])
+
+  const handleDesignFlowVariantsChange = useCallback((value: string) => {
+    const count = parseInt(value) as 2 | 4 | 6
+    setDesignFlowVariantsPerRound(count)
+    saveSetting('designFlowVariantsPerRound', count)
+  }, [saveSetting])
+
+  const handleDesignFlowModelChange = useCallback((value: string) => {
+    const model = value === 'inherit' ? null : value
+    setDesignFlowDesignModel(model)
+    saveSetting('designFlowDesignModel', model)
+  }, [saveSetting])
+
+  const handleDesignFlowAutoSaveToggle = useCallback((enabled: boolean) => {
+    setDesignFlowAutoSaveTemplates(enabled)
+    saveSetting('designFlowAutoSaveTemplates', enabled)
   }, [saveSetting])
 
   // YOLO handlers
@@ -646,6 +806,22 @@ export default function AgentTeamsSettingsPage() {
     )
   }
 
+  if (!hasAgentTeamsSettingsApi) {
+    return (
+      <div className="h-full flex flex-col">
+        <PanelHeader title="Agent Teams" actions={<HeaderMenu route={routes.view.settings('agent-teams')} />} />
+        <div className="flex-1 flex items-center justify-center px-6">
+          <div className="max-w-xl text-center">
+            <p className="text-sm font-medium">Agent Teams settings are unavailable</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Agent Teams may be disabled in this build, or the preload bridge may be out of sync.
+            </p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (isLoading) {
     return (
       <div className="h-full flex flex-col">
@@ -696,92 +872,109 @@ export default function AgentTeamsSettingsPage() {
                     className="space-y-8 overflow-hidden"
                   >
 
-                    {/* Model Preset */}
+                    {/* Model Strategy */}
                     <SettingsSection
-                      title="Model Preset"
-                      description="Choose a model mix for your teams — all presets use non-thinking mode for speed"
+                      title="Model Strategy"
+                      description="Choose a strategy for your teams — thinking and models are auto-configured per role"
                       className="relative"
                     >
                       <SettingsRadioGroup
                         value={selectedPreset}
                         onValueChange={handlePresetChange}
                       >
-                        {PRESET_OPTIONS.map((preset) => (
+                        {STRATEGY_OPTIONS.map((preset) => (
                           <SettingsRadioCard
                             key={preset.id}
                             value={preset.id}
                             label={preset.name}
                             description={preset.description}
-                            badge={preset.costLevel > 0 ? (
+                            badge={preset.badge ? (
+                              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                                {preset.badge}
+                              </span>
+                            ) : preset.costLevel > 0 ? (
                               <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${COST_BADGE_COLORS[preset.costLevel as CostLevel]}`}>
                                 {preset.cost}
                               </span>
                             ) : undefined}
                             expandedContent={preset.id !== 'custom' ? (
-                              /* Role → model summary grid for non-custom presets */
+                              /* Role → model summary grid for non-custom strategies */
                               <div className="grid grid-cols-5 gap-2 pt-1">
                                 {(['lead', 'head', 'worker', 'reviewer', 'escalation'] as const).map((role) => (
                                   <div key={role} className="flex flex-col items-center gap-1">
                                     <div className={`w-2 h-2 rounded-full ${ROLE_COLORS[role]}`} />
                                     <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">{role}</span>
-                                    <span className="text-xs font-medium">{getModelShortName(PRESET_CONFIGS[preset.id][role])}</span>
+                                    <span className="text-xs font-medium">{getModelShortName(STRATEGY_CONFIGS[preset.id][role])}</span>
                                   </div>
                                 ))}
                               </div>
-                            ) : (
-                              /* Full custom config: model dropdowns + thinking toggles */
-                              <div className="space-y-4 pt-1">
-                                <div className="flex items-start gap-2 px-1 py-2 rounded-lg bg-foreground/[0.02] border border-border/40">
-                                  <Info className="size-3.5 mt-0.5 text-muted-foreground shrink-0" />
-                                  <p className="text-[11px] text-muted-foreground leading-relaxed">
-                                    Lead: Opus/Codex (planning) · Head: Sonnet/Codex (coordination) · Worker: Haiku/Kimi (throughput) · Reviewer: Haiku/Kimi (fast checks) · Escalation: Opus/Codex (hard blockers)
-                                  </p>
-                                </div>
-                                {([
-                                  { role: 'lead', label: 'Lead', desc: 'Plans work and delegates', model: leadModel, onChange: handleLeadChange, thinking: leadThinking },
-                                  { role: 'head', label: 'Head', desc: 'Coordinates sub-teams', model: headModel, onChange: handleHeadChange, thinking: headThinking },
-                                  { role: 'worker', label: 'Worker', desc: 'Executes individual tasks', model: workerModel, onChange: handleWorkerChange, thinking: workerThinking },
-                                  { role: 'reviewer', label: 'Reviewer', desc: 'Quality gate reviews', model: reviewerModel, onChange: handleReviewerChange, thinking: reviewerThinking },
-                                  { role: 'escalation', label: 'Escalation', desc: 'Handles failures', model: escalationModel, onChange: handleEscalationChange, thinking: escalationThinking },
-                                ] as const).map(({ role, label, desc, model, onChange, thinking }) => (
-                                  <div key={role} className="flex items-center gap-3 py-1">
-                                    <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${ROLE_COLORS[role]}`} />
-                                    <div className="flex-1 min-w-0">
-                                      <div className="flex items-center gap-2">
-                                        <span className="text-xs font-medium">{label}</span>
-                                        <span className="text-[10px] text-muted-foreground">{desc}</span>
-                                      </div>
-                                      <div className="flex items-center gap-2 mt-1.5">
-                                        <select
-                                          value={model}
-                                          onChange={(e) => onChange(e.target.value)}
-                                          className="h-7 text-xs rounded-md border border-border/60 bg-background px-2 pr-6 appearance-none cursor-pointer hover:border-border focus:outline-none focus:ring-1 focus:ring-ring"
-                                        >
-                                          {roleModelOptions.map((opt) => (
-                                            <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                          ))}
-                                        </select>
-                                        <button
-                                          type="button"
-                                          onClick={() => handleThinkingToggle(role, !thinking)}
-                                          className={`h-7 px-2.5 text-[10px] font-medium rounded-md border transition-colors ${
-                                            thinking
-                                              ? 'border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-400'
-                                              : 'border-border/60 bg-background text-muted-foreground hover:text-foreground'
-                                          }`}
-                                        >
-                                          {thinking ? 'Thinking ON' : 'Thinking OFF'}
-                                        </button>
-                                      </div>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
+                            ) : undefined}
                           />
                         ))}
                       </SettingsRadioGroup>
+
+                      {selectedPreset === 'smart' && (
+                        <p className="text-xs text-muted-foreground mt-2">
+                          Workers use Sonnet when Quality Gates are on (fast, errors caught by QG).
+                          Workers use Opus when Quality Gates are off (no safety net).
+                          Thinking enabled for Lead, Reviewer, and Escalation roles.
+                        </p>
+                      )}
                     </SettingsSection>
+
+                    {/* Per-Role Model Assignment (Custom strategy only) */}
+                    {selectedPreset === 'custom' && (
+                      <SettingsSection title="Per-Role Model Assignment">
+                        <SettingsCard>
+                          <div className="flex items-start gap-2 px-4 py-3 rounded-lg bg-foreground/[0.02] border border-border/40 mx-4 mt-3">
+                            <Info className="size-3.5 mt-0.5 text-muted-foreground shrink-0" />
+                            <p className="text-[11px] text-muted-foreground leading-relaxed">
+                              Lead: Opus/Codex (planning) · Worker: Haiku/Kimi (throughput) · Reviewer: Haiku/Kimi (fast checks) · Escalation: Opus/Codex (hard blockers)
+                            </p>
+                          </div>
+                          <div className="space-y-4 px-4 py-3">
+                            {([
+                              { role: 'lead', label: 'Lead', desc: 'Plans work and delegates', model: leadModel, onChange: handleLeadChange, thinking: leadThinking },
+                              { role: 'worker', label: 'Worker', desc: 'Executes individual tasks', model: workerModel, onChange: handleWorkerChange, thinking: workerThinking },
+                              { role: 'reviewer', label: 'Reviewer', desc: 'Quality gate reviews', model: reviewerModel, onChange: handleReviewerChange, thinking: reviewerThinking },
+                              { role: 'escalation', label: 'Escalation', desc: 'Handles failures', model: escalationModel, onChange: handleEscalationChange, thinking: escalationThinking },
+                            ] as const).map(({ role, label, desc, model, onChange, thinking }) => (
+                              <div key={role} className="flex items-center gap-3 py-1">
+                                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${ROLE_COLORS[role]}`} />
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-xs font-medium">{label}</span>
+                                    <span className="text-[10px] text-muted-foreground">{desc}</span>
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-1.5">
+                                    <select
+                                      value={model}
+                                      onChange={(e) => onChange(e.target.value)}
+                                      className="h-7 text-xs rounded-md border border-border/60 bg-background px-2 pr-6 appearance-none cursor-pointer hover:border-border focus:outline-none focus:ring-1 focus:ring-ring"
+                                    >
+                                      {roleModelOptions.map((opt) => (
+                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                      ))}
+                                    </select>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleThinkingToggle(role, !thinking)}
+                                      className={`h-7 px-2.5 text-[10px] font-medium rounded-md border transition-colors ${
+                                        thinking
+                                          ? 'border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-400'
+                                          : 'border-border/60 bg-background text-muted-foreground hover:text-foreground'
+                                      }`}
+                                    >
+                                      {thinking ? 'Thinking ON' : 'Thinking OFF'}
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </SettingsCard>
+                      </SettingsSection>
+                    )}
 
                     {(codexSelected && !hasCodexConnection) && (
                       <SettingsSection
@@ -874,13 +1067,13 @@ export default function AgentTeamsSettingsPage() {
                     {/* Quality Gates */}
                     <SettingsSection
                       title="Quality Gates"
-                      description="Automated code review pipeline — every piece of teammate code is reviewed, scored, and rejected if below threshold"
+                      description="Automated code review pipeline — teammate work is reviewed, scored, and sent back for rework if below threshold"
                       className="border-l-2 border-l-amber-500/50 pl-4"
                     >
                       <SettingsCard>
                         <SettingsToggle
                           label="Enable Quality Gates"
-                          description="Automatically review teammate work before relaying to team lead"
+                          description="Automatically review completed tasks and send feedback to teammates for rework if needed"
                           checked={qgEnabled}
                           onCheckedChange={handleQgToggle}
                         />
@@ -1152,6 +1345,76 @@ export default function AgentTeamsSettingsPage() {
                                 onValueChange={handleSddTemplateChange}
                                 options={sddTemplateOptions}
                               />
+                            </SettingsCard>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </SettingsSection>
+
+                    {/* Design Flow */}
+                    <SettingsSection
+                      title="Design Flow"
+                      description="Generate multiple UI design variants before coding begins. Detects your project stack, creates variants using your design system, and lets you select the best one before implementation."
+                      className="border-l-2 border-l-emerald-500/50 pl-4"
+                    >
+                      <SettingsCard>
+                        <SettingsToggle
+                          label="Enable Design Flow"
+                          description="Generate design variants during autonomous execution"
+                          checked={designFlowEnabled}
+                          onCheckedChange={handleDesignFlowToggle}
+                        />
+                      </SettingsCard>
+
+                      <AnimatePresence>
+                        {designFlowEnabled && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                            className="space-y-4 overflow-hidden"
+                          >
+                            <SettingsCard>
+                              <SettingsMenuSelectRow
+                                label="Variants Per Round"
+                                description="Number of design variants to generate each round"
+                                value={String(designFlowVariantsPerRound)}
+                                onValueChange={handleDesignFlowVariantsChange}
+                                options={[
+                                  { value: '2', label: '2 Variants', description: 'Quick comparison' },
+                                  { value: '4', label: '4 Variants', description: 'Balanced exploration (default)' },
+                                  { value: '6', label: '6 Variants', description: 'Maximum variety' },
+                                ]}
+                              />
+                              <SettingsMenuSelectRow
+                                label="Design Model"
+                                description="Model for design generation (defaults to Head model if not set)"
+                                value={designFlowDesignModel || 'inherit'}
+                                onValueChange={handleDesignFlowModelChange}
+                                options={[
+                                  { value: 'inherit', label: 'Inherit from Head', description: 'Use the Head role model' },
+                                  ...roleModelOptions,
+                                ]}
+                              />
+                              <SettingsToggle
+                                label="Auto-save Templates"
+                                description="Save selected designs as reusable workspace templates"
+                                checked={designFlowAutoSaveTemplates}
+                                onCheckedChange={handleDesignFlowAutoSaveToggle}
+                              />
+                            </SettingsCard>
+
+                            {/* Template Library */}
+                            <SettingsCard>
+                              <div className="max-h-96">
+                                <DesignTemplateLibrary
+                                  templates={designTemplates}
+                                  loading={designTemplatesLoading}
+                                  onLoadDetail={handleLoadTemplateDetail}
+                                  onDelete={handleDeleteTemplate}
+                                />
+                              </div>
                             </SettingsCard>
                           </motion.div>
                         )}

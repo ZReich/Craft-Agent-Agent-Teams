@@ -46,6 +46,8 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
     spec_compliance: { enabled: true, weight: 20 },
     traceability: { enabled: true, weight: 15 },
     rollout_safety: { enabled: false, weight: 10 },
+    // Design flow stage — only scored when a design artifact is attached (REQ-011)
+    design_compliance: { enabled: true, weight: 15 },
   },
 };
 
@@ -251,6 +253,7 @@ function stageName(name: QualityGateStageName | string): string {
     spec_compliance: 'Spec Compliance',
     traceability: 'Requirement Traceability',
     rollout_safety: 'Rollout Safety',
+    design_compliance: 'Design Compliance',
   };
   return names[name] || name;
 }
@@ -266,6 +269,7 @@ function formatStageScoreboard(result: QualityGateResult): string[] {
     'spec_compliance',
     'traceability',
     'rollout_safety',
+    'design_compliance',
   ];
 
   const lines: string[] = [];

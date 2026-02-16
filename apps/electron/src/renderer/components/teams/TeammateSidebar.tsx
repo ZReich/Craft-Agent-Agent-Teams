@@ -33,12 +33,24 @@ const STATUS_CONFIG: Record<AgentTeammateStatus, {
   shutdown: { icon: CheckCircle2, label: 'Shutdown', className: 'text-muted-foreground' },
 }
 
-// Model display names
+// BUG-018 fix: Comprehensive model display names for all supported models
 const MODEL_SHORT_NAMES: Record<string, string> = {
   'claude-opus-4-6': 'Opus',
   'claude-sonnet-4-5-20250929': 'Sonnet',
   'claude-haiku-4-5-20251001': 'Haiku',
+  'claude-sonnet-4-5': 'Sonnet',
+  'claude-haiku-4-5': 'Haiku',
   'kimi-k2.5': 'Kimi',
+  'gpt-4o': 'GPT-4o',
+  'gpt-4o-mini': 'GPT-4o Mini',
+  'o3-mini': 'o3 Mini',
+  'deepseek-chat': 'DeepSeek',
+  'deepseek-reasoner': 'DeepSeek R1',
+}
+
+/** Get short display name for a model ID, falling back to a cleaned-up model ID */
+function getModelShortName(modelId: string): string {
+  return MODEL_SHORT_NAMES[modelId] ?? modelId.replace(/^claude-|-\d{8}$/g, '')
 }
 
 export function TeammateSidebar({
@@ -59,7 +71,7 @@ export function TeammateSidebar({
             const config = STATUS_CONFIG[teammate.status] || STATUS_CONFIG.idle
             const StatusIcon = config.icon
             const isSelected = teammate.id === selectedTeammateId
-            const modelName = MODEL_SHORT_NAMES[teammate.model] || teammate.model
+            const modelName = getModelShortName(teammate.model)
 
             return (
               <button

@@ -195,6 +195,10 @@ interface ChatDisplayProps {
   yoloModeEnabled?: boolean
   /** Callback when YOLO Mode toggle changes */
   onYoloModeChange?: (enabled: boolean) => void
+  /** Whether Design Flow is enabled for this session */
+  designFlowEnabled?: boolean
+  /** Callback when Design Flow toggle changes */
+  onDesignFlowChange?: (enabled: boolean) => void
 }
 
 /**
@@ -462,6 +466,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   onAgentTeamsChange,
   yoloModeEnabled = false,
   onYoloModeChange,
+  designFlowEnabled = false,
+  onDesignFlowChange,
 }, ref) {
   // Input is only disabled when explicitly disabled (e.g., agent needs activation)
   // User can type during streaming - submitting will stop the stream and send
@@ -1753,6 +1759,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
               onAgentTeamsChange={onAgentTeamsChange}
               yoloModeEnabled={yoloModeEnabled}
               onYoloModeChange={onYoloModeChange}
+              designFlowEnabled={designFlowEnabled}
+              onDesignFlowChange={onDesignFlowChange}
             />
           </div>
           </div>

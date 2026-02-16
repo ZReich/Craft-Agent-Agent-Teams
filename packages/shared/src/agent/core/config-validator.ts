@@ -191,8 +191,8 @@ export class ConfigValidator {
       // Skip comments and empty lines
       if (line.startsWith('#') || line === '') continue;
 
-      // Check for unclosed brackets in section headers
-      if (line.startsWith('[') && !line.match(/^\[+[^\]]+\]+$/)) {
+      // BUG-037 fix: Improved regex to handle inline comments and trailing whitespace
+      if (line.startsWith('[') && !line.match(/^\[+[^\]]+\]+\s*(#.*)?$/)) {
         warnings.push(`Line ${i + 1}: Possibly malformed section header: ${line}`);
       }
 

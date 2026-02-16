@@ -27,6 +27,7 @@ import type {
   YoloState,
   TeamPhase,
   QualityGateResult,
+  DesignArtifact,
 } from '@craft-agent/core/types';
 import type { ReviewLoopOrchestrator } from '../agent-teams/review-loop';
 import type { YoloOrchestrator } from '../agent-teams/yolo-orchestrator';
@@ -239,17 +240,18 @@ export class AgentTeamManager extends EventEmitter {
     // Stop YOLO if running
     this.stopYolo(teamId, 'Team cleanup');
 
-    // Release hot runtime memory immediately after cleanup.
-    this.tasks.delete(teamId);
-    this.messages.delete(teamId);
-    this.activityLog.delete(teamId);
-    this.teamSpecs.delete(teamId);
-    this.teamDRIAssignments.delete(teamId);
-    this.synthesisRequested.delete(teamId);
-    this.yoloStates.delete(teamId);
-    this.yoloOrchestrators.delete(teamId);
-    this.teamPhases.delete(teamId);
-    this.teams.delete(teamId);
+    // BUG-015 fix: Release hot runtime memory, resilient to partial failures.
+    // Each delete is independent — continue cleanup even if one fails.
+    const maps: Map<unknown, unknown>[] = [
+      this.tasks, this.messages, this.activityLog, this.teamSpecs,
+      this.teamDRIAssignments, this.yoloStates, this.yoloOrchestrators,
+      this.teamPhases, this.designArtifacts, this.qualityGateResults,
+      this.teamStateStores, this.teams,
+    ];
+    for (const map of maps) {
+      try { map.delete(teamId); } catch { /* continue cleanup */ }
+    }
+    try { this.synthesisRequested.delete(teamId); } catch { /* continue */ }
   }
 
   /** Get team status */
@@ -313,6 +315,8 @@ export class AgentTeamManager extends EventEmitter {
       this.qualityGateResults.set(teamId, new Map());
     }
     this.qualityGateResults.get(teamId)!.set(teammateSessionId, result);
+    // BUG-020 fix: Persist quality gate result to disk
+    this.teamStateStores.get(teamId)?.appendQualityGate(teammateSessionId, result);
   }
 
   // Implements BUG-7: Get quality gate results for all teammates in a team
@@ -480,6 +484,22 @@ export class AgentTeamManager extends EventEmitter {
     const task = teamTasks.find(t => t.id === taskId);
     if (!task) return;
 
+    // BUG-021 fix: Validate state transitions to prevent invalid status changes
+    const validTransitions: Record<TeamTaskStatus, TeamTaskStatus[]> = {
+      pending: ['in_progress', 'blocked', 'failed'],
+      in_progress: ['completed', 'in_review', 'failed', 'blocked'],
+      in_review: ['completed', 'in_progress', 'failed'],
+      blocked: ['pending', 'in_progress', 'failed'],
+      completed: ['in_progress'], // Allow reopening completed tasks
+      failed: ['pending', 'in_progress'], // Allow retrying failed tasks
+    };
+    const allowed = validTransitions[task.status];
+    if (allowed && !allowed.includes(status)) {
+      // Log but don't throw — callers may not expect exceptions
+      console.warn(`[AgentTeamManager] Invalid task transition: ${task.status} → ${status} for task "${task.title}" (${taskId})`);
+      return;
+    }
+
     // --- Review Loop Interception ---
     // When a teammate marks a task "completed" and a review loop is attached,
     // route through quality gates instead of accepting immediately.
@@ -499,6 +519,7 @@ export class AgentTeamManager extends EventEmitter {
 
     task.status = status;
     if (assignee !== undefined) task.assignee = assignee;
+    if (status === 'in_progress' && !task.startedAt) task.startedAt = new Date().toISOString();
     if (status === 'completed') task.completedAt = new Date().toISOString();
 
     // Persist updated task to disk (REQ-002)
@@ -779,6 +800,8 @@ export class AgentTeamManager extends EventEmitter {
   /** Update YOLO state for a team (called by the orchestrator's onStateChange callback) */
   updateYoloState(teamId: string, state: YoloState): void {
     this.yoloStates.set(teamId, state);
+    // BUG-020 fix: Persist YOLO state snapshot to disk
+    this.teamStateStores.get(teamId)?.appendYoloState(state);
     this.emit('yolo:state_changed', teamId, state);
   }
 
@@ -794,6 +817,23 @@ export class AgentTeamManager extends EventEmitter {
   isYoloActive(teamId: string): boolean {
     const orchestrator = this.yoloOrchestrators.get(teamId);
     return orchestrator?.isRunning() ?? false;
+  }
+
+  // ============================================================
+  // Design Artifacts (REQ-007)
+  // ============================================================
+
+  private designArtifacts = new Map<string, DesignArtifact>();  // teamId → design artifact
+
+  /** Attach a design artifact to a team (after design selection) */
+  setDesignArtifact(teamId: string, artifact: DesignArtifact): void {
+    this.designArtifacts.set(teamId, artifact);
+    this.addActivity(teamId, 'design-selected', `Design "${artifact.selectedVariantName}" selected as implementation starting point`);
+  }
+
+  /** Get the design artifact for a team */
+  getDesignArtifact(teamId: string): DesignArtifact | undefined {
+    return this.designArtifacts.get(teamId);
   }
 
   // ============================================================

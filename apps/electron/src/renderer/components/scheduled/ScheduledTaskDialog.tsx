@@ -24,6 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useRegisterModal } from '@/context/ModalContext'
 import type { ScheduledTask } from '../../../shared/types'
@@ -48,13 +49,15 @@ interface ScheduledTaskDialogProps {
   onSave: (task: Omit<ScheduledTask, 'index' | 'scheduleDescription' | 'nextRun'>) => Promise<void>
   /** Existing task for editing (null for create) */
   task?: ScheduledTask | null
+  /** Delete handler — only shown in edit mode */
+  onDelete?: (index: number) => Promise<void>
 }
 
 // ============================================================================
 // Component
 // ============================================================================
 
-export function ScheduledTaskDialog({ open, onClose, onSave, task }: ScheduledTaskDialogProps) {
+export function ScheduledTaskDialog({ open, onClose, onSave, task, onDelete }: ScheduledTaskDialogProps) {
   const isEditing = !!task
 
   // Form state
@@ -68,6 +71,7 @@ export function ScheduledTaskDialog({ open, onClose, onSave, task }: ScheduledTa
   const [customCron, setCustomCron] = useState('0 9 * * *')
   const [timezone, setTimezone] = useState('')
   const [isSaving, setIsSaving] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
 
   useRegisterModal(open, onClose)
 
@@ -123,6 +127,19 @@ export function ScheduledTaskDialog({ open, onClose, onSave, task }: ScheduledTa
       console.error('[ScheduledTaskDialog] Save failed:', err)
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!task || !onDelete) return
+    setIsDeleting(true)
+    try {
+      await onDelete(task.index)
+      onClose()
+    } catch (err) {
+      console.error('[ScheduledTaskDialog] Delete failed:', err)
+    } finally {
+      setIsDeleting(false)
     }
   }
 
@@ -309,9 +326,20 @@ export function ScheduledTaskDialog({ open, onClose, onSave, task }: ScheduledTa
         </div>
 
         <DialogFooter className="gap-2 sm:gap-0">
+          {isEditing && onDelete && (
+            <Button
+              variant="ghost"
+              className="mr-auto text-destructive hover:text-destructive hover:bg-destructive/10"
+              disabled={isDeleting || isSaving}
+              onClick={handleDelete}
+            >
+              <Trash2 className="h-4 w-4 mr-1.5" />
+              {isDeleting ? 'Deleting...' : 'Delete'}
+            </Button>
+          )}
           <Button variant="outline" onClick={onClose}>Cancel</Button>
           <Button
-            disabled={!isValid || isSaving}
+            disabled={!isValid || isSaving || isDeleting}
             onClick={handleSave}
           >
             {isSaving ? 'Saving...' : isEditing ? 'Save Changes' : 'Create Task'}

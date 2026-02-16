@@ -30,6 +30,8 @@ export interface SessionOptions {
   yoloModeEnabled: boolean
   /** Permission mode to restore when YOLO Mode is toggled off */
   preYoloPermissionMode?: PermissionMode
+  /** Whether Design Flow (multi-variant UI generation) is enabled for this session */
+  designFlowEnabled: boolean
 }
 
 /** Default values for new sessions */
@@ -39,6 +41,7 @@ export const defaultSessionOptions: SessionOptions = {
   thinkingLevel: DEFAULT_THINKING_LEVEL, // Default to 'think' level
   agentTeamsEnabled: false,
   yoloModeEnabled: false,
+  designFlowEnabled: false,
 }
 
 /** Type for partial updates to session options */

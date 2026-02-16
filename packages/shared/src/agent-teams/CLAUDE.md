@@ -78,11 +78,11 @@ Skill definitions live in `.agents/skills/` at the repo root.
 
 ## Quality Gate System
 
-### 9-Stage Pipeline
+### 10-Stage Pipeline
 
 File: `quality-gates.ts`
 
-Stages execute in this order:
+Stages execute in this order (stages 3-6 run in parallel, stages 7-9 run in parallel):
 
 | # | Stage | Type | Weight | Description |
 |---|-------|------|--------|-------------|
@@ -95,6 +95,7 @@ Stages execute in this order:
 | 7 | `spec_compliance` | Weighted | 20 | SDD mode only — requirement adherence |
 | 8 | `traceability` | Weighted | 15 | SDD mode only — REQ-ID tracing |
 | 9 | `rollout_safety` | Weighted | 10 | Disabled by default — rollback plans |
+| 10 | `design_compliance` | Weighted | 15 | Design Flow only — approved design preserved |
 
 **Binary stages** must score 100 (pass) or 0 (fail) — no partial credit.
 **Weighted stages** score 0-100 and contribute to the aggregate via their weights.
@@ -148,7 +149,7 @@ pending → running → [awaiting-rework ↔ running]* → passed | escalated | 
 1. Teammate marks task "completed"
 2. ReviewLoopOrchestrator intercepts → moves to "in_review"
 3. Collects diff of teammate's changes
-4. Runs 9-stage quality gate pipeline
+4. Runs 10-stage quality gate pipeline
 5a. PASS → marks task truly completed, emits review:passed
 5b. FAIL (cycles < max) → sends feedback, returns task to in_progress
 5c. FAIL (cycles >= max) → escalates, marks completed after escalation
@@ -387,7 +388,7 @@ All major components extend `EventEmitter`:
 
 ```
 Individual Task Quality (ReviewLoopOrchestrator)
-  → 9-stage pipeline per task
+  → 10-stage pipeline per task
   → Max 3 retry cycles → escalation
     ↓
 Team-Level Integration (IntegrationGate)

@@ -597,6 +597,14 @@ const api: ElectronAPI = {
   getQualityReports: (teamId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_GET_QUALITY_REPORTS, teamId),
 
+  // Design Templates
+  listDesignTemplates: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.DESIGN_TEMPLATES_LIST, workspaceId),
+  loadDesignTemplate: (workspaceId: string, templateId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.DESIGN_TEMPLATES_LOAD, workspaceId, templateId),
+  deleteDesignTemplate: (workspaceId: string, templateId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.DESIGN_TEMPLATES_DELETE, workspaceId, templateId),
+
   // YOLO (Autonomous Execution)
   startYolo: (teamId: string, objective: string, config?: Partial<import('@craft-agent/core/types').YoloConfig>) =>
     ipcRenderer.invoke(IPC_CHANNELS.AGENT_TEAMS_YOLO_START, teamId, objective, config),

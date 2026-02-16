@@ -9,6 +9,7 @@ import { MarkdownJsonBlock } from './MarkdownJsonBlock'
 import { MarkdownMermaidBlock } from './MarkdownMermaidBlock'
 import { MarkdownDatatableBlock } from './MarkdownDatatableBlock'
 import { MarkdownSpreadsheetBlock } from './MarkdownSpreadsheetBlock'
+import { MarkdownDesignGridBlock } from './MarkdownDesignGridBlock'
 import { preprocessLinks } from './linkify'
 import remarkCollapsibleSections from './remarkCollapsibleSections'
 import { CollapsibleSection } from './CollapsibleSection'
@@ -196,6 +197,10 @@ function createComponents(
           if (match?.[1] === 'spreadsheet') {
             return <MarkdownSpreadsheetBlock code={code} className="my-1" />
           }
+          // Design grid code blocks → interactive variant card grid (REQ-006)
+          if (match?.[1] === 'designgrid') {
+            return <MarkdownDesignGridBlock code={code} className="my-1" />
+          }
           // Mermaid code blocks → zinc-styled SVG diagram.
           // Hide the inline expand button when the mermaid block is the first
           // content in the message — TurnCard's own fullscreen button occupies
@@ -283,6 +288,10 @@ function createComponents(
         // Spreadsheet code blocks → Excel-style grid
         if (match?.[1] === 'spreadsheet') {
           return <MarkdownSpreadsheetBlock code={code} className="my-1" />
+        }
+        // Design grid code blocks → interactive variant card grid (REQ-006)
+        if (match?.[1] === 'designgrid') {
+          return <MarkdownDesignGridBlock code={code} className="my-1" />
         }
         // Mermaid code blocks → zinc-styled SVG diagram.
         // (Same first-block detection as minimal mode — see comment above.)

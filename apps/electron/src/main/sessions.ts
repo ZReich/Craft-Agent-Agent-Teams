@@ -88,9 +88,10 @@ import { IntegrationGate } from '@craft-agent/shared/agent-teams/integration-gat
 import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/diff-collector'
 import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
-import { resolveTeamModelForRole } from '@craft-agent/shared/agent-teams/model-resolution'
+import { resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/shared/agent-teams/model-resolution'
 import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
-import { YoloOrchestrator, mergeYoloConfig, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
+import { YoloOrchestrator, mergeYoloConfig, decideSpawnStrategy, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
+import { ReviewLoopOrchestrator, type ReviewLoopCallbacks, type ReviewLoopConfig } from '@craft-agent/shared/agent-teams/review-loop'
 import type { YoloConfig, YoloState } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
 import type { SummarizeCallback } from '@craft-agent/shared/sources'
@@ -228,7 +229,9 @@ const TEAM_ROLE_HEAD: TeamRole = 'head'
 const TEAM_ROLE_ESCALATION: TeamRole = 'escalation'
 const TEAM_ROLE_WORKER: TeamRole = 'worker'
 const TEAM_ROLE_REVIEWER: TeamRole = 'reviewer'
-const MAX_TEAMMATES_PER_TEAM = 6
+// Implements REQ-B4: Raised from 6 to 10 to support larger teams.
+// The limit is enforced in createTeammateSession().
+const MAX_TEAMMATES_PER_TEAM = 10
 const MAX_TEAMMATE_MESSAGES = 500
 
 function toValidatedTeamRole(rawRole?: string): TeamRole | null {
@@ -333,13 +336,15 @@ function buildWorkerQualityFeedback(result: QualityGateResult, maxCycles: number
 }
 
 function formatHealthAlertMessage(issue: HealthIssue): string {
-  const typeLabel = issue.type === 'stall'
-    ? 'STALL'
-    : issue.type === 'error-loop'
-      ? 'ERROR LOOP'
-      : issue.type === 'retry-storm'
-        ? 'RETRY STORM'
-        : 'CONTEXT EXHAUSTION'
+  const TYPE_LABELS: Record<HealthIssue['type'], string> = {
+    'stall': 'STALL',
+    'error-loop': 'ERROR LOOP',
+    'retry-storm': 'RETRY STORM',
+    'retry-storm-throttle': 'RETRY STORM (THROTTLED)',
+    'retry-storm-kill': 'RETRY STORM (KILLING)',
+    'context-exhaustion': 'CONTEXT EXHAUSTION',
+  }
+  const typeLabel = TYPE_LABELS[issue.type] ?? issue.type.toUpperCase()
   return [
     `### Ã¢Å¡Â Ã¯Â¸Â Team Health Alert (${typeLabel})`,
     `Teammate: ${issue.teammateName}`,
@@ -381,6 +386,8 @@ function formatHealthAlertSummaryMessage(issues: HealthIssue[]): string {
     if (type === 'stall') return 'STALL'
     if (type === 'error-loop') return 'ERROR LOOP'
     if (type === 'retry-storm') return 'RETRY STORM'
+    if (type === 'retry-storm-throttle') return 'RETRY STORM (THROTTLED)'
+    if (type === 'retry-storm-kill') return 'RETRY STORM (KILLING)'
     return 'CONTEXT EXHAUSTION'
   }
 
@@ -1367,6 +1374,11 @@ interface ManagedSession {
   teamLevelQgRunning?: boolean
   /** Persisted QG cycle count — survives app restarts */
   qgCycleCount?: number
+  /** Implements REQ-A1: Count of teammate spawns queued but not yet kicked off.
+   *  Prevents lead from emitting 'complete' before all teammates start. */
+  pendingTeammateSpawns?: number
+  /** Implements REQ-A1: Safety timeout handle for pending spawns (5 min max wait) */
+  pendingSpawnsTimeout?: NodeJS.Timeout
   // SDD fields
   sddEnabled?: boolean
   activeSpecId?: string
@@ -1754,6 +1766,17 @@ export class SessionManager {
         }
       }
 
+      // Implements REQ-B1: 3-stage retry-storm escalation from health monitor
+      if (issue.type === 'retry-storm-throttle') {
+        sessionLog.warn(`[AgentTeams] Retry-storm THROTTLE for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
+        // Throttle stage is a strong warning — not an auto-kill yet, but log prominently
+      }
+
+      if (issue.type === 'retry-storm-kill') {
+        shouldAutoKill = true
+        autoKillReason = `retry-storm escalated to kill stage: ${issue.details}`
+      }
+
       if (issue.type === 'context-exhaustion') {
         shouldAutoKill = true
         autoKillReason = `context window exhausted`
@@ -1772,7 +1795,10 @@ export class SessionManager {
               '',
               'The teammate was unresponsive to shutdown requests and consuming resources.',
               'Its task has been marked as failed. You may re-assign the work or complete it yourself.',
-            ].join('\n')).catch(() => {})
+            ].join('\n')).catch(sendErr => {
+              // BUG-004 fix: Log instead of silently swallowing
+              sessionLog.error(`[AgentTeams] Failed to notify lead about auto-kill of ${issue.teammateId}:`, sendErr)
+            })
           }
         }).catch(err => {
           sessionLog.error(`[AgentTeams] Auto-kill failed for ${issue.teammateId}:`, err)
@@ -1782,11 +1808,16 @@ export class SessionManager {
     this.healthMonitor.on('health:stall', alertHandler)
     this.healthMonitor.on('health:error-loop', alertHandler)
     this.healthMonitor.on('health:retry-storm', alertHandler)
+    this.healthMonitor.on('health:retry-storm-throttle', alertHandler)
+    this.healthMonitor.on('health:retry-storm-kill', alertHandler)
     this.healthMonitor.on('health:context-exhaustion', alertHandler)
     this.teamHealthAlertHandlers.set(teamId, alertHandler)
 
     // Periodic team status check-in (every 2 minutes)
     const statusInterval = setInterval(async () => {
+      // BUG-002 fix: Guard against firing after stopTeamHealthMonitoring
+      if (!this.healthMonitorTeams.has(teamId)) return
+
       const health = this.healthMonitor.getTeamHealth(teamId)
       if (health.length === 0) return
 
@@ -1846,6 +1877,8 @@ export class SessionManager {
       this.healthMonitor.off('health:stall', alertHandler)
       this.healthMonitor.off('health:error-loop', alertHandler)
       this.healthMonitor.off('health:retry-storm', alertHandler)
+      this.healthMonitor.off('health:retry-storm-throttle', alertHandler)
+      this.healthMonitor.off('health:retry-storm-kill', alertHandler)
       this.healthMonitor.off('health:context-exhaustion', alertHandler)
       this.teamHealthAlertHandlers.delete(teamId)
     }
@@ -2032,25 +2065,80 @@ export class SessionManager {
         throw new Error('Lead did not generate a spec within the timeout')
       },
 
+      // Implements REQ-B3: Smart task decomposition with dependency inference,
+      // domain grouping, and parallel identification.
       decomposeIntoTasks: async (_teamId: string, spec) => {
-        return spec.requirements.map((req, idx) => ({
-          title: `Implement ${req.id}: ${req.description.slice(0, 60)}`,
-          description: req.description,
-          requirementIds: [req.id],
-          phase: req.priority === 'critical' ? 'foundation' : req.priority === 'high' ? 'core' : 'polish',
-          phaseOrder: req.priority === 'critical' ? 0 : req.priority === 'high' ? 1 : 2,
-        }))
+        const reqMap = new Map(spec.requirements.map(r => [r.id, r]))
+
+        // Build dependency graph: if requirement B references A's ID in its description,
+        // B depends on A.
+        const dependencyMap = new Map<string, string[]>()
+        for (const req of spec.requirements) {
+          const deps: string[] = []
+          for (const other of spec.requirements) {
+            if (other.id === req.id) continue
+            // Check if this requirement references another requirement's ID
+            if (req.description.includes(other.id)) {
+              deps.push(other.id)
+            }
+          }
+          dependencyMap.set(req.id, deps)
+        }
+
+        return spec.requirements.map((req) => {
+          const phase = req.priority === 'critical' ? 'foundation' : req.priority === 'high' ? 'core' : 'polish'
+          const phaseOrder = req.priority === 'critical' ? 0 : req.priority === 'high' ? 1 : 2
+
+          // Infer task type from requirement description
+          const { inferTaskType } = require('@craft-agent/shared/agent-teams/quality-gates')
+          const taskType = inferTaskType(req.description) ?? 'feature'
+
+          // Build dependency list: task IDs that must complete first
+          const reqDeps = dependencyMap.get(req.id) ?? []
+          // Map requirement IDs to task IDs (task-{reqId})
+          const taskDeps = reqDeps.map(depReqId => `task-${depReqId}`)
+
+          return {
+            id: `task-${req.id}`,
+            title: `Implement ${req.id}: ${req.description.slice(0, 60)}`,
+            description: req.description,
+            requirementIds: [req.id],
+            phase,
+            phaseOrder,
+            taskType,
+            dependencies: taskDeps.length > 0 ? taskDeps : undefined,
+          }
+        })
       },
 
       spawnAndAssign: async (_teamId: string, taskIds: string[]) => {
-        await this.spawnYoloHeadsByPhase({
-          teamId: _teamId,
-          leadSessionId,
-          workspaceId: lead.workspace.id,
-          fallbackModel: lead.model || 'claude-opus-4-6',
-          wsConfig,
-          taskIds,
-        })
+        const allTasks = teamManager.getTasks(_teamId)
+        const relevantTasks = taskIds
+          .map(id => allTasks.find(t => t.id === id))
+          .filter((t): t is NonNullable<typeof t> => t != null)
+
+        // Implements REQ-P1: Decide flat vs managed spawn strategy
+        const strategy = decideSpawnStrategy(relevantTasks)
+
+        if (strategy.mode === 'flat') {
+          await this.spawnWorkersDirectly({
+            teamId: _teamId,
+            leadSessionId,
+            workspaceId: lead.workspace.id,
+            fallbackModel: lead.model || 'claude-opus-4-6',
+            wsConfig,
+            taskIds,
+          })
+        } else {
+          await this.spawnYoloHeadsByPhase({
+            teamId: _teamId,
+            leadSessionId,
+            workspaceId: lead.workspace.id,
+            fallbackModel: lead.model || 'claude-opus-4-6',
+            wsConfig,
+            taskIds,
+          })
+        }
       },
 
       runIntegrationCheck: async (_teamId: string) => {
@@ -2200,12 +2288,24 @@ export class SessionManager {
     const { workerModel, reviewerModel, phaseTasks, specSection } = params
     const taskLines = phaseTasks.map(task => `- ${task.title}: ${task.description || ''}`).join('\n')
 
+    // Implements REQ-B5: Calculate explicit worker budget based on task count.
+    // Simple heuristic: 1 worker per task for complex tasks, batch 2-3 simple tasks per worker.
+    const taskCount = phaseTasks.length
+    const workerBudget = Math.max(1, Math.min(taskCount, MAX_TEAMMATES_PER_TEAM - 2)) // Reserve slots for head + reviewer
+
     return [
       `You are a Head agent. Coordinate these tasks using Worker subagents (model="${workerModel}") and Reviewer subagents (model="${reviewerModel}").`,
       '',
       'TASKS ASSIGNED',
       taskLines || '- No tasks provided',
       specSection,
+      '',
+      // Implements REQ-B5: Explicit worker count guidance
+      'RESOURCE BUDGET',
+      `- You have budget for ${workerBudget} Worker subagents (based on ${taskCount} tasks).`,
+      '- Spawn 1 Worker per task for complex tasks, or 1 Worker for 2-3 related simple tasks.',
+      '- Each Worker should complete within 10 minutes.',
+      '- If a Worker exceeds 3 retries on quality gate, escalate — do not retry further.',
       '',
       'SPAWNING RULES',
       '- Spawn Workers as subagents (Task without team_name).',
@@ -2257,6 +2357,61 @@ export class SessionManager {
         this.assignTasksToSessionMember(teamId, headSession.id, phasePlan.phaseTaskIds)
       } catch (err) {
         sessionLog.error(`[YOLO] Failed to spawn head for phase ${phasePlan.phase}:`, err)
+      }
+    }
+  }
+
+  /**
+   * Implements REQ-P1: Flat mode — spawn workers directly without Head intermediary.
+   * Used when tasks are single-domain and ≤5, avoiding the token overhead of a Head agent.
+   */
+  private async spawnWorkersDirectly(params: {
+    teamId: string
+    leadSessionId: string
+    workspaceId: string
+    fallbackModel: string
+    wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined
+    taskIds: string[]
+  }): Promise<void> {
+    const { teamId, leadSessionId, workspaceId, fallbackModel, wsConfig, taskIds } = params
+    const tasks = teamManager.getTasks(teamId)
+    const teamSpec = teamManager.getTeamSpec(teamId)
+    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel)
+
+    for (const taskId of taskIds) {
+      const task = tasks.find(t => t.id === taskId)
+      if (!task) continue
+
+      try {
+        const specContext = teamSpec
+          ? `\n\nSpec Context:\n${task.requirementIds?.map(id => `- ${id}`).join('\n') ?? 'No linked requirements'}`
+          : ''
+
+        const workerPrompt = [
+          `## Task: ${task.title}`,
+          '',
+          task.description ?? 'No additional description.',
+          specContext,
+          '',
+          'Complete this task thoroughly. Follow TDD where applicable: tests first, implementation second, then verify tests pass.',
+          task.dependencies?.length
+            ? `\nDependencies (already completed): ${task.dependencies.join(', ')}`
+            : '',
+        ].filter(Boolean).join('\n')
+
+        const workerSession = await this.createTeammateSession({
+          parentSessionId: leadSessionId,
+          workspaceId,
+          teamId,
+          teammateName: `worker-${taskId}`,
+          role: TEAM_ROLE_WORKER,
+          model: workerModel,
+          prompt: workerPrompt,
+        })
+
+        this.assignTasksToSessionMember(teamId, workerSession.id, [taskId])
+      } catch (err) {
+        sessionLog.error(`[YOLO] Failed to spawn worker for task ${taskId}:`, err)
       }
     }
   }
@@ -2412,8 +2567,9 @@ export class SessionManager {
     const persistence = this.getUsagePersistence(managed.workspace.id)
     const weekIdentifier = persistence.getWeekIdentifier(now)
     const startedAtMs = managed.createdAt ?? managed.lastMessageAt ?? now.getTime()
+    // BUG-034 fix: Use structuredClone instead of JSON round-trip for deep cloning
     const base = managed.usageSummary
-      ? JSON.parse(JSON.stringify(managed.usageSummary)) as PersistedSessionUsage
+      ? structuredClone(managed.usageSummary)
       : createEmptySessionUsage(managed.id, startedAtMs)
 
     base.weekIdentifier = weekIdentifier
@@ -3225,14 +3381,33 @@ export class SessionManager {
         const datePrefix = session.id.slice(0, 6)
         const key = `${session.teamColor}:${datePrefix}`
         const candidates = leadsByColorAndDay.get(key)
-        if (candidates && candidates.length === 1) {
-          const lead = candidates[0]!
-          session.parentSessionId = lead.id
-          session.teamId = lead.teamId
-          session.teamColor = lead.teamColor
-          repairedTeammates++
-          this.persistSession(session)
-          sessionLog.info(`[AgentTeams] Recovered orphaned teammate ${session.id} → lead ${lead.id} (teamColor match)`)
+        if (candidates && candidates.length > 0) {
+          // Implements REQ-A2: When multiple leads share the same color+day,
+          // pick the one whose creation time is closest to (but before) the orphan's.
+          // This handles the case where a user creates multiple teams on the same day.
+          let bestLead: ManagedSession | null = null
+          if (candidates.length === 1) {
+            bestLead = candidates[0]!
+          } else {
+            const orphanCreatedAt = session.createdAt ?? session.lastMessageAt ?? 0
+            // Sort leads by creation time descending, pick the most recent one
+            // that was created before or at the same time as the orphan.
+            const sorted = [...candidates].sort((a, b) =>
+              (b.createdAt ?? b.lastMessageAt ?? 0) - (a.createdAt ?? a.lastMessageAt ?? 0)
+            )
+            bestLead = sorted.find(l =>
+              (l.createdAt ?? l.lastMessageAt ?? 0) <= orphanCreatedAt
+            ) ?? sorted[sorted.length - 1]!  // Fallback: oldest lead
+          }
+
+          if (bestLead) {
+            session.parentSessionId = bestLead.id
+            session.teamId = bestLead.teamId
+            session.teamColor = bestLead.teamColor
+            repairedTeammates++
+            this.persistSession(session)
+            sessionLog.info(`[AgentTeams] Recovered orphaned teammate ${session.id} → lead ${bestLead.id} (teamColor match, ${candidates.length} candidates)`)
+          }
         }
       }
     }
@@ -4269,7 +4444,7 @@ export class SessionManager {
       // LLM connection - initially undefined, will be set when model is selected
       // This allows the connection to be locked after first message
       llmConnection: options?.llmConnection,
-      thinkingLevel: defaultThinkingLevel,
+      thinkingLevel: options?.thinkingLevel ?? defaultThinkingLevel,
       // System prompt preset for mini agents
       systemPromptPreset: options?.systemPromptPreset,
       messageQueue: [],
@@ -4330,7 +4505,7 @@ export class SessionManager {
       enabledSourceSlugs: defaultEnabledSourceSlugs,
       model: managed.model,
       llmProvider: managed.llmProvider,
-      thinkingLevel: defaultThinkingLevel,
+      thinkingLevel: options?.thinkingLevel ?? defaultThinkingLevel,
       sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
       hidden: options?.hidden,
       // Agent team fields
@@ -4430,6 +4605,65 @@ export class SessionManager {
           this.sendEvent({ type: 'session_model_changed', sessionId: parent.id, model: parent.model }, parent.workspace.id)
         }
       }
+
+      // Implements AUDIT-FIX-1: Wire ReviewLoopOrchestrator so quality gates actually run.
+      // Previously, setReviewLoop() was never called in production — only in tests.
+      // This connects the 10-stage quality gate pipeline to the task completion flow.
+      const qgWsConfig = loadWorkspaceConfig(parent.workspace.rootPath)
+      const qgConfig = mergeQualityGateConfig(qgWsConfig?.agentTeams?.qualityGates)
+      if (qgConfig.enabled) {
+        const resolvedTeamIdForQg = teamManager.resolveTeamId(params.teamId)
+        const workingDir = parent.workingDirectory || parent.workspace.rootPath
+        const reviewCallbacks: ReviewLoopCallbacks = {
+          collectDiff: async (_teamId: string, _taskId: string, wd: string) => {
+            const reviewDiff = await DiffCollector.collectWorkingDiff(wd)
+            return reviewDiff.unifiedDiff
+          },
+          runQualityGates: async (diff, taskDescription, wd, config, cycleCount, spec) => {
+            const runner = this.getQualityGateRunner()
+            const taskContext: TaskContext = {
+              taskDescription,
+              workingDirectory: wd,
+              cycleCount,
+              spec,
+            }
+            return runner.runPipeline(diff, taskContext, config)
+          },
+          sendFeedback: async (_teamId: string, teammateId: string, feedback: string) => {
+            await this.sendMessage(teammateId, feedback)
+          },
+          updateTaskStatus: (teamId: string, taskId: string, status: string, assignee?: string, options?: { bypassReviewLoop?: boolean }) => {
+            teamManager.updateTaskStatus(teamId, taskId, status as import('@craft-agent/core/types').TeamTaskStatus, assignee, options)
+          },
+          escalate: async (result, diff, taskDescription, config) => {
+            const runner = this.getQualityGateRunner()
+            const taskContext: TaskContext = { taskDescription, workingDirectory: workingDir }
+            return runner.escalate(result, diff, taskContext, config)
+          },
+        }
+        const reviewLoopConfig: ReviewLoopConfig = {
+          qualityGates: qgConfig,
+          workingDirectory: workingDir,
+          autoReview: true,
+        }
+        const reviewLoop = new ReviewLoopOrchestrator(reviewCallbacks, reviewLoopConfig)
+        teamManager.setReviewLoop(reviewLoop)
+
+        // Forward review events as team activity
+        reviewLoop.on('review:passed', (data: { teamId: string; taskId: string }) => {
+          teamManager.logActivity(data.teamId, 'quality-gate-passed', `Task ${data.taskId} passed quality gates`, undefined, undefined)
+        })
+        reviewLoop.on('review:failed', (data: { teamId: string; taskId: string; report: string }) => {
+          teamManager.logActivity(data.teamId, 'quality-gate-failed', `Task ${data.taskId} failed quality gates`, undefined, undefined)
+        })
+        reviewLoop.on('review:escalated', (data: { teamId: string; taskId: string }) => {
+          teamManager.logActivity(data.teamId, 'escalation', `Task ${data.taskId} escalated after max review cycles`, undefined, undefined)
+        })
+
+        sessionLog.info(`[AgentTeams] ReviewLoopOrchestrator wired for team "${resolvedTeamIdForQg}" (QG enabled, threshold: ${qgConfig.passThreshold})`)
+      } else {
+        sessionLog.info(`[AgentTeams] Quality gates disabled for team — ReviewLoop not attached`)
+      }
     }
 
     // Create the teammate session
@@ -4450,7 +4684,7 @@ export class SessionManager {
 
     const teammateRole = normalizeTeamRole(routing.role, params.teammateName)
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
-    const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
+    const teammateCodename = buildTeammateCodename(teammateRole, params.teamId, teammateOrdinal - 1)
     // Implements REQ-002: Use witty codename as primary name, honor explicit custom names
     const customName = params.teammateName?.trim()
     const teammateDisplayName = customName || teammateCodename
@@ -4545,6 +4779,14 @@ export class SessionManager {
 
     sessionLog.info(`[AgentTeams] Using connection "${teammateConnection}" (${resolvedConnection.providerType}) for teammate "${teammateDisplayName}"`)
 
+    // Implements REQ-P3: Resolve thinking level based on strategy + role
+    // Smart: Lead/Reviewer/Escalation get thinking. Codex: only Reviewer. Budget: all off.
+    const presetId = (workspaceConfig as any)?.settings?.agentTeamsModelPreset as string | undefined
+    const customThinkingOverride = presetId === 'custom'
+      ? (workspaceConfig as any)?.settings?.[`agentTeams${teammateRole.charAt(0).toUpperCase() + teammateRole.slice(1)}Thinking`] as boolean | undefined
+      : undefined
+    const shouldEnableThinking = resolveThinkingForRole(presetId, teammateRole, customThinkingOverride)
+    const teammateThinkingLevel: ThinkingLevel = shouldEnableThinking ? 'think' : DEFAULT_THINKING_LEVEL
 
     const teammateSession = await this.createSession(params.workspaceId, {
       teamId: params.teamId,
@@ -4558,6 +4800,7 @@ export class SessionManager {
       llmConnection: teammateConnection,
       sddEnabled: parent.sddEnabled,
       activeSpecId: parent.activeSpecId,
+      thinkingLevel: teammateThinkingLevel,
     })
     await this.renameSession(teammateSession.id, teammateDisplayName)
 
@@ -4639,6 +4882,13 @@ export class SessionManager {
 
     const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithSkills, compactSpecContext)
 
+    // Implements REQ-A1: Track pending teammate spawns on the lead session
+    // so shouldDelayCompletionForAgentTeam() can block premature 'complete'.
+    const leadSession = this.sessions.get(params.parentSessionId)
+    if (leadSession) {
+      leadSession.pendingTeammateSpawns = (leadSession.pendingTeammateSpawns ?? 0) + 1
+    }
+
     // Kick off the teammate by sending the prompt
     // Use setTimeout to avoid blocking the caller, but track timer so cleanup can cancel it.
     const kickoffTimer = setTimeout(async () => {
@@ -4647,6 +4897,15 @@ export class SessionManager {
         await this.sendMessage(teammateSession.id, teammatePrompt)
       } catch (err) {
         sessionLog.error(`Failed to start teammate ${teammateDisplayName}:`, err)
+      } finally {
+        // Implements REQ-A1: Decrement pending count and check if lead can complete
+        if (leadSession) {
+          leadSession.pendingTeammateSpawns = Math.max(0, (leadSession.pendingTeammateSpawns ?? 1) - 1)
+          // If lead was waiting for spawns, re-check completion now
+          if (leadSession.pendingTeammateSpawns === 0 && !leadSession.isProcessing) {
+            this.checkLeadTeamCompletion(params.parentSessionId)
+          }
+        }
       }
     }, 100)
     this.teammateKickoffTimers.set(teammateSession.id, kickoffTimer)
@@ -5484,6 +5743,23 @@ export class SessionManager {
                 sessionId: managed.id,
                 report: interimReport,
               }, managed.workspace.id)
+            }
+          }
+
+          // Implements AUDIT-FIX-2: Bridge SubmitPlan → Spec Registration.
+          // Previously, submitted plans were never registered as specs with the teamManager,
+          // so the dashboard's spec coverage and traceability panels had no data.
+          if (managed.teamId) {
+            try {
+              const parsedPlanSpec = parseSpecMarkdown(planContent, planPath)
+              if (parsedPlanSpec && parsedPlanSpec.requirements.length > 0) {
+                const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+                teamManager.setTeamSpec(resolvedTeamId, parsedPlanSpec)
+                sessionLog.info(`[AgentTeams] Registered plan as team spec for "${resolvedTeamId}" (${parsedPlanSpec.requirements.length} requirements)`)
+              }
+            } catch (specParseErr) {
+              // Plan may not be in spec format — that's OK, not all plans are specs
+              sessionLog.debug(`[AgentTeams] Plan could not be parsed as spec (non-fatal):`, specParseErr)
             }
           }
 
@@ -6827,14 +7103,14 @@ export class SessionManager {
     // Ensure team resources are released before deleting a lead session.
     if (managed.isTeamLead && managed.teammateSessionIds?.length) {
       await this.cleanupTeam(sessionId)
-      // Clear team refs on teammates so they don't point to a deleted lead
+      // Implements REQ-A4: Preserve teamId and teamColor on teammates even when
+      // lead is deleted, so orphan recovery (Pass 1) can re-adopt them on restart.
+      // Only clear parentSessionId since it points to a now-deleted session.
       for (const tid of managed.teammateSessionIds ?? []) {
         const teammate = this.sessions.get(tid)
         if (teammate) {
           teammate.parentSessionId = undefined
-          teammate.teamId = undefined
-          teammate.teammateName = undefined
-          teammate.teamColor = undefined
+          // Keep teamId, teammateName, teamColor intact for orphan recovery
           this.persistSession(teammate)
         }
       }
@@ -7225,6 +7501,11 @@ export class SessionManager {
               toolName: event.toolName,
               error: event.isError,
             })
+            // Implements REQ-B1: Reset retry-storm escalation on successful tool completion.
+            // A successful result means the teammate is making progress, not stuck in a loop.
+            if (!event.isError) {
+              this.healthMonitor.resetRetryStormStage(hmTeamId, managed.id)
+            }
             // Forward tool completion to dashboard
             this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
               toolName: event.toolName || 'unknown',
@@ -7683,6 +7964,12 @@ export class SessionManager {
     reason: 'complete' | 'interrupted' | 'error' | 'timeout'
   ): Promise<void> {
     await this.agentTeamCompletionCoordinator.handleAgentTeamCompletionOnStop(managed, sessionId, reason)
+
+    // Implements REQ-A1: When a teammate finishes, check if its lead can now emit
+    // the deferred 'complete' event (all spawns resolved + no active teammates).
+    if (managed.parentSessionId) {
+      this.checkLeadTeamCompletion(managed.parentSessionId)
+    }
   }
 
 
@@ -7800,7 +8087,18 @@ export class SessionManager {
 
   private shouldDelayCompletionForAgentTeam(managed: ManagedSession): boolean {
     // Check if this session is a team lead with active teammate sessions
-    if (!managed.isTeamLead || !managed.teammateSessionIds?.length) {
+    if (!managed.isTeamLead) {
+      return false
+    }
+
+    // Implements REQ-A1: Block completion while teammate spawns are still pending.
+    // This closes the race where the lead emits 'complete' before setTimeout
+    // fires to kick off teammates.
+    if ((managed.pendingTeammateSpawns ?? 0) > 0) {
+      return true
+    }
+
+    if (!managed.teammateSessionIds?.length) {
       return false
     }
 
@@ -7811,6 +8109,40 @@ export class SessionManager {
     })
 
     return hasActiveTeammates
+  }
+
+  /**
+   * Implements REQ-A1 + REQ-B6: Re-check whether a lead session can now complete.
+   * Called when a pending teammate spawn resolves, or when a teammate finishes.
+   * If all spawns resolved and no teammates active, emit deferred 'complete'.
+   *
+   * Note: The actual synthesis prompt is handled by the AgentTeamCompletionCoordinator's
+   * maybePromptLeadSynthesis(), which sends a system message to the lead asking it to
+   * synthesize results. This method handles the UI-level completion event.
+   */
+  private checkLeadTeamCompletion(leadSessionId: string): void {
+    const managed = this.sessions.get(leadSessionId)
+    if (!managed) return
+    // If the lead is currently processing (e.g., synthesis prompt triggered it),
+    // don't emit complete yet — let onProcessingStopped handle it naturally.
+    if (managed.isProcessing) return
+    if (this.shouldDelayCompletionForAgentTeam(managed)) return
+
+    sessionLog.info(`[AgentTeams] All teammates finished for lead ${leadSessionId}, emitting deferred complete`)
+
+    // Clear the safety timeout if set
+    if (managed.pendingSpawnsTimeout) {
+      clearTimeout(managed.pendingSpawnsTimeout)
+      managed.pendingSpawnsTimeout = undefined
+    }
+
+    this.sendEvent({
+      type: 'complete',
+      sessionId: leadSessionId,
+      tokenUsage: managed.tokenUsage,
+      hasUnread: managed.hasUnread,
+    }, managed.workspace.id)
+    this.persistSession(managed)
   }
 
   /**

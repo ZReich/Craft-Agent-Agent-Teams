@@ -34,6 +34,23 @@ import type {
 import { DEFAULT_YOLO_CONFIG, DEFAULT_DESIGN_FLOW_CONFIG, mergeDesignFlowConfig } from '@craft-agent/core/types';
 import type { AgentTeamManager } from '../agent/agent-team-manager';
 import type { ReviewLoopOrchestrator } from './review-loop';
+import { classifyTaskDomain } from './routing-policy';
+
+// ============================================================
+// Conditional Head Spawning (REQ-P1)
+// ============================================================
+
+// Implements REQ-P1: Conditional Head spawning
+// Flat mode for simple single-domain teams, managed mode for complex multi-domain work
+
+export type SpawnStrategy =
+  | { mode: 'flat' }
+  | { mode: 'managed'; heads: DomainHeadPlan[] }
+
+export interface DomainHeadPlan {
+  domain: string
+  taskIds: string[]
+}
 
 // ============================================================
 // Callback Interface
@@ -485,22 +502,97 @@ export class YoloOrchestrator extends EventEmitter {
    * Execute a flat list of tasks (no phase ordering).
    * Respects maxConcurrency by batching.
    */
+  /**
+   * Implements REQ-B2: Dependency-aware task execution.
+   * Tasks start as soon as their dependencies are satisfied, up to maxConcurrency.
+   * No longer blocks on entire batches — when one task finishes, the next ready
+   * task starts immediately.
+   */
   private async executeFlat(teamId: string, tasks: TeamTask[], config: YoloConfig): Promise<void> {
     this.transition('executing');
     this.checkAborted();
 
-    const taskIds = tasks.map(t => t.id);
+    if (tasks.length === 0) return;
 
-    // Spawn teammates and assign work in batches of maxConcurrency
-    const batches = this.chunk(taskIds, config.maxConcurrency);
+    const taskMap = new Map(tasks.map(t => [t.id, t]));
+    const terminalStatuses = new Set(['completed', 'failed']);
+    const inFlight = new Set<string>();
+    const completed = new Set<string>();
 
-    for (const batch of batches) {
-      this.checkAborted();
-      await this.callbacks.spawnAndAssign(teamId, batch);
+    /**
+     * A task is ready to run when all its dependencies are in the completed set
+     * and it hasn't started yet.
+     */
+    const getReadyTasks = (): string[] => {
+      const ready: string[] = [];
+      for (const task of tasks) {
+        if (inFlight.has(task.id) || completed.has(task.id)) continue;
+        const deps = task.dependencies ?? [];
+        const depsReady = deps.every(depId => completed.has(depId));
+        if (depsReady) ready.push(task.id);
+      }
+      return ready;
+    };
 
-      // Wait for all tasks in this batch to reach a terminal state
-      await this.waitForTasks(teamId, batch);
-    }
+    const POLL_INTERVAL = 2000;
+    const MAX_WAIT_MS = 30 * 60 * 1000;
+
+    return new Promise<void>((resolve) => {
+      const startTime = Date.now();
+
+      const tick = async (): Promise<void> => {
+        if (this.aborted) { resolve(); return; }
+        if (Date.now() - startTime > MAX_WAIT_MS) {
+          this.logActivity('yolo-paused', `Dependency-aware execution timed out after ${MAX_WAIT_MS / 60_000} minutes`);
+          resolve();
+          return;
+        }
+
+        // Check for newly completed tasks
+        const allTasks = this.teamManager.getTasks(teamId);
+        for (const t of allTasks) {
+          if (inFlight.has(t.id) && terminalStatuses.has(t.status)) {
+            inFlight.delete(t.id);
+            completed.add(t.id);
+          }
+        }
+
+        // All tasks done?
+        if (completed.size >= tasks.length) { resolve(); return; }
+
+        // Find tasks ready to start (dependencies satisfied + under concurrency limit)
+        const ready = getReadyTasks();
+        const slotsAvailable = config.maxConcurrency - inFlight.size;
+        const toSpawn = ready.slice(0, slotsAvailable);
+
+        if (toSpawn.length > 0) {
+          for (const taskId of toSpawn) {
+            inFlight.add(taskId);
+          }
+          try {
+            this.checkAborted();
+            await this.callbacks.spawnAndAssign(teamId, toSpawn);
+          } catch (err) {
+            // If spawn fails, remove from in-flight so they can be retried
+            for (const taskId of toSpawn) {
+              inFlight.delete(taskId);
+            }
+          }
+        }
+
+        // Check if we're stuck: no in-flight tasks and no ready tasks but not all done
+        if (inFlight.size === 0 && ready.length === 0 && completed.size < tasks.length) {
+          const stuck = tasks.filter(t => !completed.has(t.id));
+          this.logActivity('phase-blocked', `${stuck.length} tasks blocked by unsatisfied dependencies`);
+          resolve();
+          return;
+        }
+
+        setTimeout(tick, POLL_INTERVAL);
+      };
+
+      void tick();
+    });
   }
 
   /**
@@ -737,6 +829,68 @@ export class YoloOrchestrator extends EventEmitter {
     }
     this.boundHandlers = [];
   }
+}
+
+// ============================================================
+// Spawn Strategy Decision (REQ-P1)
+// ============================================================
+
+/**
+ * Decide whether to spawn Heads (managed) or workers directly (flat).
+ *
+ * - 1 domain AND ≤5 tasks → flat (workers spawn directly, no Head overhead)
+ * - 2+ domains → managed (domain-specific Heads coordinate their workers)
+ * - 1 domain AND 6+ tasks → managed (volume warrants a coordinator)
+ * - Research/explore only → always flat (independent by nature)
+ */
+export function decideSpawnStrategy(tasks: { id: string; title: string; description?: string; taskType?: string }[]): SpawnStrategy {
+  if (tasks.length === 0) return { mode: 'flat' }
+
+  // Classify each task by domain
+  const tasksByDomain = new Map<string, string[]>()
+  for (const task of tasks) {
+    const text = `${task.title} ${task.description ?? ''}`
+    const { domain } = classifyTaskDomain(text)
+    const existing = tasksByDomain.get(domain) ?? []
+    existing.push(task.id)
+    tasksByDomain.set(domain, existing)
+  }
+
+  // Filter out 'other' and count meaningful domains
+  const meaningfulDomains = [...tasksByDomain.entries()].filter(
+    ([domain]) => domain !== 'other'
+  )
+
+  // Research/explore only → always flat
+  const researchOnly = meaningfulDomains.every(
+    ([domain]) => domain === 'research' || domain === 'search'
+  )
+  if (researchOnly) return { mode: 'flat' }
+
+  // Multi-domain → managed with one Head per domain
+  if (meaningfulDomains.length >= 2) {
+    const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({
+      domain,
+      taskIds,
+    }))
+    // Include 'other' tasks in the largest domain's Head
+    const otherTasks = tasksByDomain.get('other')
+    if (otherTasks?.length && heads.length > 0) {
+      const largest = heads.reduce((a, b) => a.taskIds.length >= b.taskIds.length ? a : b)
+      largest.taskIds.push(...otherTasks)
+    }
+    return { mode: 'managed', heads }
+  }
+
+  // Single domain — check task count
+  if (tasks.length >= 6) {
+    const allTaskIds = tasks.map(t => t.id)
+    const domain = meaningfulDomains[0]?.[0] ?? 'other'
+    return { mode: 'managed', heads: [{ domain, taskIds: allTaskIds }] }
+  }
+
+  // Simple case: single domain, ≤5 tasks → flat
+  return { mode: 'flat' }
 }
 
 // ============================================================

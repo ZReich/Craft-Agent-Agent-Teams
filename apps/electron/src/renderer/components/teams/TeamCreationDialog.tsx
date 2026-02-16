@@ -92,13 +92,17 @@ export function TeamCreationDialog({
 
   const costEstimate = useMemo(() => {
     const costMap: Record<ModelPresetId, number> = {
+      // New strategy presets
+      'smart': 7.5 + 3.75 * teammates.length,
+      'codex': 9.5 + 4.2 * teammates.length,
+      'budget': 2.25 + 1.425 * teammates.length,
+      'custom': 3.75 * teammates.length,
+      // Legacy presets (backward compatibility)
       'max-quality': 22.5 * teammates.length,
       'balanced': 7.5 + 3.75 * teammates.length,
       'cost-optimized': 7.5 + 1.425 * teammates.length,
-      'budget': 2.25 + 1.425 * teammates.length,
       'codex-balanced': 9.5 + 4.2 * teammates.length,
       'codex-full': 14 + 6.5 * teammates.length,
-      'custom': 3.75 * teammates.length,
     }
     return (costMap[selectedPreset] || 5).toFixed(2)
   }, [selectedPreset, teammates.length])

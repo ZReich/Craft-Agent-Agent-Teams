@@ -30,6 +30,7 @@ import type {
   TDDPhase,
   Spec,
   SpecRequirement,
+  DesignArtifact,
 } from '@craft-agent/core/types';
 import { resolveReviewProvider, type ReviewProvider } from '@craft-agent/shared/agent-teams/review-provider';
 
@@ -127,6 +128,40 @@ Return a JSON object with this exact structure:
 
 Score guide: 95-100 = fully complete and integrated, 85-94 = nearly done, 70-84 = gaps remain, below 70 = substantially incomplete.
 CRITICAL: If integrationVerified is false, score MUST be below 70 regardless of other factors. Dead code is never acceptable.`,
+
+  design_compliance: `You are a design fidelity reviewer checking that an approved UI design has been preserved during implementation.
+
+A design variant was approved before coding began. The implementation MUST preserve:
+1. **Visual structure** — Layout hierarchy, spacing, component arrangement must match the approved design
+2. **Component usage** — The specific UI components from the design brief must be used (no swapping Button for a plain <button>, etc.)
+3. **Animations and transitions** — All motion/animation code from the design must be preserved
+4. **Responsive behavior** — Mobile/tablet breakpoints from the design must be intact
+5. **Typography and color** — Font sizes, weights, and color tokens from the design must be used
+
+The implementation MAY add:
+- Data binding (connecting props to real data)
+- Event handlers (click, submit, etc.)
+- API integration
+- State management
+
+The implementation MUST NOT:
+- Change the visual layout or component hierarchy
+- Remove animations or transitions
+- Swap components for different ones
+- Alter the responsive breakpoints
+- Change typography or color tokens
+
+## Approved Design Context
+{designContext}
+
+Analyze the diff against the approved design. Return a JSON object:
+{
+  "score": <number 0-100>,
+  "issues": [<string descriptions of design deviations>],
+  "suggestions": [<string suggestions for preserving the design>]
+}
+
+Score guide: 95-100 = design fully preserved, 85-94 = minor deviations, 70-84 = notable changes, below 70 = design significantly altered.`,
 };
 
 // ============================================================
@@ -144,6 +179,8 @@ export interface TaskContext {
   tddPhase?: TDDPhase;
   /** Optional SDD specification context (used by SDD quality gate stages) */
   spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>;
+  /** Optional design artifact — when present, enables design compliance review (REQ-011) */
+  designArtifact?: DesignArtifact;
 }
 
 interface ApiKeyProvider {
@@ -296,6 +333,9 @@ export class QualityGateRunner {
     spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>,
   ): Promise<QualityGateResult> {
     qgLog.info('[QualityGates] Starting pipeline run');
+    // AUDIT-FIX-5: Pre-slice diff once to avoid redundant 50KB string allocations per stage.
+    // Previously each AI stage called diff.slice(0, 50000) independently (up to 7× per cycle).
+    const truncatedDiff = diff.slice(0, 50000);
     const preferredReviewProvider = resolveReviewProvider(config.reviewModel, config.reviewProvider);
     let activeReviewProvider = preferredReviewProvider;
     let activeReviewModel = config.reviewModel;
@@ -379,7 +419,7 @@ export class QualityGateRunner {
 
         qgLog.info(`[QualityGates] Running ${enabledAiStages.length} AI review stages in parallel`);
         const aiResults = await Promise.allSettled(
-          enabledAiStages.map(stage => this.runAIReview(stage, diff, taskContext, resultConfig, activeReviewProvider))
+          enabledAiStages.map(stage => this.runAIReview(stage, truncatedDiff, taskContext, resultConfig, activeReviewProvider))
         );
 
         for (let i = 0; i < enabledAiStages.length; i++) {
@@ -426,23 +466,59 @@ export class QualityGateRunner {
         return this.buildResult(stages, resultConfig, activeReviewProvider);
       }
 
-      if (config.stages.spec_compliance.enabled) {
-        stages.spec_compliance = await this.runSpecComplianceReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
-      }
-
-      if (config.stages.traceability.enabled) {
-        stages.traceability = await this.runTraceabilityReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
-      }
-
+      // AUDIT-FIX-5: Run SDD stages in parallel (they are independent of each other)
       const shouldRunRolloutSafety =
         config.stages.rollout_safety.enabled &&
         Boolean(activeSpec.rolloutPlan || activeSpec.rollbackPlan || activeSpec.observabilityPlan);
 
+      type SDDStageEntry = { name: string; promise: Promise<QualityGateStageResult> };
+      const sddTasks: SDDStageEntry[] = [];
+
+      if (config.stages.spec_compliance.enabled) {
+        sddTasks.push({ name: 'spec_compliance', promise: this.runSpecComplianceReview(truncatedDiff, taskContext, activeSpec, resultConfig, activeReviewProvider) });
+      }
+      if (config.stages.traceability.enabled) {
+        sddTasks.push({ name: 'traceability', promise: this.runTraceabilityReview(truncatedDiff, taskContext, activeSpec, resultConfig, activeReviewProvider) });
+      }
       if (shouldRunRolloutSafety) {
-        stages.rollout_safety = await this.runRolloutSafetyReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
+        sddTasks.push({ name: 'rollout_safety', promise: this.runRolloutSafetyReview(truncatedDiff, taskContext, activeSpec, resultConfig, activeReviewProvider) });
+      }
+
+      if (sddTasks.length > 0) {
+        qgLog.info(`[QualityGates] Running ${sddTasks.length} SDD stages in parallel`);
+        const sddResults = await Promise.allSettled(sddTasks.map(t => t.promise));
+        for (let i = 0; i < sddTasks.length; i++) {
+          const result = sddResults[i];
+          const stageName = sddTasks[i].name as keyof typeof stages;
+          if (result.status === 'fulfilled') {
+            stages[stageName] = result.value;
+          } else {
+            const errorDetails = this.serializeError(result.reason);
+            qgLog.error(`[QualityGates] SDD stage "${stageName}" failed:`, errorDetails);
+            stages[stageName] = this.createStageFailureResult(
+              `SDD stage "${stageName}" failed: ${errorDetails.message}`,
+              ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
+            );
+          }
+        }
       }
     } else {
       qgLog.info('[QualityGates] No spec provided; skipping SDD review stages');
+    }
+
+    // Design compliance stage: run only when a design artifact is attached (REQ-011)
+    if (taskContext.designArtifact && config.stages.design_compliance.enabled) {
+      if (aiReviewUnavailable) {
+        stages.design_compliance = this.createStageSkippedResult(
+          aiUnavailableReason ?? 'AI review stages unavailable',
+          ['Configure review model credentials to run design compliance checks'],
+        );
+      } else {
+        qgLog.info('[QualityGates] Running design compliance review');
+        stages.design_compliance = await this.runDesignComplianceReview(
+          truncatedDiff, taskContext, resultConfig, activeReviewProvider,
+        );
+      }
     }
 
     return this.buildResult(stages, resultConfig, activeReviewProvider);
@@ -826,7 +902,7 @@ export class QualityGateRunner {
 
     const prompt = promptTemplate.replace('{taskDescription}', taskContext.taskDescription || 'No description provided');
 
-    const userMessage = `Here is the code diff to review:\n\n\`\`\`diff\n${diff.slice(0, 50000)}\`\`\`\n\nTask: ${taskContext.taskDescription || 'No description'}`;
+    const userMessage = `Here is the code diff to review:\n\n\`\`\`diff\n${diff}\`\`\`\n\nTask: ${taskContext.taskDescription || 'No description'}`;
 
     try {
       const responseText = await this.callReviewModel(prompt, userMessage, config, reviewProvider);
@@ -917,7 +993,7 @@ ${requirementsList || '(No requirements provided)'}
 
 Code diff to review:
 \`\`\`diff
-${diff.slice(0, 50000)}
+${diff}
 \`\`\``;
 
     try {
@@ -1019,7 +1095,7 @@ Requirement IDs: ${requirementIds || '(none)'}
 
 Code diff to review:
 \`\`\`diff
-${diff.slice(0, 50000)}
+${diff}
 \`\`\``;
 
     try {
@@ -1143,7 +1219,7 @@ Specification rollout context:
 
 Code diff to review:
 \`\`\`diff
-${diff.slice(0, 50000)}
+${diff}
 \`\`\``;
 
     try {
@@ -1192,6 +1268,79 @@ ${diff.slice(0, 50000)}
       return this.createStageFailureResult(
         `Rollout safety stage encountered an error: ${errorDetails.message}`,
         ['Fix the review model/provider setup and rerun rollout safety checks'],
+      );
+    }
+  }
+
+  /**
+   * Design compliance review — checks that the approved design is preserved.
+   * Only runs when a DesignArtifact is attached to the task context.
+   *
+   * Implements REQ-011: Design Compliance Quality Gate
+   */
+  async runDesignComplianceReview(
+    diff: string,
+    taskContext: TaskContext,
+    config: QualityGateConfig,
+    reviewProvider: ReviewProvider,
+  ): Promise<QualityGateStageResult> {
+    const artifact = taskContext.designArtifact;
+    if (!artifact) {
+      return { score: 100, passed: true, issues: [], suggestions: [] };
+    }
+
+    // Build the design context that replaces {designContext} in the prompt
+    const designContext = `### Selected Design: ${artifact.selectedVariantName}
+
+### Design Brief
+${artifact.brief}
+
+### Component Spec
+${artifact.componentSpec}
+
+### Design Files
+${artifact.filePaths.map(f => `- \`${f}\``).join('\n')}
+
+### Stack
+- Framework: ${artifact.projectStack.framework}
+- TypeScript: ${artifact.projectStack.typescript}
+- Styling: ${artifact.projectStack.styling.tailwind ? 'Tailwind CSS' : 'Other'}
+- Animation: ${artifact.projectStack.animationLibrary ?? 'None'}
+- UI Library: ${artifact.projectStack.uiLibrary ?? 'None'}`;
+
+    const promptTemplate = REVIEW_PROMPTS.design_compliance;
+    const systemPrompt = promptTemplate.replace('{designContext}', designContext);
+
+    const userMessage = `Task: ${taskContext.taskDescription || 'No task description provided'}
+
+Code diff to review:
+\`\`\`diff
+${diff}
+\`\`\``;
+
+    try {
+      const responseText = await this.callReviewModel(systemPrompt, userMessage, config, reviewProvider);
+      const parsed = this.parseAiReviewResponse(responseText);
+
+      if (!parsed) {
+        return this.createStageFailureResult(
+          'Design compliance review returned an unexpected response format',
+          ['Ensure the review model returns valid JSON and rerun design compliance checks'],
+        );
+      }
+
+      return {
+        score: parsed.score,
+        passed: parsed.score >= 70,
+        issues: parsed.issues,
+        suggestions: parsed.suggestions,
+      };
+    } catch (err) {
+      const errorDetails = this.serializeError(err);
+      qgLog.error('[QualityGates] Design compliance review failed:', errorDetails);
+      return this.createStageFailureResult(
+        `Design compliance stage encountered an error: ${errorDetails.message}`,
+        ['Fix the review model/provider setup and rerun design compliance checks'],
       );
     }
   }
@@ -1468,9 +1617,11 @@ Please analyze the diff and provide:
 3. Whether the original task description was ambiguous or too complex`;
 
     try {
+      const truncDiff = diff.slice(0, 50000);
+      const diffMessage = `Diff:\n\`\`\`\n${truncDiff}\`\`\`\n\nTask: ${taskContext.taskDescription}`;
       const response = config.escalationProvider === 'moonshot'
-        ? await this.callMoonshotApi(escalationPrompt, `Diff:\n\`\`\`\n${diff.slice(0, 50000)}\`\`\`\n\nTask: ${taskContext.taskDescription}`, config.escalationModel)
-        : await this.callAnthropicApi(escalationPrompt, `Diff:\n\`\`\`\n${diff.slice(0, 50000)}\`\`\`\n\nTask: ${taskContext.taskDescription}`, config.escalationModel);
+        ? await this.callMoonshotApi(escalationPrompt, diffMessage, config.escalationModel)
+        : await this.callAnthropicApi(escalationPrompt, diffMessage, config.escalationModel);
 
       return response;
     } catch (err) {

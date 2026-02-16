@@ -332,22 +332,24 @@ export function TeamDashboard({
     window.electronAPI.getPersistedTeamState(session.id)
       .then((state) => {
         if (cancelled || !state) return
-        if (state.messages?.length) {
+        // BUG-013 fix: Check cancelled before EACH state update to prevent unmounted updates
+        if (state.messages?.length && !cancelled) {
           setRealtimeMessages((prev) => {
-            // Merge: persisted first, then any live messages already received
             const existingIds = new Set(prev.map(m => m.id))
+            // BUG-016 fix: Sort by timestamp before capping to keep newest messages
             const merged = [...state.messages.filter(m => !existingIds.has(m.id)), ...prev]
+            merged.sort((a, b) => (a.timestamp ?? '').localeCompare(b.timestamp ?? ''))
             return merged.slice(-MAX_REALTIME_MESSAGES)
           })
         }
-        if (state.tasks?.length) {
+        if (state.tasks?.length && !cancelled) {
           setRealtimeTasks((prev) => {
             const existingIds = new Set(prev.map(t => t.id))
             const merged = [...state.tasks.filter(t => !existingIds.has(t.id)), ...prev]
             return merged
           })
         }
-        if (state.activity?.length) {
+        if (state.activity?.length && !cancelled) {
           setRealtimeActivity((prev) => {
             const existingIds = new Set(prev.map(a => a.id))
             const merged = [...state.activity.filter(a => !existingIds.has(a.id)), ...prev]

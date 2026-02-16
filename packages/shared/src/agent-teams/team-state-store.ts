@@ -19,23 +19,30 @@ import type {
   TeammateMessage,
   TeamTask,
   TeamActivityEvent,
+  QualityGateResult,
+  YoloState,
 } from '@craft-agent/core/types';
 
 // ============================================================
 // Types
 // ============================================================
 
+// BUG-020 fix: Extended entry types for quality gates and YOLO state
 interface TeamStateEntry {
-  /** Type tag: msg = message, task = task, act = activity */
-  t: 'msg' | 'task' | 'act';
+  /** Type tag: msg = message, task = task, act = activity, qg = quality gate, yolo = YOLO state */
+  t: 'msg' | 'task' | 'act' | 'qg' | 'yolo';
   /** Payload */
-  d: TeammateMessage | TeamTask | TeamActivityEvent;
+  d: TeammateMessage | TeamTask | TeamActivityEvent | QualityGateResult | YoloState;
+  /** Optional key for keyed entries (e.g., teammate session ID for quality gates) */
+  k?: string;
 }
 
 export interface TeamState {
   messages: TeammateMessage[];
   tasks: TeamTask[];
   activity: TeamActivityEvent[];
+  qualityGates: Map<string, QualityGateResult>;
+  yoloState: YoloState | null;
 }
 
 // ============================================================
@@ -63,10 +70,20 @@ export class TeamStateStore {
     this.appendEntry({ t: 'act', d: event });
   }
 
+  // BUG-020 fix: Persist quality gate results
+  appendQualityGate(teammateSessionId: string, result: QualityGateResult): void {
+    this.appendEntry({ t: 'qg', d: result, k: teammateSessionId });
+  }
+
+  // BUG-020 fix: Persist YOLO state snapshots
+  appendYoloState(state: YoloState): void {
+    this.appendEntry({ t: 'yolo', d: state });
+  }
+
   // ── Load All State ──────────────────────────────────────────
 
   load(): TeamState {
-    const result: TeamState = { messages: [], tasks: [], activity: [] };
+    const result: TeamState = { messages: [], tasks: [], activity: [], qualityGates: new Map(), yoloState: null };
 
     if (!existsSync(this.filePath)) {
       return result;
@@ -106,6 +123,13 @@ export class TeamStateStore {
         case 'act':
           result.activity.push(entry.d as TeamActivityEvent);
           break;
+        // BUG-020 fix: Load quality gate and YOLO state
+        case 'qg':
+          if (entry.k) result.qualityGates.set(entry.k, entry.d as QualityGateResult);
+          break;
+        case 'yolo':
+          result.yoloState = entry.d as YoloState;  // Keep latest snapshot
+          break;
       }
     }
 
@@ -140,6 +164,13 @@ export class TeamStateStore {
     }
     for (const act of state.activity) {
       lines.push(JSON.stringify({ t: 'act', d: act }));
+    }
+    // BUG-020 fix: Persist quality gates and YOLO state during compaction
+    for (const [k, qg] of state.qualityGates) {
+      lines.push(JSON.stringify({ t: 'qg', d: qg, k }));
+    }
+    if (state.yoloState) {
+      lines.push(JSON.stringify({ t: 'yolo', d: state.yoloState }));
     }
 
     writeFileSync(this.filePath, lines.join('\n') + '\n', 'utf-8');

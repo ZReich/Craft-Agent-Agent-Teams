@@ -3511,6 +3511,7 @@ function AppShellContent({
         onClose={() => setScheduledTaskDialogOpen(false)}
         onSave={handleSaveScheduledTask}
         task={editingScheduledTask}
+        onDelete={editingScheduledTask ? handleDeleteScheduledTask : undefined}
       />
 
     </AppShellProvider>

@@ -1092,7 +1092,12 @@ export function SessionList({
   const flatLabels = useMemo(() => flattenLabels(labels), [labels])
 
   // Filter out hidden sessions (e.g., mini edit sessions) before any processing
-  const visibleItems = useMemo(() => items.filter(item => !item.hidden), [items])
+  // Implements REQ-A3: Teammates are completely hidden from the sidebar list.
+  // They only appear inside the TeamGroup component (team dashboard).
+  // Filter out: hidden sessions AND any session with a parentSessionId (teammate).
+  const visibleItems = useMemo(() => items.filter(item =>
+    !item.hidden && !item.parentSessionId
+  ), [items])
 
   // Get current filter from navigation state (for preserving context in tab routes)
   const currentFilter = isSessionsNavigation(navState) ? navState.filter : undefined
@@ -1189,37 +1194,14 @@ export function SessionList({
     }
   }, [searchActive])
 
-  // Sort by most recent activity first, then group team sessions together
-  // Team leads stay in their natural position; teammates are pulled out and
-  // placed directly after their lead so the team appears as a visual group.
+  // Sort by most recent activity first.
+  // Implements REQ-A3: Teammates are pre-filtered out in visibleItems,
+  // so only leads and standalone sessions remain. No team grouping needed here;
+  // the TeamGroup component handles teammate display inside the team dashboard.
   const sortedItems = useMemo(() => {
-    const byTime = [...visibleItems].sort((a, b) =>
+    return [...visibleItems].sort((a, b) =>
       (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
     )
-
-    // Group teammates right after their lead
-    const result: SessionMeta[] = []
-    const inserted = new Set<string>()
-
-    for (const item of byTime) {
-      if (inserted.has(item.id)) continue
-      inserted.add(item.id)
-      result.push(item)
-
-      // If this is a team lead, insert its teammates right after
-      if (item.isTeamLead && item.teammateSessionIds && item.teammateSessionIds.length > 0) {
-        for (const teammateId of item.teammateSessionIds) {
-          if (inserted.has(teammateId)) continue
-          const teammate = byTime.find(s => s.id === teammateId)
-          if (teammate) {
-            inserted.add(teammateId)
-            result.push(teammate)
-          }
-        }
-      }
-    }
-
-    return result
   }, [visibleItems])
 
   // Filter items by search query — ripgrep content search only for consistent results
@@ -1884,17 +1866,9 @@ export function SessionList({
                 <div key={group.date.toISOString()}>
                   <SessionListSectionHeader label={group.label} />
                   {group.sessions.map((item, indexInGroup) => {
-                    // Defense-in-depth: hide worker/reviewer sessions that escaped team containment
-                    if (item.teammateRole === 'worker' || item.teammateRole === 'reviewer') return null
-
-                    // Skip teammates only when their parent is visible on this page.
-                    // If parent is outside pagination, render teammate normally so it
-                    // doesn't disappear until more items are loaded.
-                    if (item.parentSessionId) {
-                      const parentVisible = paginatedItems.some(s => s.id === item.parentSessionId)
-                      if (parentVisible) return null
-                      return renderItem(item, indexInGroup === 0)
-                    }
+                    // Implements REQ-A3: Teammates are pre-filtered from the list in visibleItems.
+                    // This is defense-in-depth in case one slips through.
+                    if (item.parentSessionId || item.teammateRole === 'worker' || item.teammateRole === 'reviewer') return null
 
                     // Team lead — render as a collapsible TeamGroup
                     if (item.isTeamLead && item.teammateSessionIds && item.teammateSessionIds.length > 0) {
