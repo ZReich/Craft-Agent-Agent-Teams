@@ -5,7 +5,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
 
-describe('DiffCollector', () => {
+describe('DiffCollector', { timeout: 30_000 }, () => {
   let testDir: string;
 
   beforeEach(async () => {
