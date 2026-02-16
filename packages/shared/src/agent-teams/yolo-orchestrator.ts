@@ -759,6 +759,8 @@ export class YoloOrchestrator extends EventEmitter {
 
   private transition(phase: YoloPhase): void {
     if (!this.state) return;
+    // Don't overwrite 'aborted' with a subsequent phase — abort is terminal
+    if (this.aborted && phase !== 'aborted') return;
     this.state.phase = phase;
     if (this.teamId) {
       // Deep copy to prevent consumers from mutating orchestrator state

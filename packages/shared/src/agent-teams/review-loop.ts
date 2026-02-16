@@ -475,9 +475,8 @@ export class ReviewLoopOrchestrator extends EventEmitter {
         escalationReport = 'Escalation failed — manual review required.';
       }
 
-      // Mark task completed after escalation — do NOT send feedback or return to in_progress
-      // as that creates an infinite loop (teammate processes feedback → completes → triggers QG again)
-      this.callbacks.updateTaskStatus(teamId, taskId, 'completed', review.teammateId);
+      // Mark task completed after escalation — bypass review loop to prevent infinite re-enqueue
+      this.callbacks.updateTaskStatus(teamId, taskId, 'completed', review.teammateId, { bypassReviewLoop: true });
 
       await this.callbacks.auditLog?.({
         type: 'escalation-completed',
