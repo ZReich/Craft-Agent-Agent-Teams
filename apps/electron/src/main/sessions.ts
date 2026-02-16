@@ -763,13 +763,13 @@ export function buildTeammatePromptWithCompactSpec(
 
 export function resolveQualityGateReviewInput(
   reviewDiff: ReviewDiff | null,
-): { reviewInput: string; usesGitDiff: boolean; failureReason: string } {
+): { reviewInput: string; usesGitDiff: boolean; failureReason: string | undefined } {
   const unifiedDiff = reviewDiff?.unifiedDiff?.trim() ?? ''
   if (unifiedDiff.length > 0) {
     return {
       reviewInput: reviewDiff!.unifiedDiff,
       usesGitDiff: true,
-      failureReason: '',
+      failureReason: undefined,
     }
   }
 

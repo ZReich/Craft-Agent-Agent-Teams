@@ -43,7 +43,7 @@ export type AgentTeamCompletionContext = {
   quality: {
     getRunner: () => QualityGateRunner
     cycles: Map<string, number>
-    resolveReviewInput: (reviewDiff: Awaited<ReturnType<typeof DiffCollector.collectWorkingDiff>> | null) => { usesGitDiff: boolean; reviewInput: string; failureReason: string }
+    resolveReviewInput: (reviewDiff: Awaited<ReturnType<typeof DiffCollector.collectWorkingDiff>> | null) => { usesGitDiff: boolean; reviewInput: string; failureReason: string | undefined }
     buildLeadSummary: (teammateName: string, result: QualityGateResult, outcome: 'passed' | 'failed' | 'escalated') => string
     buildWorkerFeedback: (result: QualityGateResult, maxCycles: number) => string
     formatPercentScore: (score: number) => string
