@@ -1243,19 +1243,6 @@ export function SessionList({
       (statusFilter && statusFilter.size > 0) ||
       (labelFilterMap && labelFilterMap.size > 0)
 
-    // DEBUG: Trace values to diagnose grouping issue
-    if (searchQuery.trim() && searchFilteredItems.length > 0) {
-      searchLog.info('search:grouping', {
-        searchQuery,
-        currentFilterKind: currentFilter?.kind,
-        currentFilterStateId: currentFilter?.kind === 'state' ? currentFilter.stateId : undefined,
-        hasActiveFilters,
-        statusFilterSize: statusFilter?.size ?? 0,
-        labelFilterSize: labelFilterMap?.size ?? 0,
-        itemCount: searchFilteredItems.length,
-      })
-    }
-
     // Check if we have more results than the limit
     const totalCount = searchFilteredItems.length
     const exceeded = totalCount > MAX_SEARCH_RESULTS
@@ -1279,15 +1266,6 @@ export function SessionList({
       } else {
         others.push(item)
       }
-    }
-
-    // DEBUG: Log split result
-    if (searchFilteredItems.length > 0) {
-      searchLog.info('search:grouping:result', {
-        matchingCount: matching.length,
-        othersCount: others.length,
-        exceeded,
-      })
     }
 
     return { matchingFilterItems: matching, otherResultItems: others, exceededSearchLimit: exceeded }
