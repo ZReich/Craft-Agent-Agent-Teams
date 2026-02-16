@@ -27,6 +27,6 @@ export default defineConfig({
     teardownTimeout: 10000,
     // Vitest 4: pool and isolation settings
     pool: 'forks',
-    isolate: false,
+    isolate: true,
   },
 });
