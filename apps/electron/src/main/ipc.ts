@@ -12,6 +12,8 @@ import { registerOnboardingHandlers } from './onboarding'
 import { IPC_CHANNELS, type FileAttachment, type StoredAttachment, type SendMessageOptions, type LlmConnectionSetup } from '../shared/types'
 
 let teamActivityListenerRegistered = false
+// BUG-001 fix: Store listener references for cleanup
+const teamListenerCleanups: Array<() => void> = []
 import { readFileAttachment, perf, validateImageForClaudeAPI, IMAGE_LIMITS } from '@craft-agent/shared/utils'
 import { safeJsonParse } from '@craft-agent/shared/utils/files'
 import { UsagePersistence } from '@craft-agent/shared/usage'
@@ -20,6 +22,7 @@ import { getSessionAttachmentsPath, validateSessionId } from '@craft-agent/share
 import { loadWorkspaceSources, getSourcesBySlugs, type LoadedSource } from '@craft-agent/shared/sources'
 import { isValidThinkingLevel } from '@craft-agent/shared/agent/thinking-levels'
 import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
+import { listDesignTemplates, loadDesignTemplate, deleteDesignTemplate } from '@craft-agent/shared/agent-teams/design-store'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { MarkItDown } from 'markitdown-js'
 
@@ -481,10 +484,12 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     // Start processing in background, errors are sent via event stream
     sessionManager.sendMessage(sessionId, message, attachments, storedAttachments, options).catch(err => {
       ipcLog.error('Error in sendMessage:', err)
-      // Send error to renderer so user sees it (route to correct window)
+      // BUG-007 fix: Safely resolve window — callingWorkspaceId window may have been destroyed
       const window = callingWorkspaceId
         ? windowManager.getWindowByWorkspace(callingWorkspaceId)
-        : BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
+        : BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null
+      if (!window) return
+      if (window.isDestroyed() || window.webContents.isDestroyed()) return
       // Check mainFrame - it becomes null when render frame is disposed
       if (window && !window.isDestroyed() && !window.webContents.isDestroyed() && window.webContents.mainFrame) {
         window.webContents.send(IPC_CHANNELS.SESSION_EVENT, {
@@ -1869,6 +1874,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsWorkerModel: config?.agentTeams?.workerModel,
       agentTeamsReviewerModel: config?.agentTeams?.reviewerModel,
       agentTeamsEscalationModel: config?.agentTeams?.escalationModel,
+      agentTeamsLeadThinking: config?.agentTeams?.leadThinking ?? false,
+      agentTeamsHeadThinking: config?.agentTeams?.headThinking ?? false,
+      agentTeamsWorkerThinking: config?.agentTeams?.workerThinking ?? false,
+      agentTeamsReviewerThinking: config?.agentTeams?.reviewerThinking ?? false,
+      agentTeamsEscalationThinking: config?.agentTeams?.escalationThinking ?? false,
       agentTeamsCostCapUsd: config?.agentTeams?.costCapUsd,
       // Quality gate settings
       qualityGatesEnabled: qg?.enabled ?? true,
@@ -1899,6 +1909,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       sddAutoComplianceReports: sdd?.autoGenerateComplianceReports ?? true,
       sddDefaultSpecTemplate: sdd?.defaultSpecTemplate,
       sddSpecTemplates: sdd?.specTemplates ?? [],
+      // Design Flow settings
+      designFlowEnabled: config?.agentTeams?.designFlow?.enabled ?? false,
+      designFlowVariantsPerRound: config?.agentTeams?.designFlow?.variantsPerRound ?? 4,
+      designFlowDesignModel: config?.agentTeams?.designFlow?.designModel ?? null,
+      designFlowAutoSaveTemplates: config?.agentTeams?.designFlow?.autoSaveTemplates ?? true,
       enabledSourceSlugs: config?.defaults?.enabledSourceSlugs ?? [],
     }
   })
@@ -1909,7 +1924,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesTestScope', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate', 'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
+    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsLeadThinking', 'agentTeamsHeadThinking', 'agentTeamsWorkerThinking', 'agentTeamsReviewerThinking', 'agentTeamsEscalationThinking', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesTestScope', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate', 'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -1942,6 +1957,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsWorkerModel: 'workerModel',
       agentTeamsReviewerModel: 'reviewerModel',
       agentTeamsEscalationModel: 'escalationModel',
+      agentTeamsLeadThinking: 'leadThinking',
+      agentTeamsHeadThinking: 'headThinking',
+      agentTeamsWorkerThinking: 'workerThinking',
+      agentTeamsReviewerThinking: 'reviewerThinking',
+      agentTeamsEscalationThinking: 'escalationThinking',
       agentTeamsCostCapUsd: 'costCapUsd',
     }
 
@@ -2026,6 +2046,21 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         yolo[mappedKey] = value
       }
       config.agentTeams.yolo = yolo as typeof config.agentTeams.yolo
+    } else if (key.startsWith('designFlow')) {
+      // Store Design Flow settings in config.agentTeams.designFlow
+      config.agentTeams = config.agentTeams || { enabled: false }
+      const designFlow: Record<string, unknown> = (config.agentTeams.designFlow || {}) as Record<string, unknown>
+      const designFlowKeyMap: Record<string, string> = {
+        designFlowEnabled: 'enabled',
+        designFlowVariantsPerRound: 'variantsPerRound',
+        designFlowDesignModel: 'designModel',
+        designFlowAutoSaveTemplates: 'autoSaveTemplates',
+      }
+      const mappedKey = designFlowKeyMap[key]
+      if (mappedKey) {
+        designFlow[mappedKey] = value
+      }
+      config.agentTeams.designFlow = designFlow as typeof config.agentTeams.designFlow
     } else if (key.startsWith('sdd')) {
       // Store SDD settings in config.sdd
       config.sdd = config.sdd || {}
@@ -3835,17 +3870,26 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   if (!teamActivityListenerRegistered) {
     teamActivityListenerRegistered = true
 
+    // BUG-006 fix: O(1) inverse lookup maps instead of O(n*m) linear scans
+    const teammateToTeam = new Map<string, string>()
+    const taskToTeam = new Map<string, string>()
+    const messageToTeam = new Map<string, string>()
+
+    // Seed maps from existing teams on first registration
+    for (const team of teamManager.getActiveTeams()) {
+      for (const member of team.members) teammateToTeam.set(member.id, team.id)
+      for (const task of teamManager.getTasks(team.id)) taskToTeam.set(task.id, team.id)
+      for (const msg of teamManager.getMessages(team.id)) messageToTeam.set(msg.id, team.id)
+    }
+
     const resolveTeamIdForTeammate = (teammateId: string): string | null => {
-      const team = teamManager.getActiveTeams().find(t => t.members.some(m => m.id === teammateId))
-      return team?.id ?? null
+      return teammateToTeam.get(teammateId) ?? null
     }
     const resolveTeamIdForTask = (taskId: string): string | null => {
-      const team = teamManager.getActiveTeams().find(t => teamManager.getTasks(t.id).some(task => task.id === taskId))
-      return team?.id ?? null
+      return taskToTeam.get(taskId) ?? null
     }
     const resolveTeamIdForMessage = (messageId: string): string | null => {
-      const team = teamManager.getActiveTeams().find(t => teamManager.getMessages(t.id).some(msg => msg.id === messageId))
-      return team?.id ?? null
+      return messageToTeam.get(messageId) ?? null
     }
 
     const activityListener = (event: import('@craft-agent/core/types').TeamActivityEvent) => {
@@ -3871,7 +3915,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
     }
     const teammateSpawnedListener = (teammate: import('@craft-agent/core/types').AgentTeammate) => {
+      // BUG-006: Update inverse map on spawn
       const teamId = resolveTeamIdForTeammate(teammate.id)
+        ?? teamManager.getActiveTeams().find(t => t.members.some(m => m.id === teammate.id))?.id ?? null
+      if (teamId) teammateToTeam.set(teammate.id, teamId)
       if (!teamId) return
       const envelope: import('@craft-agent/core/types').TeammateSpawnedEvent = {
         type: 'teammate:spawned',
@@ -3893,7 +3940,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
     }
     const taskCreatedListener = (task: import('@craft-agent/core/types').TeamTask) => {
+      // BUG-006: Update inverse map on creation
       const teamId = resolveTeamIdForTask(task.id)
+        ?? teamManager.getActiveTeams().find(t => teamManager.getTasks(t.id).some(tk => tk.id === task.id))?.id ?? null
+      if (teamId) taskToTeam.set(task.id, teamId)
       if (!teamId) return
       const envelope: import('@craft-agent/core/types').TaskCreatedEvent = {
         type: 'task:created',
@@ -3915,7 +3965,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
     }
     const messageSentListener = (message: import('@craft-agent/core/types').TeammateMessage) => {
+      // BUG-006: Update inverse map on send
       const teamId = resolveTeamIdForMessage(message.id)
+        ?? teamManager.getActiveTeams().find(t => teamManager.getMessages(t.id).some(m => m.id === message.id))?.id ?? null
+      if (teamId) messageToTeam.set(message.id, teamId)
       if (!teamId) return
       const envelope: import('@craft-agent/core/types').MessageSentEvent = {
         type: 'message:sent',
@@ -3955,6 +4008,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
     }
     const teamCleanupListener = (teamId: string) => {
+      // BUG-006: Purge inverse maps for this team
+      for (const [k, v] of teammateToTeam) { if (v === teamId) teammateToTeam.delete(k) }
+      for (const [k, v] of taskToTeam) { if (v === teamId) taskToTeam.delete(k) }
+      for (const [k, v] of messageToTeam) { if (v === teamId) messageToTeam.delete(k) }
+
       const envelope: import('@craft-agent/core/types').TeamCleanupEvent = {
         type: 'team:cleanup',
         teamId,
@@ -3981,6 +4039,11 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       }
       windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
     }
+    // BUG-017 fix: Catch errors from teamManager to prevent unhandled EventEmitter crashes
+    const errorListener = (error: Error) => {
+      ipcLog.error('[AgentTeams] teamManager error event:', error.message)
+    }
+    teamManager.on('error', errorListener)
     teamManager.on('activity', activityListener)
     teamManager.on('team:created', teamCreatedListener)
     teamManager.on('team:updated', teamUpdatedListener)
@@ -3994,6 +4057,24 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     teamManager.on('cost:updated', costUpdatedListener)
     teamManager.on('yolo:state_changed', yoloStateChangedListener)
     teamManager.on('synthesis:requested', synthesisRequestedListener)
+
+    // BUG-001 fix: Store cleanup functions so listeners can be removed on shutdown
+    teamListenerCleanups.push(
+      () => teamManager.off('error', errorListener),
+      () => teamManager.off('activity', activityListener),
+      () => teamManager.off('team:created', teamCreatedListener),
+      () => teamManager.off('team:updated', teamUpdatedListener),
+      () => teamManager.off('team:cleanup', teamCleanupListener),
+      () => teamManager.off('teammate:spawned', teammateSpawnedListener),
+      () => teamManager.off('teammate:updated', teammateUpdatedListener),
+      () => teamManager.off('teammate:shutdown', teammateShutdownListener),
+      () => teamManager.off('task:created', taskCreatedListener),
+      () => teamManager.off('task:updated', taskUpdatedListener),
+      () => teamManager.off('message:sent', messageSentListener),
+      () => teamManager.off('cost:updated', costUpdatedListener),
+      () => teamManager.off('yolo:state_changed', yoloStateChangedListener),
+      () => teamManager.off('synthesis:requested', synthesisRequestedListener),
+    )
   }
 
   // Get whether agent teams are enabled for a workspace
@@ -4150,8 +4231,19 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   })
 
   // Update a task
+  // BUG-009 fix: Add error handling, type validation, and return value
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_UPDATE_TASK, async (_event, teamId: string, taskId: string, status: string, assignee?: string) => {
-    teamManager.updateTaskStatus(teamManager.resolveTeamId(teamId), taskId, status as any, assignee)
+    const validStatuses = ['pending', 'in_progress', 'in_review', 'completed', 'blocked', 'failed']
+    if (!validStatuses.includes(status)) {
+      throw new Error(`Invalid task status: "${status}". Must be one of: ${validStatuses.join(', ')}`)
+    }
+    try {
+      teamManager.updateTaskStatus(teamManager.resolveTeamId(teamId), taskId, status as import('@craft-agent/core/types').TeamTaskStatus, assignee)
+      return { success: true }
+    } catch (err) {
+      ipcLog.error(`[AgentTeams] Failed to update task ${taskId}:`, err)
+      throw err
+    }
   })
 
   // Get cost summary
@@ -4211,6 +4303,44 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
   // Implements BUG-7: Get quality gate reports for all teammates
   ipcMain.handle(IPC_CHANNELS.AGENT_TEAMS_GET_QUALITY_REPORTS, async (_event, teamId: string) => {
     return teamManager.getQualityReports(teamManager.resolveTeamId(teamId))
+  })
+
+  // ============================================================
+  // Design Templates (workspace-scoped)
+  // ============================================================
+
+  ipcMain.handle(IPC_CHANNELS.DESIGN_TEMPLATES_LIST, async (_event, workspaceId: string) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) return []
+    const index = await listDesignTemplates(workspace.rootPath)
+    // Enrich index entries with data from full templates
+    const enriched = await Promise.all(index.map(async (entry) => {
+      const full = await loadDesignTemplate(workspace.rootPath, entry.id)
+      return {
+        id: entry.id,
+        name: entry.name,
+        direction: full?.direction ?? '',
+        framework: full?.stackRequirements?.framework ?? null,
+        typescript: full?.stackRequirements?.typescript ?? false,
+        fileCount: full?.files?.length ?? 0,
+        createdAt: entry.createdAt,
+        compatible: true, // Compatibility check requires current project stack context
+      }
+    }))
+    return enriched
+  })
+
+  ipcMain.handle(IPC_CHANNELS.DESIGN_TEMPLATES_LOAD, async (_event, workspaceId: string, templateId: string) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) return null
+    return loadDesignTemplate(workspace.rootPath, templateId)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.DESIGN_TEMPLATES_DELETE, async (_event, workspaceId: string, templateId: string) => {
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`)
+    await deleteDesignTemplate(workspace.rootPath, templateId)
+    ipcLog.info(`Deleted design template "${templateId}" from workspace "${workspaceId}"`)
   })
 
   // ============================================================
@@ -4298,7 +4428,17 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     try {
       const sessionPath = sessionManager.getSessionPath(leadSessionId)
       if (!sessionPath) return null
-      return teamManager.loadPersistedStateFromPath(sessionPath)
+      const state = teamManager.loadPersistedStateFromPath(sessionPath)
+      // BUG-020 audit fix: Convert Map to plain object for IPC serialization
+      const qualityGates: Record<string, unknown> = {}
+      for (const [k, v] of state.qualityGates) { qualityGates[k] = v }
+      return {
+        messages: state.messages,
+        tasks: state.tasks,
+        activity: state.activity,
+        qualityGates,
+        yoloState: state.yoloState,
+      }
     } catch {
       return null
     }
@@ -4403,4 +4543,16 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     return { success: false }
   })
 
+}
+
+/**
+ * BUG-001 fix: Remove all team event listeners registered by registerIpcHandlers().
+ * Call this during app shutdown to prevent memory leaks.
+ */
+export function cleanupTeamListeners(): void {
+  for (const cleanup of teamListenerCleanups) {
+    cleanup()
+  }
+  teamListenerCleanups.length = 0
+  teamActivityListenerRegistered = false
 }
