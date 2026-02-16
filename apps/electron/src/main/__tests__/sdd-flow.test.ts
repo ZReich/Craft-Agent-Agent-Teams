@@ -1,5 +1,5 @@
 ﻿import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -27,8 +27,10 @@ import { SessionManager, buildTeammatePromptWithCompactSpec } from '../sessions'
 describe('SDD auto-spec + compact-spec', () => {
   it('creates an active spec when missing', async () => {
     const root = mkdtempSync(join(tmpdir(), 'craft-sdd-'));
+    mkdirSync(join(root, 'sessions', 'test-session'), { recursive: true });
     const manager = new SessionManager();
     (manager as any).persistSession = () => {};
+    (manager as any).startComplianceWatcher = async () => {};
 
     const sessionId = 'test-session';
     const managed = {
@@ -67,6 +69,11 @@ describe('SDD auto-spec + compact-spec', () => {
     const withSpec = buildTeammatePromptWithCompactSpec(basePrompt, compactSpec);
     expect(withSpec).toContain('<compact_spec>');
     expect(withSpec).toContain(compactSpec);
-    expect(buildTeammatePromptWithCompactSpec(basePrompt, null)).toBe(basePrompt);
+    expect(withSpec).toContain('TEAM COMPLETION PROTOCOL (MANDATORY)');
+    expect(withSpec).toContain('recipient "team-lead"');
+
+    const withoutSpec = buildTeammatePromptWithCompactSpec(basePrompt, null);
+    expect(withoutSpec).toContain(basePrompt);
+    expect(withoutSpec).toContain('TEAM COMPLETION PROTOCOL (MANDATORY)');
   });
 });

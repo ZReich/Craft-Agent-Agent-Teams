@@ -7,6 +7,7 @@
 
 import * as React from 'react'
 import { Users, DollarSign, Shield, ShieldOff, Columns2, PanelLeftClose, LayoutGrid, MessageSquare, Play, Pause, Square, Zap, OctagonX } from 'lucide-react'
+import { Tooltip, TooltipTrigger, TooltipContent } from '@craft-agent/ui'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -21,6 +22,8 @@ export interface TeamHeaderProps {
   specLabel?: string
   /** Implements BUG-2: actual spec coverage percentage from compliance report */
   specCoveragePercent?: number
+  /** Explicit indicator for untouched template specs */
+  specIsDraft?: boolean
   isCompactSidebarMode?: boolean
   onToggleCompactSidebarMode?: () => void
   viewMode?: 'overview' | 'focus'
@@ -48,6 +51,9 @@ const YOLO_PHASE_LABELS: Record<YoloPhase, { label: string; className: string }>
   idle: { label: 'Idle', className: 'bg-foreground/5 text-muted-foreground border-border' },
   'spec-generation': { label: 'Spec', className: 'bg-info/10 text-info-text border-info/20' },
   'task-decomposition': { label: 'Tasks', className: 'bg-info/10 text-info-text border-info/20' },
+  'stack-detection': { label: 'Stack Detection', className: 'bg-info/10 text-info-text border-info/20' },
+  'design-generation': { label: 'Design', className: 'bg-purple-500/10 text-purple-500 border-purple-500/20' },
+  'design-selection': { label: 'Design Review', className: 'bg-purple-500/10 text-purple-500 border-purple-500/20' },
   executing: { label: 'Executing', className: 'bg-success/10 text-success-text border-success/20' },
   reviewing: { label: 'Reviewing', className: 'bg-purple-500/10 text-purple-500 border-purple-500/20' },
   remediating: { label: 'Remediating', className: 'bg-warning/10 text-warning-text border-warning/20' },
@@ -66,6 +72,7 @@ export function TeamHeader({
   specModeEnabled,
   specLabel,
   specCoveragePercent,
+  specIsDraft,
   isCompactSidebarMode,
   onToggleCompactSidebarMode,
   viewMode = 'overview',
@@ -104,6 +111,28 @@ export function TeamHeader({
           )}>
             {specCoveragePercent !== undefined ? `Spec: ${specCoveragePercent}%` : 'Spec Compliance'}
           </Badge>
+        )}
+        {specModeEnabled && specIsDraft && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+                aria-label="Why this spec is marked as draft"
+              >
+                <Badge
+                  variant="outline"
+                  className="cursor-help text-[11px] px-2 py-0.5 font-medium bg-warning/10 text-warning-text border-warning/20"
+                >
+                  Draft Spec
+                </Badge>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-xs text-xs">
+              This spec still matches the default template requirements and all items are pending.
+              Update requirements/statuses to get actionable progress tracking.
+            </TooltipContent>
+          </Tooltip>
         )}
         {specModeEnabled && specLabel && (
           <span className="text-[11px] text-muted-foreground truncate max-w-[240px]" title={specLabel}>

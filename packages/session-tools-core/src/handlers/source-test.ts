@@ -497,7 +497,17 @@ async function testApiConnectionWithAuth(
             };
           }
           for (const headerName of headerNames) {
-            headers[headerName] = headerValues[headerName];
+            const headerValue = headerValues[headerName];
+            if (typeof headerValue !== 'string' || headerValue.length === 0) {
+              return {
+                lines: [`⚠ Multi-header auth token has invalid value for: ${headerName}`],
+                success: false,
+                hasError: true,
+                error: `Header "${headerName}" must be a non-empty string in token JSON`,
+                attempted: true,
+              };
+            }
+            headers[headerName] = headerValue;
           }
         } catch {
           // Token is not valid JSON - this is a configuration error for multi-header auth

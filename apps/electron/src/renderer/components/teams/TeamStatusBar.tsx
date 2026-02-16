@@ -107,7 +107,7 @@ export function TeamStatusBar({
 
   // ----- Teammate session view (not the lead) -----
   if (!isLead && parentSessionId) {
-    const leadName = parentMeta?.name ?? parentMeta?.teammateName ?? 'Team Lead'
+    const leadName = parentMeta?.name ?? parentMeta?.teammateName ?? 'Orchestrator'
     return (
       <div
         className="border-b border-border"
@@ -152,7 +152,7 @@ export function TeamStatusBar({
       >
         <Users className="h-4 w-4 shrink-0" style={{ color: teamColor }} />
         <span className="font-medium" style={{ color: teamColor }}>
-          Team Lead
+          Orchestrator
         </span>
         <span className="text-muted-foreground mx-1">&mdash;</span>
 
@@ -244,7 +244,7 @@ export function TeamStatusBar({
 
       {showSpawnWarning && (
         <div className="px-4 py-2 border-t border-border/50 text-xs text-info-text bg-info/10">
-          No teammates have spawned yet. If delegation is expected, ensure the lead agent calls Task (team_name optional).
+          No teammates have spawned yet. If delegation is expected, ensure the orchestrator calls Task (team_name optional).
         </div>
       )}
 

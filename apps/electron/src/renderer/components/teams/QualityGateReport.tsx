@@ -30,6 +30,7 @@ const STAGE_META: Record<QualityGateStageName, { label: string; binary?: boolean
   spec_compliance: { label: 'Spec Compliance' },
   traceability: { label: 'Traceability' },
   rollout_safety: { label: 'Rollout Safety' },
+  design_compliance: { label: 'Design Compliance' },
 }
 
 function scoreColor(score: number): string {

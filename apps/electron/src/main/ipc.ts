@@ -4175,8 +4175,16 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     parentSessionId?: string;
     workspaceId?: string;
   }) => {
-    const validRoles = new Set(['lead', 'head', 'worker', 'reviewer', 'escalation'])
-    const normalizedRole = validRoles.has(options.role) ? options.role : 'worker'
+    const roleAliases: Record<string, string> = {
+      lead: 'lead',
+      orchestrator: 'lead',
+      head: 'head',
+      'team-manager': 'head',
+      worker: 'worker',
+      reviewer: 'reviewer',
+      escalation: 'escalation',
+    }
+    const normalizedRole = roleAliases[(options.role || '').toLowerCase()] ?? 'worker'
     if (options.role !== normalizedRole) {
       ipcLog.warn(`[agent teams] Invalid role "${options.role}" for teammate "${options.name}", defaulting to "${normalizedRole}"`)
     }

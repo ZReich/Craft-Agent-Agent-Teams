@@ -1,7 +1,7 @@
 ﻿import { sessionLog } from './logger'
 import { loadWorkspaceConfig } from '@craft-agent/shared/workspaces'
 import { mergeQualityGateConfig, inferTaskType, shouldSkipQualityGates } from '@craft-agent/shared/agent-teams/quality-gates'
-import { type QualityGateConfig } from '@craft-agent/core/types'
+import { type QualityGateConfig, type QualityGateResult } from '@craft-agent/core/types'
 import { DiffCollector } from '@craft-agent/shared/agent-teams/diff-collector'
 import { formatFailureReport, formatSuccessReport, type QualityGateRunner, type TaskContext } from './quality-gate-runner'
 
@@ -44,8 +44,8 @@ export type AgentTeamCompletionContext = {
     getRunner: () => QualityGateRunner
     cycles: Map<string, number>
     resolveReviewInput: (reviewDiff: Awaited<ReturnType<typeof DiffCollector.collectWorkingDiff>> | null) => { usesGitDiff: boolean; reviewInput: string; failureReason: string }
-    buildLeadSummary: (teammateName: string, result: { aggregateScore: number; cycleCount?: number; maxCycles?: number }, outcome: 'passed' | 'escalated') => string
-    buildWorkerFeedback: (result: { aggregateScore: number }, maxCycles: number) => string
+    buildLeadSummary: (teammateName: string, result: QualityGateResult, outcome: 'passed' | 'failed' | 'escalated') => string
+    buildWorkerFeedback: (result: QualityGateResult, maxCycles: number) => string
     formatPercentScore: (score: number) => string
   }
   team: {

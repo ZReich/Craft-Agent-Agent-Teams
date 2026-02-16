@@ -344,14 +344,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     return undefined
   }, [teamSpec])
 
-  // Auto-enable dashboard when session is a team lead
+  // Reset dashboard state when switching sessions. Default to the lead
+  // chat view — users can open the dashboard via the TeamStatusBar toggle.
   React.useEffect(() => {
-    if (session?.isTeamLead && session?.teamId) {
-      setShowTeamDashboard(true)
-    } else {
-      setShowTeamDashboard(false)
-    }
-  }, [session?.id, session?.isTeamLead, session?.teamId])
+    setShowTeamDashboard(false)
+  }, [session?.id])
 
   const teamSessionIds = React.useMemo(() => {
     if (!session?.teamId) return []
@@ -1008,8 +1005,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     <>
       <div className="h-full flex flex-col">
         <PanelHeader  title={displayTitle} titleMenu={titleMenu} actions={shareButton} rightSidebarButton={rightSidebarButton} isRegeneratingTitle={isAsyncOperationOngoing} />
-        {/* Agent Teams status bar */}
-        {session?.teamId && (
+        {/* Agent Teams status bar — show as soon as metadata is available.
+            Implements H1: Works regardless of workspaceAgentTeamsEnabled for
+            historical team sessions. */}
+        {(session?.teamId || sessionMeta?.teamId) && (
           <TeamStatusBar
             session={session}
             isDashboardOpen={showTeamDashboard}
@@ -1019,7 +1018,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
           />
         )}
         {/* Team Dashboard (replaces chat when active) */}
-        {showTeamDashboard && session?.isTeamLead && session?.teamId ? (
+        {showTeamDashboard && (session?.isTeamLead || sessionMeta?.isTeamLead) && (session?.teamId || sessionMeta?.teamId) ? (
           <div className="flex-1 flex flex-col min-h-0">
             <TeamDashboard
               session={session}

@@ -299,7 +299,7 @@ export default function AgentTeamsSettingsPage() {
         if (settings?.sddAutoComplianceReports !== undefined) setSddAutoComplianceReports(settings.sddAutoComplianceReports)
         if (settings?.sddDefaultSpecTemplate) setSddDefaultTemplate(settings.sddDefaultSpecTemplate)
         if (settings?.sddSpecTemplates && settings.sddSpecTemplates.length > 0) {
-          setSddTemplateOptions(settings.sddSpecTemplates.map((template) => ({
+          setSddTemplateOptions(settings.sddSpecTemplates.map((template: { id: string; name: string; description?: string }) => ({
             value: template.id,
             label: template.name,
             description: template.description,
@@ -319,7 +319,7 @@ export default function AgentTeamsSettingsPage() {
             const templates = typeof electronAPI.listDesignTemplates === 'function'
               ? await electronAPI.listDesignTemplates(activeWorkspaceId)
               : []
-            setDesignTemplates(templates.map(t => ({
+            setDesignTemplates(templates.map((t: { id: string; name: string; direction: string; framework: string | null; typescript: boolean; fileCount: number; createdAt: string; compatible: boolean }) => ({
               ...t,
               description: t.direction,
               compatible: t.compatible,
@@ -636,7 +636,7 @@ export default function AgentTeamsSettingsPage() {
     setDesignTemplatesLoading(true)
     try {
       const templates = await electronAPI.listDesignTemplates(activeWorkspaceId)
-      setDesignTemplates(templates.map(t => ({
+      setDesignTemplates(templates.map((t: { id: string; name: string; direction: string; framework: string | null; typescript: boolean; fileCount: number; createdAt: string; compatible: boolean }) => ({
         ...t,
         description: t.direction,
         compatible: t.compatible,

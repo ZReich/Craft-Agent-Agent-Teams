@@ -128,11 +128,15 @@ export class FileOwnershipTracker extends EventEmitter {
       blocked: this.config.mode === 'strict',
     };
 
-    // Store the conflict
+    // Store the conflict (implements M1: cap at 50 per team to prevent unbounded growth)
     if (!this.conflicts.has(teamId)) {
       this.conflicts.set(teamId, []);
     }
-    this.conflicts.get(teamId)!.push(conflict);
+    const conflictList = this.conflicts.get(teamId)!;
+    conflictList.push(conflict);
+    if (conflictList.length > 50) {
+      conflictList.splice(0, conflictList.length - 50);
+    }
 
     this.emit('file:conflict', conflict);
     return conflict;

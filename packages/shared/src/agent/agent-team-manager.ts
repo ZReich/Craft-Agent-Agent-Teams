@@ -153,6 +153,48 @@ export class AgentTeamManager extends EventEmitter {
     return store.load();
   }
 
+  // ── Hydration (restore persisted state on reload) ────────────
+
+  /**
+   * Hydrate a task from persisted state into in-memory Maps.
+   * Implements REQ-002: persist team state across close/reopen.
+   * Unlike createTask(), this does NOT emit events or persist again.
+   */
+  hydrateTask(teamId: string, task: TeamTask): void {
+    const tasks = this.tasks.get(teamId) || [];
+    // Avoid duplicates (idempotent reload)
+    if (!tasks.some(t => t.id === task.id)) {
+      tasks.push(task);
+      this.tasks.set(teamId, tasks);
+    }
+  }
+
+  /**
+   * Hydrate a message from persisted state into in-memory Maps.
+   * Implements REQ-002: persist team state across close/reopen.
+   */
+  hydrateMessage(teamId: string, message: TeammateMessage): void {
+    const messages = this.messages.get(teamId) || [];
+    // Avoid duplicates
+    if (!messages.some(m => m.id === message.id)) {
+      this.pushCapped(messages, message, AgentTeamManager.MAX_TEAM_MESSAGES);
+      this.messages.set(teamId, messages);
+    }
+  }
+
+  /**
+   * Hydrate an activity event from persisted state into in-memory Maps.
+   * Implements REQ-002: persist team state across close/reopen.
+   */
+  hydrateActivity(teamId: string, event: TeamActivityEvent): void {
+    const log = this.activityLog.get(teamId) || [];
+    // Avoid duplicates
+    if (!log.some(e => e.id === event.id)) {
+      this.pushCapped(log, event, AgentTeamManager.MAX_ACTIVITY_EVENTS);
+      this.activityLog.set(teamId, log);
+    }
+  }
+
   private pushCapped<T>(arr: T[], item: T, max: number): void {
     arr.push(item);
     if (arr.length > max) {
@@ -209,6 +251,27 @@ export class AgentTeamManager extends EventEmitter {
     this.addActivity(team.id, 'teammate-spawned', 'Team created', undefined, undefined);
 
     return team;
+  }
+
+  /**
+   * Clear all in-memory team data. Called on app startup before restoring
+   * fresh state from disk.
+   * Implements C5: Prevent unbounded Map growth across long-lived Electron sessions.
+   */
+  evictAllTeamData(): void {
+    this.teams.clear();
+    this.tasks.clear();
+    this.messages.clear();
+    this.activityLog.clear();
+    this.teamSpecs.clear();
+    this.teamDRIAssignments.clear();
+    this.synthesisRequested.clear();
+    this.yoloStates.clear();
+    this.teamPhases.clear();
+    this.yoloOrchestrators.clear();
+    this.teamStateStores.clear();
+    this.qualityGateResults.clear();
+    if (this.designArtifacts) this.designArtifacts.clear();
   }
 
   /** Clean up a team — shut down all teammates and mark as completed */

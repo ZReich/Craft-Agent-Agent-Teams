@@ -224,26 +224,55 @@ function resolveConnectionForModel(options: {
   return undefined
 }
 
-const VALID_TEAM_ROLES: ReadonlySet<TeamRole> = new Set(['lead', 'head', 'worker', 'reviewer', 'escalation'])
+const VALID_TEAM_ROLES: ReadonlySet<TeamRole> = new Set([
+  'lead',
+  'head',
+  'worker',
+  'reviewer',
+  'escalation',
+  'orchestrator',
+  'team-manager',
+])
 const TEAM_ROLE_HEAD: TeamRole = 'head'
 const TEAM_ROLE_ESCALATION: TeamRole = 'escalation'
 const TEAM_ROLE_WORKER: TeamRole = 'worker'
 const TEAM_ROLE_REVIEWER: TeamRole = 'reviewer'
+const TEAM_ROLE_LEAD: TeamRole = 'lead'
 // Implements REQ-B4: Raised from 6 to 10 to support larger teams.
 // The limit is enforced in createTeammateSession().
 const MAX_TEAMMATES_PER_TEAM = 10
 const MAX_TEAMMATE_MESSAGES = 500
 
+function toRuntimeTeamRole(role: TeamRole): TeamRole {
+  // Keep runtime/storage canonicalized to legacy values for now, while accepting
+  // new role aliases from UI/prompts/APIs.
+  if (role === 'orchestrator') return TEAM_ROLE_LEAD
+  if (role === 'team-manager') return TEAM_ROLE_HEAD
+  return role
+}
+
 function toValidatedTeamRole(rawRole?: string): TeamRole | null {
   if (!rawRole) return null
-  return VALID_TEAM_ROLES.has(rawRole as TeamRole) ? (rawRole as TeamRole) : null
+  const normalized = rawRole.trim().toLowerCase() as TeamRole
+  if (!VALID_TEAM_ROLES.has(normalized)) return null
+  return toRuntimeTeamRole(normalized)
 }
 
 function inferTeamRoleFromName(teammateName?: string): TeamRole | null {
   if (!teammateName) return null
-  // Infer from name prefix as fallback (e.g. "head-california" -> "head")
-  const prefix = teammateName.toLowerCase().split('-')[0]
-  return VALID_TEAM_ROLES.has(prefix as TeamRole) ? (prefix as TeamRole) : null
+  const normalized = teammateName.trim().toLowerCase()
+  // Longest-match first to support prefixes like "team-manager-foo".
+  const inferredPrefix = [
+    'team-manager',
+    'orchestrator',
+    'escalation',
+    'reviewer',
+    'worker',
+    'head',
+    'lead',
+  ].find(prefix => normalized === prefix || normalized.startsWith(`${prefix}-`) || normalized.startsWith(`${prefix}_`))
+  if (!inferredPrefix) return null
+  return toValidatedTeamRole(inferredPrefix)
 }
 
 function normalizeTeamRole(rawRole?: string, teammateName?: string): TeamRole {
@@ -404,7 +433,7 @@ function formatHealthAlertSummaryMessage(issues: HealthIssue[]): string {
 
 function buildTeamDeliveryMetadata(options: {
   outputPresent: boolean
-  receiverId: string
+  receiverId?: string
 }): string {
   return `<details><summary>Delivery details</summary>\n\nstatus: delivered | output: ${options.outputPresent ? 'present' : 'empty'}\n\n</details>`
 }
@@ -713,20 +742,34 @@ export function buildTeammatePromptWithCompactSpec(
   prompt: string,
   compactSpecContext?: string | null
 ): string {
+  const sections: string[] = [prompt]
+
   if (compactSpecContext && compactSpecContext.trim().length > 0) {
-    return `${prompt}\n\n<compact_spec>\n${compactSpecContext}\n</compact_spec>`
+    sections.push(`<compact_spec>\n${compactSpecContext}\n</compact_spec>`)
   }
-  return prompt
+
+  // Implements REQ-LIFECYCLE-001:
+  // Enforce teammate completion handshake to prevent silent idle sessions and retry storms.
+  sections.push([
+    'TEAM COMPLETION PROTOCOL (MANDATORY)',
+    '- When you finish your assigned task (or are blocked), immediately send one SendMessage to recipient "team-lead".',
+    '- Include: outcome summary, files changed, tests/checks run, and any blockers/risks.',
+    '- After sending that completion message, stop tool calls and wait for a shutdown_request.',
+    '- Do not continue retrying tools once you have reported completion or a blocker.',
+  ].join('\n'))
+
+  return sections.join('\n\n')
 }
 
 export function resolveQualityGateReviewInput(
-  reviewDiff: Pick<ReviewDiff, 'unifiedDiff'> | null,
-): { reviewInput: string; usesGitDiff: boolean; failureReason?: string } {
+  reviewDiff: ReviewDiff | null,
+): { reviewInput: string; usesGitDiff: boolean; failureReason: string } {
   const unifiedDiff = reviewDiff?.unifiedDiff?.trim() ?? ''
   if (unifiedDiff.length > 0) {
     return {
       reviewInput: reviewDiff!.unifiedDiff,
       usesGitDiff: true,
+      failureReason: '',
     }
   }
 
@@ -1857,6 +1900,15 @@ export class SessionManager {
       } catch (err) {
         sessionLog.error('[AgentTeams] Failed to send periodic team status:', err)
       }
+
+      // Implements H3: Periodically evict stale review states (older than 1 hour)
+      const rl = teamManager.getReviewLoop()
+      if (rl) {
+        const evicted = rl.evictStaleReviews()
+        if (evicted > 0) {
+          sessionLog.info(`[AgentTeams] Evicted ${evicted} stale review states`)
+        }
+      }
     }, 2 * 60 * 1000)
 
     if (typeof statusInterval.unref === 'function') {
@@ -2216,8 +2268,16 @@ export class SessionManager {
     wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined,
     role: TeamRole,
     fallbackModel: string,
+    options?: { qgEnabled?: boolean },
   ): string {
-    const assignment = resolveTeamModelForRole(wsConfig, role, undefined, fallbackModel)
+    const effectiveQgEnabled = options?.qgEnabled ?? mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates).enabled
+    const assignment = resolveTeamModelForRole(
+      wsConfig,
+      role,
+      undefined,
+      fallbackModel,
+      { qgEnabled: effectiveQgEnabled },
+    )
     return assignment.model !== 'unknown' ? assignment.model : fallbackModel
   }
 
@@ -2331,10 +2391,11 @@ export class SessionManager {
     const tasks = teamManager.getTasks(teamId)
     const teamSpec = teamManager.getTeamSpec(teamId)
     const tasksByPhase = this.groupTasksByPhase(tasks, taskIds)
+    const qgEnabled = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates).enabled
 
-    const headModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_HEAD, fallbackModel)
-    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel)
-    const reviewerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_REVIEWER, fallbackModel)
+    const headModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_HEAD, fallbackModel, { qgEnabled })
+    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel, { qgEnabled })
+    const reviewerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_REVIEWER, fallbackModel, { qgEnabled })
 
     const phasePlans = [...tasksByPhase.entries()].map(([phase, phaseTaskIds]) => {
       const phaseTasks = this.buildPhaseTaskSelection(tasks, phaseTaskIds)
@@ -2376,7 +2437,8 @@ export class SessionManager {
     const { teamId, leadSessionId, workspaceId, fallbackModel, wsConfig, taskIds } = params
     const tasks = teamManager.getTasks(teamId)
     const teamSpec = teamManager.getTeamSpec(teamId)
-    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel)
+    const qgEnabled = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates).enabled
+    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel, { qgEnabled })
 
     for (const taskId of taskIds) {
       const task = tasks.find(t => t.id === taskId)
@@ -2403,7 +2465,7 @@ export class SessionManager {
           parentSessionId: leadSessionId,
           workspaceId,
           teamId,
-          teammateName: `worker-${taskId}`,
+          teammateName: undefined,
           role: TEAM_ROLE_WORKER,
           model: workerModel,
           prompt: workerPrompt,
@@ -2428,7 +2490,7 @@ export class SessionManager {
       parentSessionId: params.parentSessionId,
       workspaceId: params.workspaceId,
       teamId: params.teamId,
-      teammateName: `head-${params.phase}`,
+      teammateName: undefined,
       role: TEAM_ROLE_HEAD,
       model: params.model,
       prompt: params.prompt,
@@ -3339,6 +3401,12 @@ export class SessionManager {
       // metadata persistence (e.g., missing teammateSessionIds on lead sessions).
       this.repairTeamSessionLinks()
 
+      // Implements REQ-002: Restore team state stores for existing team leads.
+      // initStateStore() is normally only called in createTeam(), so after a
+      // reload these stores are missing — making team data (tasks, messages,
+      // activity) invisible even though the JSONL files exist on disk.
+      this.restoreTeamStateStores()
+
       sessionLog.info(`Loaded ${totalSessions} sessions from disk (metadata only)`)
     } catch (error) {
       sessionLog.error('Failed to load sessions from disk:', error)
@@ -3482,6 +3550,65 @@ export class SessionManager {
 
     if (repairedLeads > 0 || repairedTeammates > 0) {
       sessionLog.warn(`[AgentTeams] Repaired team links after startup (leads=${repairedLeads}, teammates=${repairedTeammates})`)
+    }
+  }
+
+  /**
+   * Restore team state stores for existing team leads after app reload.
+   * Implements REQ-002: persist team state across close/reopen.
+   *
+   * Without this, initStateStore() is only called during createTeam(),
+   * so after a reload the team manager has empty Maps and all team data
+   * (tasks, messages, activity) is invisible even though team-state.jsonl
+   * files exist on disk.
+   */
+  private restoreTeamStateStores(): void {
+    // Implements C5: Clear stale in-memory Maps before restoring fresh state.
+    // Without this, long-lived Electron processes accumulate orphaned team data.
+    teamManager.evictAllTeamData()
+
+    let restored = 0
+    const { join: joinPath } = require('path')
+
+    for (const session of this.sessions.values()) {
+      if (!session.isTeamLead || !session.teamId) continue
+
+      const workspaceRootPath = session.workspace.rootPath
+      const sessionDir = joinPath(workspaceRootPath, 'sessions', session.id)
+
+      try {
+        // Initialize the state store so loadPersistedState() will work
+        teamManager.initStateStore(session.teamId, sessionDir)
+
+        // Load the persisted state into the team manager's in-memory Maps
+        const state = teamManager.loadPersistedState(session.teamId)
+        if (state) {
+          // Hydrate in-memory Maps from persisted JSONL data
+          if (state.tasks.length > 0) {
+            for (const task of state.tasks) {
+              teamManager.hydrateTask(session.teamId, task)
+            }
+          }
+          if (state.messages.length > 0) {
+            for (const msg of state.messages) {
+              teamManager.hydrateMessage(session.teamId, msg)
+            }
+          }
+          if (state.activity.length > 0) {
+            for (const event of state.activity) {
+              teamManager.hydrateActivity(session.teamId, event)
+            }
+          }
+          restored++
+          sessionLog.info(`[AgentTeams] Restored state store for team ${session.teamId} (lead: ${session.id}, ${state.tasks.length} tasks, ${state.messages.length} messages, ${state.activity.length} activity events)`)
+        }
+      } catch (err) {
+        sessionLog.warn(`[AgentTeams] Failed to restore state store for team ${session.teamId}:`, err)
+      }
+    }
+
+    if (restored > 0) {
+      sessionLog.info(`[AgentTeams] Restored ${restored} team state stores from disk`)
     }
   }
 
@@ -3856,29 +3983,38 @@ export class SessionManager {
     }
 
     return sessions
-      .map(m => ({
-        // Persistent fields (auto-included via pickSessionFields)
-        ...pickSessionFields(m),
-        // Pre-computed fields from header
-        preview: m.preview,
-        lastMessageRole: m.lastMessageRole,
-        tokenUsage: m.tokenUsage,
-        messageCount: m.messageCount,
-        lastFinalMessageId: m.lastFinalMessageId,
-        hidden: m.hidden,
-        // Agent team fields
-        teamId: m.teamId,
-        isTeamLead: m.isTeamLead,
-        parentSessionId: m.parentSessionId,
-        teammateName: m.teammateName,
-        teammateSessionIds: m.teammateSessionIds,
-        teamColor: m.teamColor,
-        // Runtime-only fields
-        workspaceId: m.workspace.id,
-        workspaceName: m.workspace.name,
-        messages: [],  // Never send all messages - use getSession(id) for specific session
-        isProcessing: m.isProcessing,
-      }) as Session)
+      .map(m => {
+        // Implements M3: Session integrity validation.
+        // Team leads must never have parentSessionId set — if they do,
+        // they'll be incorrectly filtered out of the session list.
+        const parentSessionId = (m.isTeamLead && m.parentSessionId)
+          ? undefined  // Clear invalid parentSessionId on team leads
+          : m.parentSessionId
+
+        return {
+          // Persistent fields (auto-included via pickSessionFields)
+          ...pickSessionFields(m),
+          // Pre-computed fields from header
+          preview: m.preview,
+          lastMessageRole: m.lastMessageRole,
+          tokenUsage: m.tokenUsage,
+          messageCount: m.messageCount,
+          lastFinalMessageId: m.lastFinalMessageId,
+          hidden: m.hidden,
+          // Agent team fields
+          teamId: m.teamId,
+          isTeamLead: m.isTeamLead,
+          parentSessionId,
+          teammateName: m.teammateName,
+          teammateSessionIds: m.teammateSessionIds,
+          teamColor: m.teamColor,
+          // Runtime-only fields
+          workspaceId: m.workspace.id,
+          workspaceName: m.workspace.name,
+          messages: [],  // Never send all messages - use getSession(id) for specific session
+          isProcessing: m.isProcessing,
+        } as Session
+      })
       .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))
   }
 
@@ -4720,7 +4856,14 @@ export class SessionManager {
     const normalizedRequestedModel = requestedModel && requestedModel !== 'auto'
       ? requestedModel
       : undefined
-    const resolvedAssignment = resolveTeamModelForRole(workspaceConfig, teammateRole, undefined, parent.model)
+    const qgEnabled = mergeQualityGateConfig(workspaceConfig?.agentTeams?.qualityGates).enabled
+    const resolvedAssignment = resolveTeamModelForRole(
+      workspaceConfig,
+      teammateRole,
+      undefined,
+      parent.model,
+      { qgEnabled },
+    )
     const configuredModel = resolvedAssignment.model && resolvedAssignment.model !== 'unknown'
       ? resolvedAssignment.model
       : undefined
@@ -4887,6 +5030,24 @@ export class SessionManager {
     const leadSession = this.sessions.get(params.parentSessionId)
     if (leadSession) {
       leadSession.pendingTeammateSpawns = (leadSession.pendingTeammateSpawns ?? 0) + 1
+      // Implements REQ-A1: Safety timeout so a stuck spawn cannot block lead completion forever.
+      if (!leadSession.pendingSpawnsTimeout) {
+        leadSession.pendingSpawnsTimeout = setTimeout(() => {
+          const trackedLead = this.sessions.get(params.parentSessionId)
+          if (!trackedLead) return
+          if ((trackedLead.pendingTeammateSpawns ?? 0) <= 0) {
+            trackedLead.pendingSpawnsTimeout = undefined
+            return
+          }
+          sessionLog.warn(
+            `[AgentTeams] Pending teammate spawn timeout hit for lead ${trackedLead.id}; ` +
+            `forcing pending count from ${trackedLead.pendingTeammateSpawns} to 0`
+          )
+          trackedLead.pendingTeammateSpawns = 0
+          trackedLead.pendingSpawnsTimeout = undefined
+          this.checkLeadTeamCompletion(trackedLead.id)
+        }, 5 * 60 * 1000)
+      }
     }
 
     // Kick off the teammate by sending the prompt
@@ -9617,6 +9778,15 @@ export class SessionManager {
     }
     this.healthMonitor.dispose()
     this.teamHealthAlertHandlers.clear()
+
+    // Implements H3: Evict stale review states on shutdown
+    const reviewLoop = teamManager.getReviewLoop()
+    if (reviewLoop) {
+      reviewLoop.evictStaleReviews(0) // Evict all terminal reviews on shutdown
+    }
+
+    // Implements C5: Clear all team manager in-memory Maps on shutdown
+    teamManager.evictAllTeamData()
 
     sessionLog.info('Cleanup complete')
   }

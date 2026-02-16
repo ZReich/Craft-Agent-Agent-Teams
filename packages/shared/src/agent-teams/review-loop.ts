@@ -268,6 +268,33 @@ export class ReviewLoopOrchestrator extends EventEmitter {
     this.queue = this.queue.filter(q => q.teamId !== teamId);
   }
 
+  /**
+   * Evict completed/escalated review states to free memory.
+   * Implements H3: Auto-evict old review states to prevent unbounded growth.
+   * Removes terminal reviews older than maxAgeMs (default 1 hour).
+   * Trims cycle history to last 2 entries for remaining terminal reviews.
+   */
+  evictStaleReviews(maxAgeMs = 60 * 60 * 1000): number {
+    let evicted = 0;
+    const now = Date.now();
+    const terminalStatuses = new Set(['passed', 'escalated', 'failed']);
+
+    for (const [taskId, review] of this.reviews.entries()) {
+      if (!terminalStatuses.has(review.status)) continue;
+
+      const startTime = review.startedAt ? new Date(review.startedAt).getTime() : 0;
+      if (now - startTime > maxAgeMs) {
+        this.reviews.delete(taskId);
+        evicted++;
+      } else if (review.cycleHistory.length > 2) {
+        // Trim cycle history to last 2 entries to save memory
+        review.cycleHistory = review.cycleHistory.slice(-2);
+      }
+    }
+
+    return evicted;
+  }
+
   // ============================================================
   // Core Review Loop
   // ============================================================

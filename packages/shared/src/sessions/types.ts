@@ -49,7 +49,7 @@ export const SESSION_PERSISTENT_FIELDS = [
   // Hierarchy
   'parentSessionId', 'siblingOrder',
   // Agent teams
-  'teamId', 'isTeamLead', 'teammateName', 'teammateRole', 'teammateSessionIds', 'teamColor',
+  'teamId', 'isTeamLead', 'teammateName', 'teammateRole', 'teammateSessionIds', 'teamColor', 'qgCycleCount',
 ] as const;
 
 export type SessionPersistentField = typeof SESSION_PERSISTENT_FIELDS[number];
@@ -182,6 +182,8 @@ export interface SessionConfig {
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
   teamColor?: string;
+  /** Persisted QG cycle count — survives app restarts */
+  qgCycleCount?: number;
 }
 
 /**

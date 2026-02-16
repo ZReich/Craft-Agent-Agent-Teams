@@ -70,6 +70,12 @@ const MAX_REALTIME_ACTIVITY = 1500
 const MAX_TOOL_ACTIVITIES_PER_TEAMMATE = 5
 const MAX_HEALTH_ISSUES_PER_TEAMMATE = 3
 
+const TEMPLATE_REQUIREMENT_SNIPPETS = [
+  'define the primary user flow',
+  'document data inputs/outputs',
+  'outline performance, reliability, and security expectations',
+]
+
 interface TeammateHealthIssue {
   issueType: 'stall' | 'error-loop' | 'retry-storm' | 'context-exhaustion'
   details: string
@@ -389,14 +395,27 @@ export function TeamDashboard({
     }
   }, [session.workspaceId])
 
+  // Implements REQ-004 (spec clarity): explicitly detect untouched template specs.
+  const specIsDraft = useMemo(() => {
+    if (!specModeEnabled || specRequirements.length === 0) return false
+    return specRequirements.length >= 3
+      && specRequirements.every((req) => {
+        const normalized = req.description.toLowerCase()
+        return req.status === 'pending'
+          && TEMPLATE_REQUIREMENT_SNIPPETS.some(snippet => normalized.includes(snippet))
+      })
+  }, [specModeEnabled, specRequirements])
+
   // Implements BUG-2: derive spec coverage percentage from requirements data
   const specCoveragePercent = useMemo(() => {
     if (!specModeEnabled || specRequirements.length === 0) return undefined
+    if (specIsDraft) return undefined
+
     const verified = specRequirements.filter(r => r.status === 'verified').length
     const implemented = specRequirements.filter(r => r.status === 'implemented').length
     const inProgress = specRequirements.filter(r => r.status === 'in-progress').length
     return Math.round(((verified + implemented * 0.75 + inProgress * 0.25) / specRequirements.length) * 100)
-  }, [specModeEnabled, specRequirements])
+  }, [specModeEnabled, specRequirements, specIsDraft])
 
   // Implements BUG-6: check if YOLO is enabled in workspace settings
   const yoloEnabled = workspaceSettings?.yoloMode !== undefined && workspaceSettings.yoloMode !== 'off'
@@ -613,6 +632,7 @@ export function TeamDashboard({
         specModeEnabled={specModeEnabled}
         specLabel={specLabel}
         specCoveragePercent={specCoveragePercent}
+        specIsDraft={specIsDraft}
         isCompactSidebarMode={compactSidebarMode}
         onToggleCompactSidebarMode={() => {
           setCompactSidebarMode(prev => !prev)

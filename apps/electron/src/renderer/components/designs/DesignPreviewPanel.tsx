@@ -130,7 +130,7 @@ export function DesignPreviewPanel({
 
     // Handle navigation within the webview (e.g., clicking links)
     const handleNewWindow = (event: Event) => {
-      const e = event as Electron.NewWindowEvent
+      const e = event as Event & { url: string }
       // Open external links in the user's browser, not in the webview
       if (onOpenExternal && e.url) {
         e.preventDefault()

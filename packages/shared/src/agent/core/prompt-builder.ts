@@ -151,7 +151,7 @@ You have MCP tools available from the "session" server for managing agent teams.
 ## Spawning Teammates
 Use the **Task** MCP tool to spawn a teammate agent:
 - team_name: string (required — team identifier, e.g. "my-team")
-- name: string (required — teammate name, e.g. "researcher")
+- name: string (optional — teammate name; omit to auto-generate codename)
 - role: "head" | "worker" | "reviewer" | "escalation" (required when role intent is known)
 - prompt: string (required — task instructions for the teammate)
 - model: string (optional — model override)
@@ -159,9 +159,13 @@ Use the **Task** MCP tool to spawn a teammate agent:
 If agent teams are enabled and you create a plan/spec, you MUST either:
 - Spawn appropriate teammates for work that benefits from parallel execution, OR
 - Explicitly state in the chat that no team is needed and why.
+- For 2+ independent workstreams, spawn at least 2 teammates in parallel (do not serialize work by default).
+- In every teammate Task prompt, require a completion handshake: SendMessage(type="message", recipient="team-lead") when done, then wait for shutdown_request.
 
 Example: To spawn a researcher teammate, call the Task tool with:
-  team_name: "project-team", name: "researcher", role: "worker", prompt: "Research the API docs and summarize the endpoints"
+  team_name: "project-team", role: "worker", prompt: "Research the API docs and summarize the endpoints"
+
+Tip: Omit \`name\` to let the session manager assign the role-flavored codename automatically.
 
 ## Model Selection Note
 Workspace settings control teammate models. Do not override the \`model\` field unless the user explicitly requests a different model.
@@ -187,12 +191,14 @@ Each teammate runs independently in its own session. Results are delivered autom
 enabled: true
 To spawn teammates, call the Task tool with:
 - team_name: string (team id/name)
-- name: string (teammate name)
+- name: string (optional teammate name; omit for auto codename)
 - role: "head" | "worker" | "reviewer" | "escalation" (required when role intent is known)
 - prompt: string (task to perform)
 - model: string (optional)
 Use SendMessage to message teammates (type: message | broadcast | shutdown_request).
 If agent teams are enabled and you create a plan/spec, you MUST either spawn teammates or explicitly say no team is needed and why.
+For 2+ independent workstreams, spawn at least 2 teammates in parallel.
+Every teammate prompt must require: send SendMessage(type="message", recipient="team-lead") on completion, then wait for shutdown_request.
 </agent_teams>`;
   }
 

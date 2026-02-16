@@ -658,7 +658,7 @@ const SessionItem = React.memo(function SessionItem({
                       color: 'rgb(147, 51, 234)',
                     }}
                   >
-                    {item.isTeamLead ? 'Lead' : 'Team'}
+                  {item.isTeamLead ? 'Orchestrator' : 'Team'}
                   </span>
                 )}
                 {connectionDetails && (
@@ -1868,7 +1868,8 @@ export function SessionList({
                   {group.sessions.map((item, indexInGroup) => {
                     // Implements REQ-A3: Teammates are pre-filtered from the list in visibleItems.
                     // This is defense-in-depth in case one slips through.
-                    if (item.parentSessionId || item.teammateRole === 'worker' || item.teammateRole === 'reviewer') return null
+                    // Implements M2: Exclude team leads from this filter — they should always be visible.
+                    if ((item.parentSessionId && !item.isTeamLead) || item.teammateRole === 'worker' || item.teammateRole === 'reviewer') return null
 
                     // Team lead — render as a collapsible TeamGroup
                     if (item.isTeamLead && item.teammateSessionIds && item.teammateSessionIds.length > 0) {

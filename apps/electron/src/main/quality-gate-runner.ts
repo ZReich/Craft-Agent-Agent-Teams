@@ -181,6 +181,8 @@ export interface TaskContext {
   spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>;
   /** Optional design artifact — when present, enables design compliance review (REQ-011) */
   designArtifact?: DesignArtifact;
+  /** Current review cycle count (for QG feedback messages) */
+  cycleCount?: number;
 }
 
 interface ApiKeyProvider {
@@ -491,11 +493,11 @@ export class QualityGateRunner {
           const result = sddResults[i];
           const stageName = sddTasks[i].name as keyof typeof stages;
           if (result.status === 'fulfilled') {
-            stages[stageName] = result.value;
+            (stages as Record<string, QualityGateStageResult>)[stageName] = result.value;
           } else {
             const errorDetails = this.serializeError(result.reason);
             qgLog.error(`[QualityGates] SDD stage "${stageName}" failed:`, errorDetails);
-            stages[stageName] = this.createStageFailureResult(
+            (stages as Record<string, QualityGateStageResult>)[stageName] = this.createStageFailureResult(
               `SDD stage "${stageName}" failed: ${errorDetails.message}`,
               ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
             );

@@ -53,8 +53,18 @@ if (!globalThis.DOMMatrix) {
 
 // Mock child components to simplify testing
 vi.mock('../TeamHeader', () => ({
-  TeamHeader: ({ team }: { team: AgentTeam }) => (
-    <div data-testid="team-header">Team: {team.name}</div>
+  TeamHeader: ({
+    team,
+    specCoveragePercent,
+    specIsDraft,
+  }: {
+    team: AgentTeam;
+    specCoveragePercent?: number;
+    specIsDraft?: boolean;
+  }) => (
+    <div data-testid="team-header">
+      Team: {team.name} Coverage: {specCoveragePercent ?? 'n/a'} Draft: {specIsDraft ? 'yes' : 'no'}
+    </div>
   ),
 }));
 
@@ -744,6 +754,62 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       // The component receives 2 tasks, but we're testing that it renders them
       // (The actual deduplication should happen at a higher level)
       expect(screen.getByTestId('task-list')).toHaveTextContent('Tasks: 2');
+    });
+
+    it('suppresses coverage percent for untouched template specs', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Document data inputs/outputs and persistence needs.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-003',
+            description: 'Outline performance, reliability, and security expectations.',
+            priority: 'medium',
+            status: 'pending',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: n/a');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: yes');
+    });
+
+    it('shows computed coverage for non-template specs', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Implement lifecycle completion handshake for teammates.',
+            priority: 'high',
+            status: 'verified',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Ensure audit task routing uses parallel teammates.',
+            priority: 'high',
+            status: 'pending',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: 50');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
     });
   });
 

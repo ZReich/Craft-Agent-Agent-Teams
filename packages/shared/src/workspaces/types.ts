@@ -99,6 +99,8 @@ export interface SDDWorkspaceConfig {
   requireFullCoverage?: boolean;
   /** Auto-generate compliance report artifacts on completion */
   autoGenerateComplianceReports?: boolean;
+  /** Currently active spec ID for the workspace (default for new sessions) */
+  activeSpecId?: string;
 }
 
 /**

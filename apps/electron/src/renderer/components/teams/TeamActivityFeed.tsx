@@ -70,6 +70,9 @@ const EVENT_CONFIG: Record<TeamActivityType, {
   'yolo-spec-evolution-proposed': { icon: SearchCheck, color: 'text-purple-500' },
   'phase-advanced': { icon: ArrowUpCircle, color: 'text-cyan-500' },
   'phase-blocked': { icon: AlertTriangle, color: 'text-orange-500' },
+  'design-generation-started': { icon: ClipboardList, color: 'text-purple-500' },
+  'design-variant-ready': { icon: CheckCircle2, color: 'text-blue-500' },
+  'design-selected': { icon: CheckCircle2, color: 'text-green-500' },
   'error': { icon: AlertTriangle, color: 'text-destructive' },
 }
 

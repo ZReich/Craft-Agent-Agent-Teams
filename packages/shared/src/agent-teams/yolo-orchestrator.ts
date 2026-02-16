@@ -113,6 +113,9 @@ export class YoloOrchestrator extends EventEmitter {
   private teamId: string | null = null;
   private timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   private costCheckInterval: ReturnType<typeof setInterval> | null = null;
+  // Implements C2: Store poll timer refs so cleanup() can clear them
+  private pollTimerHandle: ReturnType<typeof setTimeout> | null = null;
+  private waitTimerHandle: ReturnType<typeof setTimeout> | null = null;
   private aborted = false;
   private boundHandlers: Array<{ event: string; handler: (...args: unknown[]) => void }> = [];
 
@@ -534,7 +537,8 @@ export class YoloOrchestrator extends EventEmitter {
       return ready;
     };
 
-    const POLL_INTERVAL = 2000;
+    // Implements C2: Increased from 2s to 5s, store timer ref for cleanup
+    const POLL_INTERVAL = 5000;
     const MAX_WAIT_MS = 30 * 60 * 1000;
 
     return new Promise<void>((resolve) => {
@@ -588,7 +592,7 @@ export class YoloOrchestrator extends EventEmitter {
           return;
         }
 
-        setTimeout(tick, POLL_INTERVAL);
+        this.pollTimerHandle = setTimeout(tick, POLL_INTERVAL);
       };
 
       void tick();
@@ -601,7 +605,8 @@ export class YoloOrchestrator extends EventEmitter {
    * Times out after 30 minutes to prevent infinite hangs from stuck tasks.
    */
   private async waitForTasks(teamId: string, taskIds: string[]): Promise<void> {
-    const POLL_INTERVAL = 2000;
+    // Implements C2: Increased from 2s to 5s, store timer ref for cleanup
+    const POLL_INTERVAL = 5000;
     const MAX_WAIT_MS = 30 * 60 * 1000; // 30 minutes
     const terminalStatuses = new Set(['completed', 'failed']);
 
@@ -628,7 +633,7 @@ export class YoloOrchestrator extends EventEmitter {
         if (allDone || relevant.length === 0) {
           resolve();
         } else {
-          setTimeout(check, POLL_INTERVAL);
+          this.waitTimerHandle = setTimeout(check, POLL_INTERVAL);
         }
       };
 
@@ -641,6 +646,13 @@ export class YoloOrchestrator extends EventEmitter {
   // ============================================================
 
   private wireReviewEvents(): void {
+    // Implements C3: Clear any previously attached handlers before wiring new ones
+    // to prevent listener accumulation on YOLO restart without full cleanup.
+    for (const { event, handler } of this.boundHandlers) {
+      this.reviewLoop.off(event, handler);
+    }
+    this.boundHandlers = [];
+
     // When the review loop detects missing requirements, create remediation tasks
     const remediationHandler = (data: {
       teamId: string;
@@ -738,7 +750,7 @@ export class YoloOrchestrator extends EventEmitter {
         this.pause('cost-cap');
         this.logActivity('yolo-paused', `YOLO paused: cost cap $${costCapUsd.toFixed(2)} reached ($${cost.totalCostUsd.toFixed(2)} spent)`);
       }
-    }, 10_000); // Check every 10 seconds
+    }, 60_000); // Implements H2: Reduced from 10s to 60s to lower CPU overhead
   }
 
   // ============================================================
@@ -822,6 +834,15 @@ export class YoloOrchestrator extends EventEmitter {
     if (this.costCheckInterval) {
       clearInterval(this.costCheckInterval);
       this.costCheckInterval = null;
+    }
+    // Implements C2: Clear poll timer refs that were previously leaked
+    if (this.pollTimerHandle) {
+      clearTimeout(this.pollTimerHandle);
+      this.pollTimerHandle = null;
+    }
+    if (this.waitTimerHandle) {
+      clearTimeout(this.waitTimerHandle);
+      this.waitTimerHandle = null;
     }
     // Remove only the handlers this orchestrator attached
     for (const { event, handler } of this.boundHandlers) {
