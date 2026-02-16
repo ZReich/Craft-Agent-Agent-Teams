@@ -208,6 +208,10 @@ export interface FreeFormInputProps {
   yoloModeEnabled?: boolean
   /** Callback when YOLO Mode toggle changes */
   onYoloModeChange?: (enabled: boolean) => void
+  /** Whether Design Flow is enabled for this session */
+  designFlowEnabled?: boolean
+  /** Callback when Design Flow toggle changes */
+  onDesignFlowChange?: (enabled: boolean) => void
 }
 
 /**
@@ -265,6 +269,8 @@ export function FreeFormInput({
   onAgentTeamsChange,
   yoloModeEnabled = false,
   onYoloModeChange,
+  designFlowEnabled = false,
+  onDesignFlowChange,
 }: FreeFormInputProps) {
   // Read connection default model, connections, and workspace info from context.
   // Uses optional variant so playground (no provider) doesn't crash.
@@ -1872,14 +1878,16 @@ Model
           </DropdownMenu>
           )}
 
-          {/* 5.25 Session Controls Dropdown (Agent Teams + YOLO Mode) — Implements REQ-001 */}
-          {!compactMode && onAgentTeamsChange && onYoloModeChange && (
+          {/* 5.25 Session Controls Dropdown — Implements REQ-001, REQ-003, REQ-004 */}
+          {!compactMode && (onAgentTeamsChange || onYoloModeChange || onDesignFlowChange) && (
             <div className="relative">
               <SessionControlsDropdown
                 agentTeamsEnabled={agentTeamsEnabled}
                 onAgentTeamsChange={onAgentTeamsChange}
                 yoloModeEnabled={yoloModeEnabled}
                 onYoloModeChange={onYoloModeChange}
+                designFlowEnabled={designFlowEnabled}
+                onDesignFlowChange={onDesignFlowChange}
               />
             </div>
           )}

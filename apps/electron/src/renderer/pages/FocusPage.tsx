@@ -68,6 +68,8 @@ export const FocusPage = React.memo(function FocusPage({
     chatDisplayRef,
     onChatMatchInfoChange,
     workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
   } = useAppShellContext()
 
   const { navigate: navNavigate } = useNavigation()
@@ -211,6 +213,11 @@ export const FocusPage = React.memo(function FocusPage({
     }
   }, [setOption, setPermissionMode, sessionOpts.permissionMode, sessionOpts.preYoloPermissionMode])
 
+  // Design Flow toggle handler
+  const handleDesignFlowChange = React.useCallback((enabled: boolean) => {
+    setOption('designFlowEnabled', enabled)
+  }, [setOption])
+
   if (!session) {
     return (
       <div className="flex-1 flex items-center justify-center">
@@ -319,7 +326,9 @@ export const FocusPage = React.memo(function FocusPage({
             agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
             onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
             yoloModeEnabled={sessionOpts.yoloModeEnabled}
-            onYoloModeChange={workspaceAgentTeamsEnabled ? handleYoloModeChange : undefined}
+            onYoloModeChange={workspaceYoloEnabled ? handleYoloModeChange : undefined}
+            designFlowEnabled={sessionOpts.designFlowEnabled}
+            onDesignFlowChange={workspaceDesignFlowEnabled ? handleDesignFlowChange : undefined}
           />
         </div>
 

@@ -81,6 +81,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     isFocusModeActive,
     onToggleFocusMode,
     workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
   } = useAppShellContext()
 
   // Use the unified session options hook for clean access
@@ -233,6 +235,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       setPermissionMode(restoreMode)
     }
   }, [setOption, setPermissionMode, sessionOpts.permissionMode, sessionOpts.preYoloPermissionMode])
+
+  // Design Flow toggle handler
+  const handleDesignFlowChange = React.useCallback((enabled: boolean) => {
+    setOption('designFlowEnabled', enabled)
+  }, [setOption])
 
   // Check if session's locked connection has been removed
   const connectionUnavailable = React.useMemo(() =>
@@ -963,7 +970,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
                 onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
                 yoloModeEnabled={sessionOpts.yoloModeEnabled}
-                onYoloModeChange={workspaceAgentTeamsEnabled ? handleYoloModeChange : undefined}
+                onYoloModeChange={workspaceYoloEnabled ? handleYoloModeChange : undefined}
+                designFlowEnabled={sessionOpts.designFlowEnabled}
+                onDesignFlowChange={workspaceDesignFlowEnabled ? handleDesignFlowChange : undefined}
               />
             </div>
           </div>
@@ -1083,7 +1092,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
             onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
             yoloModeEnabled={sessionOpts.yoloModeEnabled}
-            onYoloModeChange={workspaceAgentTeamsEnabled ? handleYoloModeChange : undefined}
+            onYoloModeChange={workspaceYoloEnabled ? handleYoloModeChange : undefined}
+            designFlowEnabled={sessionOpts.designFlowEnabled}
+            onDesignFlowChange={workspaceDesignFlowEnabled ? handleDesignFlowChange : undefined}
           />
         </div>
         )}
