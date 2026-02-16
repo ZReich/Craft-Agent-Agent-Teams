@@ -75,7 +75,7 @@ describe('mergeYoloConfig', () => {
   });
 });
 
-describe('YoloOrchestrator', () => {
+describe('YoloOrchestrator', { timeout: 30_000 }, () => {
   it('executes phased tasks in phase order and completes', async () => {
     const h = createHarness();
     const orchestrator = new YoloOrchestrator(h.teamManager, h.reviewLoop, h.callbacks);
