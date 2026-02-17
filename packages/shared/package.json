@@ -25,6 +25,7 @@
     "./agent-teams/audit-logger": "./src/agent-teams/audit-logger.ts",
     "./agent-teams/checkpoint-manager": "./src/agent-teams/checkpoint-manager.ts",
     "./agent-teams/health-monitor": "./src/agent-teams/health-monitor.ts",
+    "./agent-teams/tool-call-throttle": "./src/agent-teams/tool-call-throttle.ts",
     "./agent-teams/file-tracker": "./src/agent-teams/file-tracker.ts",
     "./agent-teams/local-checks": "./src/agent-teams/local-checks.ts",
     "./agent/agent-team-manager": "./src/agent/agent-team-manager.ts",

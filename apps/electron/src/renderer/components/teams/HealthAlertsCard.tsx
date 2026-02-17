@@ -21,16 +21,21 @@ function isRetryStorm(details: string): boolean {
   return normalized.includes('retry storm') || normalized.includes('retry-storm')
 }
 
+function isStall(details: string): boolean {
+  const normalized = details.toLowerCase()
+  return normalized.includes('stall') && !isErrorLoop(normalized) && !isRetryStorm(normalized)
+}
+
 export function HealthAlertsCard({ events, className, onOpenActivity }: HealthAlertsCardProps) {
   const healthAlerts = React.useMemo(() => events.filter((event) => {
-    if (event.type === 'stall-detected') return true
+    if (isStall(event.details)) return true
     if (isErrorLoop(event.details)) return true
     if (isRetryStorm(event.details)) return true
     return false
   }), [events])
 
   const stallCount = React.useMemo(
-    () => healthAlerts.filter((event) => event.type === 'stall-detected').length,
+    () => healthAlerts.filter((event) => isStall(event.details)).length,
     [healthAlerts]
   )
   const errorLoopCount = React.useMemo(

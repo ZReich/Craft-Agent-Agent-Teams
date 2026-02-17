@@ -488,6 +488,7 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
       teammateName: header.teammateName,
       teammateSessionIds: header.teammateSessionIds,
       teamColor: header.teamColor,
+      teamStatus: header.teamStatus,
     };
   } catch (error) {
     debug(`[sessions] Failed to convert header to metadata for session "${header?.id}" in ${workspaceRootPath}:`, error);
@@ -618,6 +619,7 @@ export async function updateSessionMetadata(
     | 'sddComplianceReports'
     | 'isArchived'
     | 'archivedAt'
+    | 'teamStatus'
   >>
 ): Promise<void> {
   const session = loadSession(workspaceRootPath, sessionId);
@@ -643,6 +645,7 @@ export async function updateSessionMetadata(
   if (updates.sddComplianceReports !== undefined) session.sddComplianceReports = updates.sddComplianceReports;
   if (updates.isArchived !== undefined) session.isArchived = updates.isArchived;
   if ('archivedAt' in updates) session.archivedAt = updates.archivedAt;
+  if (updates.teamStatus !== undefined) session.teamStatus = updates.teamStatus;
 
   await saveSession(session);
 }

@@ -87,6 +87,8 @@ import { mergeQualityGateConfig, inferTaskType, shouldSkipQualityGates } from '@
 import { IntegrationGate } from '@craft-agent/shared/agent-teams/integration-gate'
 import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/diff-collector'
 import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
+import { ToolCallThrottle } from '@craft-agent/shared/agent-teams/tool-call-throttle'
+import { HeartbeatAggregator } from '@craft-agent/shared/agent-teams/heartbeat-aggregator'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
 import { resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/shared/agent-teams/model-resolution'
 import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
@@ -1413,15 +1415,23 @@ interface ManagedSession {
   teammateRole?: TeamRole
   teammateSessionIds?: string[]
   teamColor?: string
+  /** Team lifecycle status — set to 'completed' on cleanup */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error'
   /** Re-entry guard: prevents team-level QG from firing multiple times */
   teamLevelQgRunning?: boolean
   /** Persisted QG cycle count — survives app restarts */
   qgCycleCount?: number
+  /** Guard: teammate results already relayed to lead — prevents duplicate deliveries */
+  completionRelayed?: boolean
+  /** Guard: "[System] All teammates completed" synthesis prompt already sent to lead */
+  synthesisPromptSent?: boolean
   /** Implements REQ-A1: Count of teammate spawns queued but not yet kicked off.
    *  Prevents lead from emitting 'complete' before all teammates start. */
   pendingTeammateSpawns?: number
   /** Implements REQ-A1: Safety timeout handle for pending spawns (5 min max wait) */
   pendingSpawnsTimeout?: NodeJS.Timeout
+  /** Adaptive tool call throttle for teammate sessions (prevents retry storms) */
+  toolCallThrottle?: ToolCallThrottle
   // SDD fields
   sddEnabled?: boolean
   activeSpecId?: string
@@ -1634,9 +1644,14 @@ export class SessionManager {
 
   // Teammate health monitor -> detects stalls, error loops, retry storms
   private healthMonitor = new TeammateHealthMonitor()
+  // Heartbeat aggregator -> observes tool calls, synthesizes periodic heartbeat summaries (REQ-HB-001)
+  private heartbeatAggregator = new HeartbeatAggregator()
   private healthMonitorTeams = new Set<string>() // teams with active monitoring
   private teamStatusIntervals = new Map<string, NodeJS.Timeout>() // periodic status checks
   private teamHealthAlertHandlers = new Map<string, (issue: HealthIssue) => void>()
+  // REQ-HB-001: heartbeat event handler references for cleanup
+  private teamHeartbeatBatchHandlers = new Map<string, (...args: any[]) => void>()
+  private teamHeartbeatLLMHandlers = new Map<string, (...args: any[]) => void>()
   // Implements REQ-003: aggregate health alerts to prevent retry-storm chat spam
   private pendingTeamHealthAlerts = new Map<string, HealthIssue[]>()
   private teamHealthAlertFlushTimers = new Map<string, NodeJS.Timeout>()
@@ -1710,6 +1725,10 @@ export class SessionManager {
         getTeamSpec: teamManager.getTeamSpec.bind(teamManager),
         storeQualityResult: teamManager.storeQualityResult.bind(teamManager),
         logActivity: teamManager.logActivity.bind(teamManager),
+        stopHealthMonitoring: (teamId: string) => {
+          const resolvedId = teamManager.resolveTeamId(teamId)
+          this.stopTeamHealthMonitoring(resolvedId)
+        },
       },
     }
   }
@@ -1757,11 +1776,80 @@ export class SessionManager {
 
     this.healthMonitor.startMonitoring(teamId)
 
+    // REQ-HB-001: Start heartbeat aggregation for this team
+    this.heartbeatAggregator.startTracking(teamId)
+
+    // UI heartbeat delivery — broadcast batched snapshots to renderer via IPC (zero token cost)
+    const heartbeatBatchHandler = (batch: { teamId: string; heartbeats: import('@craft-agent/shared/agent-teams/heartbeat-aggregator').AgentHeartbeat[]; triggeredBy?: string }) => {
+      if (batch.teamId !== teamId) return
+      if (this.windowManager) {
+        this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, {
+          type: 'heartbeat:batch' as const,
+          teamId,
+          payload: {
+            heartbeats: batch.heartbeats.map(hb => ({
+              teammateId: hb.teammateId,
+              teammateName: hb.teammateName,
+              model: hb.model,
+              provider: hb.provider,
+              timestamp: hb.timestamp,
+              toolCallsSinceFlush: hb.toolCallsSinceFlush,
+              lastToolName: hb.lastToolName,
+              activitySummary: hb.activitySummary,
+              progressHint: hb.progressHint,
+              estimatedProgress: hb.estimatedProgress,
+              contextUsage: hb.contextUsage,
+              appearsStalled: hb.appearsStalled,
+            })),
+            triggeredBy: batch.triggeredBy,
+          },
+          timestamp: new Date().toISOString(),
+        })
+      }
+    }
+    this.heartbeatAggregator.on('heartbeat:batch', heartbeatBatchHandler)
+    this.teamHeartbeatBatchHandlers.set(teamId, heartbeatBatchHandler)
+
+    // LLM summary delivery — send to lead agent every 2 min (costs tokens, gives awareness)
+    const heartbeatLLMHandler = async (summary: { teamId: string; summary: string; heartbeats: import('@craft-agent/shared/agent-teams/heartbeat-aggregator').AgentHeartbeat[] }) => {
+      if (summary.teamId !== teamId) return
+      const lead = this.sessions.get(leadSessionId)
+      if (!lead || !lead.isTeamLead) return
+
+      // Check for teammates that need soft probes (REQ-HB-002)
+      for (const hb of summary.heartbeats) {
+        if (this.heartbeatAggregator.needsSoftProbe(teamId, hb.teammateId)) {
+          this.heartbeatAggregator.markSoftProbeSent(teamId, hb.teammateId)
+          sessionLog.info(`[AgentTeams] Sending soft probe to "${hb.teammateName}" (${hb.teammateId}) — silent for too long`)
+          this.sendMessage(hb.teammateId, [
+            '[System] Progress check — you have been quiet for a while.',
+            'Please briefly report: What are you currently working on? Are you blocked?',
+            'If blocked, send a message to team-lead explaining the issue.',
+          ].join('\n')).catch(err => {
+            sessionLog.warn(`[AgentTeams] Failed to soft-probe ${hb.teammateId}:`, err)
+          })
+        }
+      }
+
+      // Deliver the summary to the lead LLM
+      try {
+        await this.sendMessage(leadSessionId, summary.summary)
+      } catch (err) {
+        sessionLog.error('[AgentTeams] Failed to deliver heartbeat LLM summary:', err)
+      }
+    }
+    this.heartbeatAggregator.on('heartbeat:llm-summary', heartbeatLLMHandler)
+    this.teamHeartbeatLLMHandlers.set(teamId, heartbeatLLMHandler)
+
     // Relay health alerts to the lead session + broadcast to dashboard
     // Implements BUG-002 fix: Auto-terminate zombie teammates that exceed health thresholds
-    const AUTO_KILL_STALL_MS = 10 * 60 * 1000 // 10 minutes stalled → force-kill
+    // Implements REQ-ORCH-002: 3-stage stall recovery
+    const STALL_NUDGE_MS = 5 * 60 * 1000       // Stage 1: 5 min → send nudge message
+    const STALL_KILL_MS = 8 * 60 * 1000         // Stage 2: 8 min → force-kill + notify lead to re-assign
+    const STALL_HARD_KILL_MS = 12 * 60 * 1000   // Stage 3: 12 min → force-kill (failsafe)
     const AUTO_KILL_RETRY_STORM_COUNT = 2 // Second retry-storm detection → force-kill
     const retryStormCounts = new Map<string, number>()
+    const stallNudged = new Set<string>() // teammates that received a nudge
 
     const alertHandler = (issue: HealthIssue): void => {
       // Only relay alerts for teammates belonging to this team.
@@ -1795,9 +1883,25 @@ export class SessionManager {
       let shouldAutoKill = false
       let autoKillReason = ''
 
-      if (issue.type === 'stall' && issue.duration && issue.duration >= AUTO_KILL_STALL_MS) {
-        shouldAutoKill = true
-        autoKillReason = `stall exceeded ${AUTO_KILL_STALL_MS / 60000}min (actual: ${Math.round((issue.duration) / 60000)}min)`
+      // Implements REQ-ORCH-002: 3-stage stall recovery
+      // Stage 1 (5 min): nudge the teammate with a reminder message
+      // Stage 2 (8 min): force-kill + notify lead to re-assign
+      // Stage 3 (12 min): hard kill failsafe (handled by STALL_HARD_KILL_MS threshold)
+      if (issue.type === 'stall' && issue.duration) {
+        if (issue.duration >= STALL_KILL_MS) {
+          shouldAutoKill = true
+          autoKillReason = `stall exceeded ${Math.round(STALL_KILL_MS / 60000)}min — teammate unresponsive after nudge (actual: ${Math.round(issue.duration / 60000)}min)`
+        } else if (issue.duration >= STALL_NUDGE_MS && !stallNudged.has(issue.teammateId)) {
+          stallNudged.add(issue.teammateId)
+          sessionLog.info(`[AgentTeams] Stage 1 nudge for stalled teammate "${issue.teammateName}" (${issue.teammateId}) at ${Math.round(issue.duration / 60000)}min`)
+          this.sendMessage(issue.teammateId, [
+            'You appear to be stalled. Please continue working on your assigned task.',
+            'If you are blocked, send a message to team-lead explaining what is blocking you.',
+            'If you have completed your work, send your results to team-lead via SendMessage.',
+          ].join('\n')).catch(err => {
+            sessionLog.warn(`[AgentTeams] Failed to nudge stalled teammate ${issue.teammateId}:`, err)
+          })
+        }
       }
 
       if (issue.type === 'retry-storm') {
@@ -1807,12 +1911,54 @@ export class SessionManager {
           shouldAutoKill = true
           autoKillReason = `retry-storm detected ${count} times`
         }
+        // Implements REQ-THROTTLE-BRIDGE: Stage 1 — early synthesis nudge.
+        // Tell the agent to stop searching and synthesize what it has BEFORE
+        // escalation reaches Stage 2 (hard-block) or Stage 3 (kill).
+        sessionLog.info(`[AgentTeams] Retry-storm WARN for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
+        this.sendMessage(issue.teammateId, [
+          `**[SYSTEM] You are approaching a retry-storm limit.** You have made ${issue.details}.`,
+          '',
+          'STOP making more search/fetch calls. You have enough data to work with.',
+          'Your next action MUST be one of:',
+          '1. Synthesize and summarize all the results you have gathered so far',
+          '2. Send your findings to team-lead via SendMessage(type="message", recipient="team-lead")',
+          '3. Use a completely different tool if you genuinely need more information',
+          '',
+          'Do NOT make another similar search call or your tool access will be permanently blocked.',
+        ].join('\n')).catch(err => {
+          sessionLog.warn(`[AgentTeams] Failed to send Stage 1 nudge to ${issue.teammateId}:`, err)
+        })
       }
 
-      // Implements REQ-B1: 3-stage retry-storm escalation from health monitor
+      // Implements REQ-THROTTLE-BRIDGE: Stage 2 — hard-block offending tool + ultimatum.
+      // Instead of resetting the throttle (which gives fresh budget to keep searching),
+      // permanently block the specific tool that's causing the storm.
       if (issue.type === 'retry-storm-throttle') {
         sessionLog.warn(`[AgentTeams] Retry-storm THROTTLE for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
-        // Throttle stage is a strong warning — not an auto-kill yet, but log prominently
+        const teammateManaged = this.sessions.get(issue.teammateId)
+        if (teammateManaged?.toolCallThrottle && issue.toolName) {
+          // Hard-block the specific offending tool — no more calls allowed
+          teammateManaged.toolCallThrottle.hardBlockTool(
+            issue.toolName,
+            `"${issue.toolName}" has been permanently blocked due to retry-storm detection. `
+            + 'You MUST synthesize your findings now and send them to team-lead. '
+            + 'Do NOT attempt to search again — use the data you already have.',
+          )
+          sessionLog.info(`[AgentTeams] Hard-blocked "${issue.toolName}" for "${issue.teammateName}" — no further calls allowed`)
+        }
+        // Send ultimatum message
+        this.sendMessage(issue.teammateId, [
+          `**[SYSTEM — FINAL WARNING] "${issue.toolName ?? 'This tool'}" is now BLOCKED.** You cannot make any more calls to it.`,
+          '',
+          'You MUST immediately:',
+          '1. Stop all search/fetch activity',
+          '2. Compile your findings from the data you already have',
+          '3. Send your complete report to team-lead via SendMessage(type="message", recipient="team-lead")',
+          '',
+          'If you do not comply, you will be terminated. This is your final warning.',
+        ].join('\n')).catch(err => {
+          sessionLog.warn(`[AgentTeams] Failed to send Stage 2 ultimatum to ${issue.teammateId}:`, err)
+        })
       }
 
       if (issue.type === 'retry-storm-kill') {
@@ -1827,17 +1973,38 @@ export class SessionManager {
 
       if (shouldAutoKill) {
         sessionLog.warn(`[AgentTeams] Auto-terminating zombie teammate "${issue.teammateName}" (${issue.teammateId}): ${autoKillReason}`)
+        // Phase 4b: Capture partial results BEFORE terminate — terminateTeammateSession()
+        // calls removeTeammate() which deletes health state. Must snapshot first.
+        const resolvedTeamIdForKill = teamManager.resolveTeamId(teamId)
+        const teammateHealth = this.healthMonitor.getHealth(resolvedTeamIdForKill, issue.teammateId)
+        const partialResults = teammateHealth?.recentToolResults
+          ?.filter(r => !r.isError)
+          ?.slice(-5)  // Last 5 successful results
+          ?.map(r => `- **${r.tool}**: ${r.resultPreview.slice(0, 200)}`)
+          ?? []
+
         this.terminateTeammateSession(issue.teammateId, `health-auto-kill:${autoKillReason}`).then(killed => {
           if (killed) {
             // Relay termination notice to lead
-            const resolvedTeamId = teamManager.resolveTeamId(teamId)
-            this.updateTeammateTasks(resolvedTeamId, issue.teammateId, 'failed')
+            this.updateTeammateTasks(resolvedTeamIdForKill, issue.teammateId, 'failed')
+
+            const partialSection = partialResults.length > 0
+              ? [
+                '',
+                '**Partial results recovered:**',
+                ...partialResults,
+                '',
+                'You can use these partial findings to continue the work.',
+              ]
+              : []
+
             this.sendMessage(leadSessionId, [
               `**${issue.teammateName}** was auto-terminated by the health monitor.`,
               `Reason: ${autoKillReason}`,
               '',
               'The teammate was unresponsive to shutdown requests and consuming resources.',
               'Its task has been marked as failed. You may re-assign the work or complete it yourself.',
+              ...partialSection,
             ].join('\n')).catch(sendErr => {
               // BUG-004 fix: Log instead of silently swallowing
               sessionLog.error(`[AgentTeams] Failed to notify lead about auto-kill of ${issue.teammateId}:`, sendErr)
@@ -1856,9 +2023,11 @@ export class SessionManager {
     this.healthMonitor.on('health:context-exhaustion', alertHandler)
     this.teamHealthAlertHandlers.set(teamId, alertHandler)
 
-    // Periodic team status check-in (every 2 minutes)
-    const statusInterval = setInterval(async () => {
-      // BUG-002 fix: Guard against firing after stopTeamHealthMonitoring
+    // Periodic housekeeping (every 2 minutes)
+    // Note: Status check-ins are now handled by the heartbeat aggregator (REQ-HB-001).
+    // The LLM summary handler above delivers structured heartbeats to the lead every 2 min.
+    // This interval only handles liveness checks and review-loop eviction.
+    const statusInterval = setInterval(() => {
       if (!this.healthMonitorTeams.has(teamId)) return
 
       const health = this.healthMonitor.getTeamHealth(teamId)
@@ -1884,23 +2053,6 @@ export class SessionManager {
         return
       }
 
-      const lines = liveHealth.map(h => {
-        const elapsed = Date.now() - new Date(h.lastActivityAt).getTime()
-        const elapsedStr = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s ago` : `${Math.round(elapsed / 60000)}m ago`
-        const rawTask = h.currentTaskId ?? ''
-        const taskLabel = rawTask.length > 60 ? rawTask.slice(0, 57) + '...' : rawTask
-        const task = taskLabel ? `working on "${taskLabel}"` : 'idle'
-        const issues = h.issues.length > 0 ? ` [${h.issues.length} issue(s)]` : ''
-        return `- ${h.teammateName}: ${task} (last activity: ${elapsedStr})${issues}`
-      })
-
-      const statusMessage = `### Team Status Check-In\n${lines.join('\n')}`
-      try {
-        await this.sendMessage(leadSessionId, statusMessage)
-      } catch (err) {
-        sessionLog.error('[AgentTeams] Failed to send periodic team status:', err)
-      }
-
       // Implements H3: Periodically evict stale review states (older than 1 hour)
       const rl = teamManager.getReviewLoop()
       if (rl) {
@@ -1922,6 +2074,7 @@ export class SessionManager {
    */
   private stopTeamHealthMonitoring(teamId: string): void {
     this.healthMonitor.clearTeam(teamId)
+    this.heartbeatAggregator.stopTracking(teamId)
     this.healthMonitorTeams.delete(teamId)
 
     const alertHandler = this.teamHealthAlertHandlers.get(teamId)
@@ -1933,6 +2086,18 @@ export class SessionManager {
       this.healthMonitor.off('health:retry-storm-kill', alertHandler)
       this.healthMonitor.off('health:context-exhaustion', alertHandler)
       this.teamHealthAlertHandlers.delete(teamId)
+    }
+
+    // REQ-HB-001: Clean up heartbeat event listeners
+    const heartbeatBatchHandler = this.teamHeartbeatBatchHandlers.get(teamId)
+    if (heartbeatBatchHandler) {
+      this.heartbeatAggregator.off('heartbeat:batch', heartbeatBatchHandler)
+      this.teamHeartbeatBatchHandlers.delete(teamId)
+    }
+    const heartbeatLLMHandler = this.teamHeartbeatLLMHandlers.get(teamId)
+    if (heartbeatLLMHandler) {
+      this.heartbeatAggregator.off('heartbeat:llm-summary', heartbeatLLMHandler)
+      this.teamHeartbeatLLMHandlers.delete(teamId)
     }
 
     const statusInterval = this.teamStatusIntervals.get(teamId)
@@ -1995,6 +2160,8 @@ export class SessionManager {
       : undefined
     if (resolvedTeamId) {
       this.healthMonitor.removeTeammate(resolvedTeamId, teammate.id)
+      // REQ-HB-001: Signal completion so heartbeat aggregator does an immediate UI flush
+      this.heartbeatAggregator.signalAgentCompleted(resolvedTeamId, teammate.id)
       const hasLiveTeammates = Array.from(this.sessions.values()).some(s => {
         if (s.id === teammate.id) return false
         if (!s.parentSessionId || !s.teamId) return false
@@ -3360,6 +3527,7 @@ export class SessionManager {
             qgCycleCount: typeof meta.qgCycleCount === 'number' ? meta.qgCycleCount : undefined,
             teammateSessionIds: meta.teammateSessionIds,
             teamColor: meta.teamColor,
+            teamStatus: meta.teamStatus as ManagedSession['teamStatus'],
             sddEnabled: meta.sddEnabled,
             activeSpecId: meta.activeSpecId,
             sddComplianceReports: meta.sddComplianceReports,
@@ -3659,6 +3827,7 @@ export class SessionManager {
         qgCycleCount: managed.qgCycleCount,
         teammateSessionIds: managed.teammateSessionIds,
         teamColor: managed.teamColor,
+        teamStatus: managed.teamStatus,
         sddEnabled: managed.sddEnabled,
         activeSpecId: managed.activeSpecId,
         sddComplianceReports: managed.sddComplianceReports,
@@ -3984,13 +4153,6 @@ export class SessionManager {
 
     return sessions
       .map(m => {
-        // Implements M3: Session integrity validation.
-        // Team leads must never have parentSessionId set — if they do,
-        // they'll be incorrectly filtered out of the session list.
-        const parentSessionId = (m.isTeamLead && m.parentSessionId)
-          ? undefined  // Clear invalid parentSessionId on team leads
-          : m.parentSessionId
-
         return {
           // Persistent fields (auto-included via pickSessionFields)
           ...pickSessionFields(m),
@@ -4004,10 +4166,11 @@ export class SessionManager {
           // Agent team fields
           teamId: m.teamId,
           isTeamLead: m.isTeamLead,
-          parentSessionId,
+          parentSessionId: m.parentSessionId,
           teammateName: m.teammateName,
           teammateSessionIds: m.teammateSessionIds,
           teamColor: m.teamColor,
+          teamStatus: m.teamStatus,
           // Runtime-only fields
           workspaceId: m.workspace.id,
           workspaceName: m.workspace.name,
@@ -4317,6 +4480,7 @@ export class SessionManager {
       teammateName: m.teammateName,
       teammateSessionIds: m.teammateSessionIds,
       teamColor: m.teamColor,
+      teamStatus: m.teamStatus,
       // Runtime-only fields
       workspaceId: m.workspace.id,
       workspaceName: m.workspace.name,
@@ -4700,6 +4864,28 @@ export class SessionManager {
       throw new Error(`Team has reached the maximum of ${MAX_TEAMMATES_PER_TEAM} teammates. Complete or terminate existing teammates before spawning new ones.`)
     }
 
+    // Implements REQ-ORCH-004: Prevent duplicate teammate spawns
+    // If a teammate with the same explicit name already exists and is still active, reject the spawn.
+    if (params.teammateName && parent.teammateSessionIds?.length) {
+      const normalizedName = params.teammateName.trim().toLowerCase()
+      for (const existingId of parent.teammateSessionIds) {
+        const existing = this.sessions.get(existingId)
+        if (
+          existing &&
+          existing.teammateName?.trim().toLowerCase() === normalizedName &&
+          (existing.agent !== null || existing.isProcessing)
+        ) {
+          sessionLog.warn(
+            `[AgentTeams] Duplicate spawn blocked: teammate "${params.teammateName}" already exists as active session ${existingId}`
+          )
+          throw new Error(
+            `A teammate named "${params.teammateName}" is already active in this team (session ${existingId}). ` +
+            `Wait for it to complete or terminate it before spawning a replacement.`
+          )
+        }
+      }
+    }
+
     // Pick team color: count existing teams to rotate through the palette
     let teamColor = parent.teamColor
     if (!teamColor) {
@@ -4982,6 +5168,23 @@ export class SessionManager {
       type: 'task_update',
       taskId: params.prompt?.slice(0, 80) ?? 'unknown',
     })
+    // REQ-HB-001: Register teammate with heartbeat aggregator for activity tracking
+    this.heartbeatAggregator.registerTeammate(
+      resolvedTeamId,
+      teammateSession.id,
+      teammateDisplayName,
+      teammateModel,
+      resolvedConnection.providerType,
+    )
+
+    // Phase 2c: Create adaptive throttle for this teammate session.
+    // Prevents retry storms via TCP slow-start / AIMD congestion control.
+    // Phase 2d: Honor workspace-level throttle config overrides if present.
+    const managedTeammate = this.sessions.get(teammateSession.id)
+    if (managedTeammate) {
+      const throttleOverrides = this.healthMonitor.getThrottleConfig()
+      managedTeammate.toolCallThrottle = new ToolCallThrottle(throttleOverrides)
+    }
 
     // Build compact spec context + task metadata for teammates when SDD is enabled
     let compactSpecContext: string | null = null
@@ -5097,6 +5300,14 @@ export class SessionManager {
 
     // Implements REQ-001: Preserve team metadata on lead for sidebar grouping
     // Runtime agents are terminated above, but team identity is kept for display
+
+    // Implements REQ-UX-003: Set team status to completed on lead session
+    lead.teamStatus = 'completed'
+    if (lead.workspace?.rootPath) {
+      updateSessionMetadata(lead.workspace.rootPath, leadSessionId, {
+        teamStatus: 'completed',
+      })
+    }
   }
 
   /**
@@ -5449,6 +5660,9 @@ export class SessionManager {
             ) {
               try {
                 await this.sendMessage(managed.parentSessionId, `**${managed.teammateName || 'Teammate'}** completed:\n\n---\n\n${params.content}`)
+                // Mark that this teammate already sent results to the lead via DM.
+                // The completion coordinator will skip its redundant relay.
+                managed.completionRelayed = true
                 return { delivered: true }
               } catch (err) {
                 return { delivered: false, error: String(err) }
@@ -5717,6 +5931,8 @@ export class SessionManager {
           isHeadless: !AGENT_FLAGS.defaultModesEnabled,
           // Pass the workspace-level HookSystem so agents reuse the shared instance
           hookSystem: this.hookSystems.get(managed.workspace.rootPath),
+          // Adaptive throttle for teammate sessions (undefined for non-teammates)
+          toolCallThrottle: managed.toolCallThrottle,
           // System prompt preset for mini agents (focused prompts for quick edits)
           systemPromptPreset: managed.systemPromptPreset,
           // Always pass session object - id is required for plan mode callbacks
@@ -5816,6 +6032,9 @@ export class SessionManager {
             ) {
               try {
                 await this.sendMessage(managed.parentSessionId, `**${managed.teammateName || 'Teammate'}** completed:\n\n---\n\n${params.content}`)
+                // Mark that this teammate already sent results to the lead via DM.
+                // The completion coordinator will skip its redundant relay.
+                managed.completionRelayed = true
                 return { delivered: true }
               } catch (err) {
                 return { delivered: false, error: String(err) }
@@ -7646,7 +7865,16 @@ export class SessionManager {
             this.healthMonitor.recordActivity(hmTeamId, managed.id, managed.teammateName, {
               type: 'tool_call',
               toolName: event.toolName,
+              // Implements Phase 1a: Pass toolInput so health monitor can distinguish different queries
+              toolInput: event.input ? JSON.stringify(event.input).slice(0, 200) : '',
             })
+            // REQ-HB-001: Feed tool call to heartbeat aggregator for activity tracking
+            this.heartbeatAggregator.recordToolCall(
+              hmTeamId,
+              managed.id,
+              event.toolName,
+              event.input ? JSON.stringify(event.input).slice(0, 200) : '',
+            )
             // Forward tool activity to dashboard for live visibility
             this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
               toolName: event.toolName,
@@ -7661,11 +7889,22 @@ export class SessionManager {
               type: 'tool_result',
               toolName: event.toolName,
               error: event.isError,
+              // Phase 4a: Capture result preview for partial work recovery on kill
+              resultPreview: event.result ? String(event.result).slice(0, 500) : undefined,
             })
-            // Implements REQ-B1: Reset retry-storm escalation on successful tool completion.
-            // A successful result means the teammate is making progress, not stuck in a loop.
-            if (!event.isError) {
-              this.healthMonitor.resetRetryStormStage(hmTeamId, managed.id)
+            // Phase 1b fix: Don't blindly reset retry-storm stage on every success.
+            // Most storm calls succeed (they return results, just useless ones), so resetting
+            // on success defeats the escalation. Instead, the health monitor's checkRetryStorm()
+            // handles escalation based on actual similarity patterns, and resetRetryStormStage()
+            // is called only when the agent demonstrably changes approach (see health-monitor.ts).
+            // Phase 2c: Record success/failure in adaptive throttle so budget grows/shrinks.
+            if (managed.toolCallThrottle && event.toolName) {
+              const inputPrefix = event.input ? JSON.stringify(event.input).slice(0, 100) : '';
+              if (event.isError) {
+                managed.toolCallThrottle.recordFailure(event.toolName);
+              } else {
+                managed.toolCallThrottle.recordSuccess(event.toolName, inputPrefix);
+              }
             }
             // Forward tool completion to dashboard
             this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
@@ -7973,8 +8212,9 @@ export class SessionManager {
         const colonIdx = line.indexOf(':')
         if (colonIdx < 0) continue
         let filePath = line.substring(0, colonIdx)
-        // Skip node_modules, dist, build, .git
-        if (/node_modules|[/\\]dist[/\\]|[/\\]build[/\\]|[/\\]\.git[/\\]/i.test(filePath)) continue
+        // Skip node_modules, dist, build, .git, spec templates, config/docs that
+        // produce false positives (the codebase's own spec system references REQ-001 etc.)
+        if (/node_modules|[/\\]dist[/\\]|[/\\]build[/\\]|[/\\]\.git[/\\]|[/\\]specs[/\\]|[/\\]\.craft-agent[/\\]|prd\.json$|vitest[^/\\]*\.(?:config|base\.config|results[^/\\]*)\.(?:json|ts)$/i.test(filePath)) continue
 
         // Normalize path separators
         filePath = filePath.replace(/\\/g, '/')
@@ -8295,6 +8535,34 @@ export class SessionManager {
     if (managed.pendingSpawnsTimeout) {
       clearTimeout(managed.pendingSpawnsTimeout)
       managed.pendingSpawnsTimeout = undefined
+    }
+
+    // Stop health monitoring + status check-in polling — all teammates are done
+    if (managed.teamId) {
+      this.stopTeamHealthMonitoring(teamManager.resolveTeamId(managed.teamId))
+    }
+
+    // REQ-UX-001: Transition team status to 'completed' when all teammates are done
+    if (managed.teamId) {
+      const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+      const team = teamManager.getTeam(resolvedTeamId)
+      if (team && team.status === 'active') {
+        teamManager.updateTeamStatus(resolvedTeamId, 'completed')
+        const tasks = teamManager.getTasks(resolvedTeamId)
+        const cost = teamManager.getCostSummary(resolvedTeamId)
+        // Notify the renderer so the dashboard can show the completion banner
+        if (this.windowManager) {
+          this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, {
+            type: 'team:completed' as const,
+            teamId: resolvedTeamId,
+            payload: {
+              finalCost: cost.totalCostUsd,
+              tasksCompleted: tasks.filter(t => t.status === 'completed').length,
+            },
+            timestamp: new Date().toISOString(),
+          })
+        }
+      }
     }
 
     this.sendEvent({
@@ -9527,6 +9795,21 @@ export class SessionManager {
     tasks
       .filter(task => task.assignee === teammateId && task.status === 'in_progress')
       .forEach(task => teamManager.updateTaskStatus(teamId, task.id, status))
+
+    // Implements REQ-SPEC-001: auto-update linked requirement statuses on task completion
+    if (status === 'completed') {
+      const leadSessionId = this.sessions.get(teammateId)?.parentSessionId
+      if (leadSessionId) {
+        const completedTasks = tasks.filter(task => task.assignee === teammateId && (task.requirementIds?.length ?? 0) > 0)
+        for (const task of completedTasks) {
+          for (const reqId of task.requirementIds!) {
+            this.updateSpecRequirementStatus(leadSessionId, reqId, 'implemented').catch(err => {
+              sessionLog.warn(`[AgentTeams] Failed to update spec requirement ${reqId}:`, err)
+            })
+          }
+        }
+      }
+    }
 
     // Implements BUG-004 fix: Also update the Claude Code SDK's .claude/tasks/ files on disk.
     // The SDK maintains its own task files at ~/.claude/tasks/{teamId}/*.json which are

@@ -787,6 +787,37 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: yes');
     });
 
+    it('detects template spec even when compliance reports changed status to in-progress', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Document data inputs/outputs and persistence needs.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+          {
+            id: 'REQ-003',
+            description: 'Outline performance, reliability, and security expectations.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: n/a');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: yes');
+    });
+
     it('shows computed coverage for non-template specs', () => {
       const session = createMockSession();
       renderTeamDashboard({
@@ -809,6 +840,67 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       });
 
       expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: 50');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
+    });
+
+    it('does not treat mixed template and custom requirements as draft', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Implement OAuth 2.0 authentication for all API endpoints.',
+            priority: 'high',
+            status: 'pending',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
+    });
+
+    it('does not treat template requirements plus user additions as draft', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Document data inputs/outputs and persistence needs.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-003',
+            description: 'Outline performance, reliability, and security expectations.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-004',
+            description: 'Add real-time WebSocket notifications for order updates.',
+            priority: 'high',
+            status: 'pending',
+          },
+        ],
+      });
+
+      // Not draft because a non-template requirement exists
       expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
     });
   });

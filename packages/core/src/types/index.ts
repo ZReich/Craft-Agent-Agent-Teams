@@ -140,6 +140,8 @@ export type {
   YoloStateChangedEvent,
   SynthesisRequestedEvent,
   TeamErrorEvent,
+  HeartbeatSnapshot,
+  HeartbeatBatchEvent,
   TeamEvent,
   TeamEventBatch,
 } from './team-events.ts';

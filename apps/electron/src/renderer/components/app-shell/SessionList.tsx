@@ -2,10 +2,11 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useAction, useActionLabel } from "@/actions"
 import { formatDistanceToNow, formatDistanceToNowStrict, isToday, isYesterday, format, startOfDay } from "date-fns"
 import type { Locale } from "date-fns"
-import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive,  Users, Clock } from "lucide-react"
+import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive, Users, Clock, ChevronRight, ChevronDown } from "lucide-react"
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
+import { Badge } from "@/components/ui/badge"
 import { rendererPerf } from "@/lib/perf"
 import { searchLog } from "@/lib/logger"
 import type { LabelConfig } from "@craft-agent/shared/labels"
@@ -162,6 +163,8 @@ interface TeamGroupProps {
 
 function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSessionItem }: TeamGroupProps) {
   const teamColor = lead.teamColor || '#7c3aed'
+  const isCompleted = lead.teamStatus === 'completed'
+  const isCollapsed = lead.teamId ? collapsedTeams.has(lead.teamId) : false
 
   const workingCount = teammates.filter(t => t.isProcessing).length
   const doneCount = teammates.filter(t => !t.isProcessing).length
@@ -170,31 +173,53 @@ function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSe
     <div className="team-group">
       {/* Team lead — only entry shown in sidebar. Teammates visible in dashboard only. */}
       <div
-        style={{ borderLeft: `4px solid ${teamColor}`, backgroundColor: `${teamColor}08` }}
+        style={{
+          borderLeft: `4px solid ${isCompleted ? 'var(--success)' : teamColor}`,
+          backgroundColor: isCompleted ? undefined : `${teamColor}08`,
+        }}
+        className={isCompleted ? 'opacity-70' : undefined}
       >
-        {/* Team status bar (non-interactive, just shows stats) */}
-        <div
-          className="w-full flex items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground"
-          style={{ color: teamColor }}
+        {/* Team status bar — clickable to toggle collapse */}
+        <button
+          type="button"
+          onClick={() => lead.teamId && onToggleCollapse(lead.teamId)}
+          className={cn(
+            "w-full flex items-center gap-1.5 px-3 py-1 text-[11px] cursor-pointer hover:bg-foreground/3 transition-colors",
+            isCompleted ? "text-muted-foreground" : "text-muted-foreground"
+          )}
+          style={isCompleted ? undefined : { color: teamColor }}
         >
+          {isCollapsed ? (
+            <ChevronRight className="h-3 w-3 shrink-0" />
+          ) : (
+            <ChevronDown className="h-3 w-3 shrink-0" />
+          )}
           <Users className="h-3 w-3 shrink-0" />
           <span className="font-medium">Team</span>
           <span className="text-muted-foreground mx-0.5">&middot;</span>
           <span className="text-muted-foreground">{teammates.length} member{teammates.length !== 1 ? 's' : ''}</span>
-          {workingCount > 0 && (
-            <span className="ml-auto flex items-center gap-1 text-[10px]">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-              {workingCount} working
-            </span>
+          {isCompleted ? (
+            <Badge variant="secondary" className="ml-auto text-[10px] px-1.5 py-0 h-4 bg-success/10 text-success-text border-transparent">
+              Completed
+            </Badge>
+          ) : (
+            <>
+              {workingCount > 0 && (
+                <span className="ml-auto flex items-center gap-1 text-[10px]">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  {workingCount} working
+                </span>
+              )}
+              {workingCount === 0 && doneCount > 0 && (
+                <span className="ml-auto flex items-center gap-1 text-[10px] text-green-600">
+                  All done
+                </span>
+              )}
+            </>
           )}
-          {workingCount === 0 && doneCount > 0 && (
-            <span className="ml-auto flex items-center gap-1 text-[10px] text-green-600">
-              All done
-            </span>
-          )}
-        </div>
-        {/* Lead session item */}
-        {renderSessionItem(lead, true)}
+        </button>
+        {/* Lead session item — hidden when collapsed */}
+        {!isCollapsed && renderSessionItem(lead, true)}
       </div>
     </div>
   )
@@ -616,6 +641,13 @@ const SessionItem = React.memo(function SessionItem({
               {/* Fixed indicators (Spinner + New) — always visible */}
               {item.isProcessing && (
                 <Spinner className="text-[8px] text-foreground shrink-0" />
+              )}
+              {/* REQ-HB-001: Show "Waiting" indicator when team lead is idle but teammates are still active */}
+              {!item.isProcessing && item.isTeamLead && item.teamStatus !== 'completed' && item.teammateSessionIds && item.teammateSessionIds.length > 0 && (
+                <span className="shrink-0 flex items-center gap-1 text-[10px] font-medium" style={{ color: item.teamColor || 'var(--foreground)' }}>
+                  <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: item.teamColor || 'var(--amber-500, #f59e0b)' }} />
+                  Waiting
+                </span>
               )}
               {!item.isProcessing && hasUnreadMessages(item) && (
                 <span className="shrink-0 px-1.5 py-0.5 text-[10px] font-medium rounded bg-accent text-white">
@@ -1086,6 +1118,27 @@ export function SessionList({
 
     // Update known set
     knownTeamIds.current = currentTeamIds
+
+    // Implements REQ-UX-003: Auto-collapse completed teams
+    const completedTeamIds: string[] = []
+    for (const item of items) {
+      if (item.isTeamLead && item.teamId && item.teamStatus === 'completed') {
+        completedTeamIds.push(item.teamId)
+      }
+    }
+    if (completedTeamIds.length > 0) {
+      setCollapsedTeams(prev => {
+        let changed = false
+        const next = new Set(prev)
+        for (const id of completedTeamIds) {
+          if (!next.has(id)) {
+            next.add(id)
+            changed = true
+          }
+        }
+        return changed ? next : prev
+      })
+    }
   }, [items])
 
   // Pre-flatten label tree once for efficient ID lookups in each SessionItem
@@ -1198,10 +1251,16 @@ export function SessionList({
   // Implements REQ-A3: Teammates are pre-filtered out in visibleItems,
   // so only leads and standalone sessions remain. No team grouping needed here;
   // the TeamGroup component handles teammate display inside the team dashboard.
+  // Implements REQ-UX-003: Completed teams sort below active sessions/teams.
   const sortedItems = useMemo(() => {
-    return [...visibleItems].sort((a, b) =>
-      (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
-    )
+    return [...visibleItems].sort((a, b) => {
+      // Completed teams sink below active sessions
+      const aCompleted = a.isTeamLead && a.teamStatus === 'completed' ? 1 : 0
+      const bCompleted = b.isTeamLead && b.teamStatus === 'completed' ? 1 : 0
+      if (aCompleted !== bCompleted) return aCompleted - bCompleted
+      // Then sort by most recent activity
+      return (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
+    })
   }, [visibleItems])
 
   // Filter items by search query — ripgrep content search only for consistent results

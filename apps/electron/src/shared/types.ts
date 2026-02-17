@@ -145,6 +145,9 @@ import type {
   YoloState,
   SpecEvolutionProposal,
   TeamPhase,
+  // Heartbeat types (REQ-HB-001)
+  HeartbeatSnapshot,
+  HeartbeatBatchEvent,
 } from '@craft-agent/core/types';
 export type {
   AgentTeam,
@@ -188,6 +191,9 @@ export type {
   YoloState,
   SpecEvolutionProposal,
   TeamPhase,
+  // Heartbeat types (REQ-HB-001)
+  HeartbeatSnapshot,
+  HeartbeatBatchEvent,
 };
 
 
@@ -526,6 +532,8 @@ export interface Session {
   teammateSessionIds?: string[]
   /** Team accent color (hex, e.g., "#7c3aed") */
   teamColor?: string
+  /** Team lifecycle status — set when team events fire */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error'
   /** Whether SDD/spec mode is enabled for this session */
   sddEnabled?: boolean
   /** Currently active spec identifier */

@@ -164,6 +164,7 @@ export function createSessionHeader(session: StoredSession): SessionHeader {
     teammateName: session.teammateName,
     teammateSessionIds: session.teammateSessionIds,
     teamColor: session.teamColor,
+    teamStatus: session.teamStatus,
   } as SessionHeader;
 }
 

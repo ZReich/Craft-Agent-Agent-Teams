@@ -39,6 +39,7 @@ import type {
   ModelPresetId,
   YoloState,
   TeamPhase,
+  HeartbeatSnapshot,
 } from '../../../shared/types'
 
 import { TeamHeader } from './TeamHeader'
@@ -56,6 +57,7 @@ import { SpecChecklistModal } from './SpecChecklistModal'
 import { useTeamStateSync } from '@/hooks/useTeamEvents'
 import { ToolActivityIndicator } from './ToolActivityIndicator'
 import type { ToolActivity } from './ToolActivityIndicator'
+import { TeamCompletionBanner } from './TeamCompletionBanner'
 
 const MODEL_NAMES: Record<string, string> = {
   'claude-opus-4-6': 'Opus 4.6',
@@ -221,6 +223,9 @@ export function TeamDashboard({
   const [realtimeHealthIssues, setRealtimeHealthIssues] = useState<Record<string, TeammateHealthIssue[]>>({})
   const [yoloState, setYoloState] = useState<YoloState | null>(null)
   const [yoloPhases, setYoloPhases] = useState<TeamPhase[]>([])
+  const [completionBannerDismissed, setCompletionBannerDismissed] = useState(false)
+  // REQ-HB-001: Live heartbeat snapshots per teammate
+  const [heartbeatByTeammate, setHeartbeatByTeammate] = useState<Record<string, HeartbeatSnapshot>>({})
 
   // Read teammate session metadata from Jotai atoms
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
@@ -309,6 +314,18 @@ export function TeamDashboard({
           setYoloPhases(event.payload.phases)
         }
       },
+      // REQ-HB-001: Update per-teammate heartbeat snapshots
+      onHeartbeatBatch: (event) => {
+        const heartbeats = event.payload.heartbeats
+        if (!heartbeats?.length) return
+        setHeartbeatByTeammate((prev) => {
+          const next = { ...prev }
+          for (const hb of heartbeats) {
+            next[hb.teammateId] = hb
+          }
+          return next
+        })
+      },
     },
     {
       // Don't use mock mode in production
@@ -396,14 +413,16 @@ export function TeamDashboard({
   }, [session.workspaceId])
 
   // Implements REQ-004 (spec clarity): explicitly detect untouched template specs.
+  // Check description text only — status may have been overridden by compliance
+  // report scanning (codebase refs to REQ-001/002/003 produce false "partial"
+  // coverage which changes status from 'pending' to 'in-progress').
   const specIsDraft = useMemo(() => {
     if (!specModeEnabled || specRequirements.length === 0) return false
-    return specRequirements.length >= 3
-      && specRequirements.every((req) => {
-        const normalized = req.description.toLowerCase()
-        return req.status === 'pending'
-          && TEMPLATE_REQUIREMENT_SNIPPETS.some(snippet => normalized.includes(snippet))
-      })
+    const templateMatchCount = specRequirements.filter((req) => {
+      const normalized = req.description.toLowerCase()
+      return TEMPLATE_REQUIREMENT_SNIPPETS.some(snippet => normalized.includes(snippet))
+    }).length
+    return templateMatchCount === specRequirements.length
   }, [specModeEnabled, specRequirements])
 
   // Implements BUG-2: derive spec coverage percentage from requirements data
@@ -644,6 +663,18 @@ export function TeamDashboard({
         onYoloAbort={yoloEnabled ? handleYoloAbort : undefined}
       />
 
+      {/* REQ-UX-002: Completion banner when team is done */}
+      {team.status === 'completed' && !completionBannerDismissed && (
+        <TeamCompletionBanner
+          team={team}
+          tasks={realtimeTasks}
+          cost={cost}
+          specCoveragePercent={specCoveragePercent}
+          onDismiss={() => setCompletionBannerDismissed(true)}
+          className="mx-4 mt-3"
+        />
+      )}
+
       <div className="flex items-center justify-between px-4 py-2 border-b border-border">
         <p className="text-sm text-muted-foreground">
           {viewMode === 'overview'
@@ -682,6 +713,7 @@ export function TeamDashboard({
               const draft = quickReplyByTeammate[teammate.id] ?? ''
               const toolActivities = realtimeToolActivity[teammate.id] ?? []
               const healthIssues = realtimeHealthIssues[teammate.id] ?? []
+              const heartbeat = heartbeatByTeammate[teammate.id]
               return (
                 <div
                   key={teammate.id}
@@ -732,6 +764,24 @@ export function TeamDashboard({
                       </div>
                     </div>
                     <p className="mt-2 text-[11px] text-muted-foreground">{activeCount} active tasks</p>
+                    {/* REQ-HB-001: Heartbeat activity summary */}
+                    {heartbeat && (
+                      <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+                        <span className={cn(
+                          'w-1.5 h-1.5 rounded-full shrink-0',
+                          heartbeat.appearsStalled ? 'bg-destructive' : 'bg-success animate-pulse'
+                        )} />
+                        <span className="truncate">{heartbeat.activitySummary}</span>
+                        {heartbeat.contextUsage != null && (
+                          <span className={cn(
+                            'ml-auto shrink-0 tabular-nums',
+                            heartbeat.contextUsage >= 0.7 ? 'text-destructive' : ''
+                          )}>
+                            Ctx {Math.round(heartbeat.contextUsage * 100)}%
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </button>
 
                   {/* Live tool activity feed */}
@@ -919,22 +969,42 @@ export function TeamDashboard({
             ) : activeTab === 'activity' ? (
               <TeamActivityFeed events={realtimeActivity} />
             ) : activeTab === 'spec-coverage' ? (
-              <SpecCoveragePanel
-                requirements={specRequirements}
-                className="h-full"
-                onRequirementStatusChange={onSpecRequirementStatusChange}
-                onRequirementClick={(requirementId) => {
-                  const matchingRequirement = specRequirements.find((req) => req.id === requirementId)
-                  setHighlightedTaskIds(matchingRequirement?.linkedTaskIds || [])
-                  setTaskListCollapsed(false)
-                  onSpecRequirementClick?.(requirementId)
-                }}
-              />
+              specIsDraft ? (
+                <div className="flex items-center justify-center h-full text-muted-foreground">
+                  <div className="text-center space-y-2 max-w-xs">
+                    <AlertTriangle className="size-5 mx-auto text-yellow-500" />
+                    <p className="text-sm font-medium">Template Spec</p>
+                    <p className="text-xs">Edit the spec file to replace the default template requirements before coverage tracking begins.</p>
+                  </div>
+                </div>
+              ) : (
+                <SpecCoveragePanel
+                  requirements={specRequirements}
+                  className="h-full"
+                  onRequirementStatusChange={onSpecRequirementStatusChange}
+                  onRequirementClick={(requirementId) => {
+                    const matchingRequirement = specRequirements.find((req) => req.id === requirementId)
+                    setHighlightedTaskIds(matchingRequirement?.linkedTaskIds || [])
+                    setTaskListCollapsed(false)
+                    onSpecRequirementClick?.(requirementId)
+                  }}
+                />
+              )
             ) : activeTab === 'traceability' ? (
-              <SpecTraceabilityPanel
-                traceabilityMap={specTraceabilityMap}
-                className="h-full"
-              />
+              specIsDraft ? (
+                <div className="flex items-center justify-center h-full text-muted-foreground">
+                  <div className="text-center space-y-2 max-w-xs">
+                    <AlertTriangle className="size-5 mx-auto text-yellow-500" />
+                    <p className="text-sm font-medium">Template Spec</p>
+                    <p className="text-xs">Traceability data will appear once the spec contains real requirements.</p>
+                  </div>
+                </div>
+              ) : (
+                <SpecTraceabilityPanel
+                  traceabilityMap={specTraceabilityMap}
+                  className="h-full"
+                />
+              )
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
                 <p className="text-sm">Select a teammate</p>

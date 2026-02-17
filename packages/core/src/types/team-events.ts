@@ -384,6 +384,37 @@ export interface TeamErrorEvent extends TeamEventEnvelope<{
 }
 
 // ============================================================
+// Heartbeat Events (REQ-HB-001)
+// ============================================================
+
+/** Per-agent heartbeat snapshot for UI display */
+export interface HeartbeatSnapshot {
+  teammateId: string;
+  teammateName: string;
+  model: string;
+  provider: string;
+  timestamp: string;
+  toolCallsSinceFlush: number;
+  lastToolName: string;
+  activitySummary: string;
+  progressHint?: string;
+  estimatedProgress?: number;
+  contextUsage?: number;
+  appearsStalled: boolean;
+}
+
+/**
+ * Heartbeat batch event — periodic team health snapshot for UI.
+ * Implements REQ-HB-001: Bidirectional Heartbeat Protocol.
+ */
+export interface HeartbeatBatchEvent extends TeamEventEnvelope<{
+  heartbeats: HeartbeatSnapshot[];
+  triggeredBy?: 'agent_completed' | 'error_loop_detected' | 'approach_changed_after_stall' | 'context_threshold_crossed';
+}> {
+  type: 'heartbeat:batch';
+}
+
+// ============================================================
 // Union Type for All Events
 // ============================================================
 
@@ -417,7 +448,8 @@ export type TeamEvent =
   | IntegrationCheckCompletedEvent
   | YoloStateChangedEvent
   | SynthesisRequestedEvent
-  | TeamErrorEvent;
+  | TeamErrorEvent
+  | HeartbeatBatchEvent;
 
 // ============================================================
 // Event Factory Functions

@@ -26,6 +26,7 @@ import type {
   CostUpdatedEvent,
   YoloStateChangedEvent,
   SynthesisRequestedEvent,
+  HeartbeatBatchEvent,
 } from '@craft-agent/core/types';
 
 // ============================================================
@@ -389,6 +390,7 @@ export function useTeamStateSync(
     onCostUpdated?: (event: CostUpdatedEvent) => void;
     onYoloStateChanged?: (event: YoloStateChangedEvent) => void;
     onSynthesisRequested?: (event: SynthesisRequestedEvent) => void;
+    onHeartbeatBatch?: (event: HeartbeatBatchEvent) => void;
   },
   options?: Omit<TeamEventSubscriptionOptions, 'teamId'>
 ): UseTeamEventsResult {
@@ -444,6 +446,9 @@ export function useTeamStateSync(
           break;
         case 'synthesis:requested':
           callbacks.onSynthesisRequested?.(event as SynthesisRequestedEvent);
+          break;
+        case 'heartbeat:batch':
+          callbacks.onHeartbeatBatch?.(event as HeartbeatBatchEvent);
           break;
       }
     };

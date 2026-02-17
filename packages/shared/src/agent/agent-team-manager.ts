@@ -317,6 +317,14 @@ export class AgentTeamManager extends EventEmitter {
     try { this.synthesisRequested.delete(teamId); } catch { /* continue */ }
   }
 
+  /** Update team lifecycle status and emit 'team:updated' */
+  updateTeamStatus(teamId: string, status: AgentTeam['status']): void {
+    const team = this.teams.get(teamId);
+    if (!team) return;
+    team.status = status;
+    this.emit('team:updated', team);
+  }
+
   /** Get team status */
   getTeam(teamId: string): AgentTeam | undefined {
     return this.teams.get(teamId);

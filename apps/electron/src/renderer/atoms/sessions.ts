@@ -91,6 +91,8 @@ export interface SessionMeta {
   teammateSessionIds?: string[]
   /** Team accent color (hex) */
   teamColor?: string
+  /** Team lifecycle status (e.g., 'active', 'completed') — set by team events */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error'
 }
 
 /**
@@ -158,6 +160,7 @@ export function extractSessionMeta(session: Session): SessionMeta {
     teammateRole: session.teammateRole,
     teammateSessionIds: session.teammateSessionIds,
     teamColor: session.teamColor,
+    teamStatus: session.teamStatus,
   }
 }
 

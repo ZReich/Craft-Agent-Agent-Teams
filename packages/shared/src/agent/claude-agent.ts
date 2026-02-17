@@ -138,6 +138,8 @@ export interface ClaudeAgentConfig {
   }) => Promise<{ delivered: boolean; error?: string }>;
   /** Workspace-level HookSystem instance (shared across all agents in the workspace) */
   hookSystem?: HookSystem;
+  /** Adaptive tool call throttle for teammate sessions (prevents retry storms) */
+  toolCallThrottle?: import('../agent-teams/tool-call-throttle.ts').ToolCallThrottle;
 }
 
 // Permission request tracking
@@ -405,6 +407,7 @@ export class ClaudeAgent extends BaseAgent {
   private activeTeamName: string | null = null;
   private activeTeammateCount: number = 0;
   private hookSystem?: HookSystem;
+  private toolCallThrottle?: import('../agent-teams/tool-call-throttle.ts').ToolCallThrottle;
 
   /**
    * Get the session ID for mode operations.
@@ -486,6 +489,7 @@ export class ClaudeAgent extends BaseAgent {
 
     this.isHeadless = config.isHeadless ?? false;
     this.hookSystem = config.hookSystem;
+    this.toolCallThrottle = config.toolCallThrottle;
 
     // Log which model is being used (helpful for debugging custom models)
     this.debug(`Using model: ${model}`);
@@ -860,6 +864,21 @@ export class ClaudeAgent extends BaseAgent {
                 return { continue: true };
               }
 
+              // Phase 2b: Adaptive tool call throttle for teammate sessions.
+              // Checks tool call budget BEFORE execution to prevent retry storms.
+              if (this.toolCallThrottle) {
+                const inputPrefix = input.tool_input ? JSON.stringify(input.tool_input).slice(0, 100) : '';
+                const throttleResult = this.toolCallThrottle.check(toolName, inputPrefix);
+                if (!throttleResult.allowed) {
+                  this.onDebug?.(`[Throttle] Blocked ${toolName}: ${throttleResult.reason}`);
+                  return {
+                    continue: false,
+                    decision: 'block' as const,
+                    reason: throttleResult.reason,
+                  };
+                }
+              }
+
               // Get current permission mode (single source of truth)
               const permissionMode = getPermissionMode(sessionId);
               this.onDebug?.(`PreToolUse hook: ${toolName} (permissionMode=${permissionMode})`);
@@ -978,8 +997,11 @@ export class ClaudeAgent extends BaseAgent {
 
                   // CRITICAL: Set activeTeamName/Count NOW (before returning synthetic result)
                   // This ensures the keep-alive check at completion time sees an active team.
+                  // REQ-ORCH-005: Guard against team name mismatches (e.g., TeamCreate set name "A" but Task uses "B")
                   if (!this.activeTeamName) {
                     this.activeTeamName = teamName;
+                  } else if (this.activeTeamName !== teamName) {
+                    this.onDebug?.(`[AgentTeams] Team name mismatch: active="${this.activeTeamName}" vs spawn="${teamName}" — using active team name`);
                   }
                   this.activeTeammateCount++;
 
@@ -1055,19 +1077,59 @@ export class ClaudeAgent extends BaseAgent {
                 }
               }
 
-              // --- TeamCreate: Let SDK handle normally (creates metadata files) ---
-              // TeamCreate just creates config files at ~/.claude/teams/ which is fine.
-              // We don't need to intercept it.
+              // --- TeamCreate: Intercept to prevent orphan SDK files --- // Implements REQ-ALIGN-001 + REQ-ORCH-005
+              if (toolName === 'TeamCreate' && this.onTeammateSpawnRequested) {
+                const toolInput = input.tool_input as Record<string, unknown>
+                const teamCreateName = (toolInput.team_name as string) || (toolInput.teamName as string) || 'default-team'
+
+                // REQ-ORCH-005: Idempotent state management — set activeTeamName consistently
+                // so subsequent Task spawns don't conflict with a stale or missing team name.
+                if (!this.activeTeamName) {
+                  this.activeTeamName = teamCreateName
+                  this.onDebug?.(`[AgentTeams] Intercepting TeamCreate for "${teamCreateName}" — set as active team`)
+                } else if (this.activeTeamName !== teamCreateName) {
+                  // Already leading a different team — log warning but don't overwrite state
+                  this.onDebug?.(`[AgentTeams] TeamCreate for "${teamCreateName}" ignored — already leading team "${this.activeTeamName}"`)
+                } else {
+                  this.onDebug?.(`[AgentTeams] TeamCreate for "${teamCreateName}" — already active (idempotent no-op)`)
+                }
+
+                return {
+                  outputContent: `Team "${teamCreateName}" created successfully. Teams are managed automatically when spawning teammates.`,
+                }
+              }
 
               // --- TeamDelete: Trigger our session-based cleanup ---
               if (toolName === 'TeamDelete' && this.onTeammateMessage) {
-                this.onDebug?.('[AgentTeams] Intercepting TeamDelete — cleaning up team sessions');
+                this.onDebug?.('[AgentTeams] Intercepting TeamDelete — cleaning up team sessions')
+                // Capture team name before reset for cleanup
+                const teamName = this.activeTeamName
                 // Reset team state on this agent
-                this.activeTeamName = null;
-                this.activeTeammateCount = 0;
+                this.activeTeamName = null
+                this.activeTeammateCount = 0
+                // Clean up orphan SDK files if they exist // Implements REQ-AUDIT-008
+                if (teamName) {
+                  try {
+                    const os = require('os')
+                    const path = require('path')
+                    const fs = require('fs')
+                    const teamsDir = path.join(os.homedir(), '.claude', 'teams', teamName)
+                    const tasksDir = path.join(os.homedir(), '.claude', 'tasks', teamName)
+                    if (fs.existsSync(teamsDir)) {
+                      fs.rmSync(teamsDir, { recursive: true, force: true })
+                      this.onDebug?.(`[AgentTeams] Cleaned up SDK teams directory: ${teamsDir}`)
+                    }
+                    if (fs.existsSync(tasksDir)) {
+                      fs.rmSync(tasksDir, { recursive: true, force: true })
+                      this.onDebug?.(`[AgentTeams] Cleaned up SDK tasks directory: ${tasksDir}`)
+                    }
+                  } catch (err) {
+                    this.onDebug?.(`[AgentTeams] Failed to clean up SDK files: ${err instanceof Error ? err.message : String(err)}`)
+                  }
+                }
                 return {
                   outputContent: 'Team deleted and sessions cleaned up successfully.',
-                };
+                }
               }
 
               // ============================================================

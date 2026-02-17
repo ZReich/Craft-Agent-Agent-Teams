@@ -7,7 +7,8 @@
 
 import * as React from 'react'
 import { atom, useAtomValue, useSetAtom } from 'jotai'
-import { AlertCircle, Globe, Copy, RefreshCw, Link2Off, Info } from 'lucide-react'
+import { AlertCircle, Globe, Copy, RefreshCw, Link2Off, Info, CheckCircle2 } from 'lucide-react'
+import { formatDistanceToNowStrict } from 'date-fns'
 import { ChatDisplay, type ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
 import { TeamStatusBar } from '@/components/teams/TeamStatusBar'
 import { TeamDashboard } from '@/components/teams/TeamDashboard'
@@ -335,6 +336,14 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const lastTeamRealtimeEventAtRef = React.useRef(0)
   const teamReloadTimerRef = React.useRef<number | null>(null)
 
+  // Implements REQ-UX-004: Auto-minimize dashboard on completion
+  const [teamCompletedMinimized, setTeamCompletedMinimized] = React.useState(false)
+  const teamCompletedSummaryRef = React.useRef<{
+    teammateCount: number
+    taskCount: number
+    elapsed: string
+  } | null>(null)
+
   const specLabel = React.useMemo(() => {
     if (!teamSpec) return undefined
     const title = teamSpec.title?.trim()
@@ -348,6 +357,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   // chat view — users can open the dashboard via the TeamStatusBar toggle.
   React.useEffect(() => {
     setShowTeamDashboard(false)
+    setTeamCompletedMinimized(false)
+    teamCompletedSummaryRef.current = null
   }, [session?.id])
 
   const teamSessionIds = React.useMemo(() => {
@@ -395,11 +406,18 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     const requirements: SpecRequirementSummary[] = spec?.requirements?.length
       ? spec.requirements.map((req) => {
         const trace = traceability.find((t) => t.requirementId === req.id)
+        // Implements REQ-SPEC-002: merge compliance report coverage into requirement status
+        const coverageEntry = coverage.find((c) => c.requirementId === req.id)
+        let effectiveStatus = req.status
+        if (effectiveStatus === 'pending' && coverageEntry) {
+          if (coverageEntry.coverage === 'full') effectiveStatus = 'implemented'
+          else if (coverageEntry.coverage === 'partial') effectiveStatus = 'in-progress'
+        }
         return {
           id: req.id,
           description: req.description,
           priority: req.priority,
-          status: req.status,
+          status: effectiveStatus,
           linkedTaskIds: trace?.tasks ?? req.linkedTaskIds,
           linkedTestPatterns: trace?.tests ?? req.linkedTestPatterns,
         }
@@ -505,6 +523,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 
       if (event.type === 'team:updated') {
         setTeamStatus(event.payload.team)
+        // Implements REQ-UX-003: Propagate team status to session meta for sidebar display
+        if (event.payload.team?.status) {
+          updateMeta(session.id, { teamStatus: event.payload.team.status })
+        }
       }
       if (event.type === 'cost:updated') {
         setTeamCost(event.payload.summary)
@@ -622,8 +644,17 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const handleCleanupTeam = React.useCallback(async () => {
     if (!session?.teamId || !window.electronAPI) return
     try {
+      // Implements REQ-UX-004: Capture summary before cleanup for the minimized bar
+      teamCompletedSummaryRef.current = {
+        teammateCount: teamStatus?.members?.length ?? session.teammateSessionIds?.length ?? 0,
+        taskCount: teamTasks.length,
+        elapsed: session.createdAt
+          ? formatDistanceToNowStrict(new Date(session.createdAt))
+          : '',
+      }
       await window.electronAPI.cleanupAgentTeam(session.teamId)
       setShowTeamDashboard(false)
+      setTeamCompletedMinimized(true)
       await loadTeamData()
       toast.success('Team ended')
     } catch (error) {
@@ -632,7 +663,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         description: error instanceof Error ? error.message : 'Unknown error',
       })
     }
-  }, [session?.teamId, loadTeamData])
+  }, [session?.teamId, session?.teammateSessionIds, session?.createdAt, teamStatus?.members?.length, teamTasks.length, loadTeamData])
 
   const handleShutdownTeammate = React.useCallback(async (teammateId: string) => {
     if (!session?.teamId || !window.electronAPI) return
@@ -736,8 +767,17 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       if (session.sddEnabled && window.electronAPI.syncSDDCompliance) {
         await window.electronAPI.syncSDDCompliance(session.id)
       }
+      // Implements REQ-UX-004: Capture summary before cleanup for the minimized bar
+      teamCompletedSummaryRef.current = {
+        teammateCount: teamStatus?.members?.length ?? session.teammateSessionIds?.length ?? 0,
+        taskCount: teamTasks.length,
+        elapsed: session.createdAt
+          ? formatDistanceToNowStrict(new Date(session.createdAt))
+          : '',
+      }
       await window.electronAPI.cleanupAgentTeam(session.teamId)
       setShowTeamDashboard(false)
+      setTeamCompletedMinimized(true)
       await loadTeamData()
       toast.success('Team completed')
     } catch (error) {
@@ -746,7 +786,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         description: error instanceof Error ? error.message : 'Unknown error',
       })
     }
-  }, [session?.teamId, session?.id, session?.sddEnabled, loadTeamData])
+  }, [session?.teamId, session?.id, session?.sddEnabled, session?.teammateSessionIds, session?.createdAt, teamStatus?.members?.length, teamTasks.length, loadTeamData])
 
   // Implements BUG-7: Quality reports state
   const [qualityReports, setQualityReports] = React.useState<Map<string, import('@craft-agent/core/types').QualityGateResult>>(new Map())
@@ -1017,6 +1057,31 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             onToggleFocusMode={onToggleFocusMode}
           />
         )}
+        {/* Implements REQ-UX-004: Compact completion bar shown after dashboard is dismissed */}
+        {teamCompletedMinimized && teamCompletedSummaryRef.current && (
+          <button
+            type="button"
+            onClick={() => {
+              setTeamCompletedMinimized(false)
+              setShowTeamDashboard(true)
+            }}
+            className="mx-3 mb-1 mt-1 flex items-center gap-2 h-8 px-3 bg-success/5 border border-success/20 rounded-lg text-xs text-success-text cursor-pointer hover:bg-success/10 transition-colors"
+          >
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+            <span>
+              Team completed
+              {teamCompletedSummaryRef.current.teammateCount > 0 && (
+                <> · {teamCompletedSummaryRef.current.teammateCount} teammate{teamCompletedSummaryRef.current.teammateCount !== 1 ? 's' : ''}</>
+              )}
+              {teamCompletedSummaryRef.current.taskCount > 0 && (
+                <> · {teamCompletedSummaryRef.current.taskCount} task{teamCompletedSummaryRef.current.taskCount !== 1 ? 's' : ''}</>
+              )}
+              {teamCompletedSummaryRef.current.elapsed && (
+                <> · {teamCompletedSummaryRef.current.elapsed}</>
+              )}
+            </span>
+          </button>
+        )}
         {/* Team Dashboard (replaces chat when active) */}
         {showTeamDashboard && (session?.isTeamLead || sessionMeta?.isTeamLead) && (session?.teamId || sessionMeta?.teamId) ? (
           <div className="flex-1 flex flex-col min-h-0">
@@ -1050,6 +1115,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             session={session}
             onSendMessage={(message, attachments, skillSlugs) => {
               if (session) {
+                // Implements REQ-UX-004: Clear minimized bar when user sends a new message
+                if (teamCompletedMinimized) {
+                  setTeamCompletedMinimized(false)
+                  teamCompletedSummaryRef.current = null
+                }
                 onSendMessage(session.id, message, attachments, skillSlugs)
               }
             }}

@@ -47,6 +47,60 @@ function inferTeamRoleFromName(teammateName?: string): TeamRole | null
 function normalizeTeamRole(rawRole?: string, teammateName?: string): TeamRole
 ```
 
+## SDK Integration Architecture
+
+> **How Craft Agent wraps the Claude Agent SDK for agent teams.**
+> This section documents the actual interception and routing layer.
+
+### SDK Tools: Interception vs Pass-Through
+
+Craft Agent intercepts several SDK-native team tools in `claude-agent.ts` and
+`codex-agent.ts`. The table below shows what happens to each tool call:
+
+| SDK Tool | Intercepted? | What Happens |
+|----------|-------------|--------------|
+| `Task` (with `team_name`) | **Yes** | Creates a separate `CraftAgent` session via `createTeammateSession()`. Does NOT create a real SDK subprocess teammate. |
+| `Task` (without `team_name`) | **No** | Falls through to SDK — creates a native in-process subagent (used by Heads for Workers/Reviewers). |
+| `SendMessage` | **Yes** | Routes DMs, broadcasts, and shutdown requests via session manager's `sendMessage()`. |
+| `TeamCreate` | **Yes (no-op)** | Intercepted and returns success. Teams are created implicitly when first teammate spawns. |
+| `TeamDelete` | **Yes** | Resets agent team state and cleans up `~/.claude/teams/` files. |
+| `TaskCreate` | **Not used** | SDK's native task tools are never called. All task management goes through `AgentTeamManager`. |
+| `TaskUpdate` | **Not used** | Same — task status transitions happen via `AgentTeamManager.updateTaskStatus()`. |
+| `TaskList` | **Not used** | Same — task listing is from `AgentTeamManager.getTasks()`. |
+| `TodoWrite` | **Not intercepted** | Used by agents for their own internal tracking, independent of team task management. |
+
+### Teammate Sessions Are NOT SDK Teammates
+
+**Critical architecture detail:** When the lead's `Task` call with `team_name`
+is intercepted, Craft Agent creates a **standalone session** (a new `CraftAgent`
+instance), not a real SDK team member. This means:
+
+1. The teammate has NO access to SDK's native team tools (`TaskCreate`, `TaskUpdate`, `TaskList`)
+2. The teammate communicates only via `SendMessage` (intercepted) and its final assistant output
+3. Teammate completion is detected by the session manager's `onProcessingStopped` handler
+
+### Completion Flow
+
+```
+Teammate agent finishes processing
+  → onProcessingStopped() in sessions.ts
+    → handleAgentTeamCompletionOnStop()
+      → AgentTeamCompletionCoordinator
+        → Checks workspace quality gate config
+        → If QG enabled: runs DiffCollector + QualityGateRunner pipeline
+          → PASS: relays results to lead, marks task completed, archives
+          → FAIL (cycles < max): sends feedback to teammate, teammate retries
+          → FAIL (cycles >= max): escalates, relays to lead
+        → If QG disabled: relays results directly to lead
+```
+
+### State Management
+
+All team state lives in `AgentTeamManager` in-memory Maps:
+- `teams`, `tasks`, `messages`, `activityLog` — volatile, reconstructed each session
+- `TeamStateStore` — persists tasks, messages, and activity to disk at `sessions/{leadId}/team-state.json`
+- SDK's `~/.claude/teams/` and `~/.claude/tasks/` directories are NOT used for state
+
 ## Task Domain Routing
 
 File: `routing-policy.ts`
@@ -194,6 +248,48 @@ Catches the "built but not connected" problem:
 3. For each new file, searches for import statements referencing it
 4. Files with zero importers are flagged as "unwired" (potential dead code)
 
+## Adaptive Tool Call Throttle
+
+File: `tool-call-throttle.ts`
+
+Proactive congestion control for teammate tool calls, inspired by TCP slow-start / AIMD. Prevents retry storms **before** they happen by limiting how many calls of the same tool type a teammate can make in a sliding window.
+
+### Algorithm
+
+| Phase | Behavior |
+|-------|----------|
+| **Slow Start** | Budget starts at `initialWindow` (2). Doubles on diverse success until `ssthresh` (8). |
+| **Congestion Avoidance** | After ssthresh, budget grows linearly (+1 per diverse success) up to `maxWindow` (15). |
+| **Backoff** | When similar calls hit budget, budget halved + 10s cooldown. |
+| **Hard Block** | After 3 backoffs in 60s, tool is blocked. Agent must change approach. |
+
+### Configuration
+
+```typescript
+interface ThrottleConfig {
+  initialWindow: number;      // Default: 2
+  ssthresh: number;           // Default: 8
+  maxWindow: number;          // Default: 15
+  windowDurationMs: number;   // Default: 60_000
+  maxBackoffs: number;        // Default: 3
+  backoffCooldownMs: number;  // Default: 10_000
+}
+```
+
+Configurable via `HealthMonitorConfig.throttle` (workspace-level).
+
+### Integration Points
+
+1. **PreToolUse hook** (`claude-agent.ts`): Checks `throttle.check()` before tool execution. Only active for teammate sessions (when `toolCallThrottle` is set on the agent config).
+2. **tool_result handler** (`sessions.ts`): Calls `throttle.recordSuccess()` or `throttle.recordFailure()` after execution completes.
+3. **Stage 2 enforcement** (`sessions.ts`): Health monitor's `retry-storm-throttle` event now calls `throttle.reset()` to force all budgets back to slow-start.
+
+### Key Design Decisions
+
+- **Per-tool budgets**: An agent doing 5 WebSearches + 5 Reads is healthy research. 15 WebSearches is a storm.
+- **Only for teammates**: Team leads don't get throttled (they're user-controlled).
+- **Defense in depth**: Throttle prevents most storms. Health monitor catches what slips through.
+
 ## Health Monitor
 
 File: `health-monitor.ts`
@@ -209,6 +305,80 @@ Periodic health checks (default every 30s) detect four issue types:
 
 Events are debounced (2-minute minimum interval per teammate per issue type).
 Issues are stored per-teammate (max 20 retained) and emitted as `health:{type}` events.
+
+### Retry Storm Reset Logic
+
+Retry-storm escalation resets when the agent **changes approach** (different tool or different input), not on every successful tool result. This prevents storms from defeating escalation by succeeding on useless results.
+
+### Partial Result Capture
+
+`recentToolResults` captures the last 20 successful tool result previews (up to 500 chars each). When an agent is auto-killed, these are surfaced to the team lead so partial work isn't fully lost.
+
+## Heartbeat Protocol (REQ-HB-001)
+
+Files: `heartbeat-aggregator.ts`, `model-profiles.ts`
+
+Bidirectional orchestrator ↔ sub-agent communication that runs alongside the health monitor.
+
+### Architecture
+
+```
+Sub-Agent Sessions ──(tool calls)──→ HeartbeatAggregator ──(30s batch)──→ UI (IPC)
+                                          │                ──(2m summary)──→ Lead LLM
+                                          └── Soft Probes ←── (model-aware stall detection)
+```
+
+**Design principle:** Observe, don't instruct. We watch tool call patterns at the session layer and synthesize heartbeats — agents are never asked to send heartbeats themselves. Zero token cost for passive monitoring.
+
+### Two-Tier Delivery
+
+| Tier | Interval | Target | Token Cost | Event |
+|------|----------|--------|-----------|-------|
+| UI heartbeats | 30s (or on significant events) | Renderer via IPC | Zero | `heartbeat:batch` |
+| LLM summaries | 2 min | Lead session via `sendMessage` | ~200 tokens | `heartbeat:llm-summary` |
+
+Significant events that trigger early flush: agent completion, error loop detected, context threshold crossed (70%).
+
+### Model-Aware Profiles
+
+Different models have different expected silence periods:
+
+```typescript
+// From model-profiles.ts
+interface ModelHeartbeatProfile {
+  expectedSilenceMs: number;  // Normal thinking time
+  softProbeMs: number;        // Send "are you ok?" query
+  hardStallMs: number;        // Escalate to health monitor
+}
+```
+
+Built-in profiles: `claude-haiku` (15s/60s/180s), `claude-sonnet` (30s/90s/300s), `claude-opus` (45s/120s/300s), `gpt-*` (45s/120s/360s), `o1/o3/o4` reasoning (60s/150s/420s).
+
+### Soft Probes (REQ-HB-002)
+
+Before the health monitor's hard stall detection (5 min), the heartbeat aggregator sends a **soft probe** — a lightweight liveness query asking the agent if it's blocked. This recovers many false-positive stalls.
+
+### Activity Classification
+
+Tool call patterns are classified into human-readable summaries:
+
+| Tool Pattern | Summary |
+|---|---|
+| Read, Grep, Glob | "Exploring codebase" |
+| Edit, Write, NotebookEdit | "Implementing changes" |
+| WebSearch, WebFetch | "Researching" |
+| TodoWrite | "Updating task progress" |
+| Task | "Delegating to sub-agent" |
+| Bash | "Running commands" |
+| No activity > expectedSilenceMs | "Thinking / generating response" |
+| No activity > softProbeMs | "May be stalled" |
+
+### Integration Points (sessions.ts)
+
+- **Teammate spawn:** `heartbeatAggregator.registerTeammate()` — registers with model/provider info
+- **tool_start events:** `heartbeatAggregator.recordToolCall()` — feeds activity data
+- **Teammate completion:** `heartbeatAggregator.signalAgentCompleted()` — triggers immediate UI flush
+- **Team cleanup:** `heartbeatAggregator.stopTracking()` — cleans up intervals and state
 
 ## YOLO Mode (Autonomous Execution)
 
@@ -350,22 +520,18 @@ Each preset assigns model+provider per role. Defined in `../providers/presets.ts
 
 ## Activity Events
 
-33+ event types tracked in the activity feed:
+23 event types tracked in the activity feed (13 dead types removed in REQ-CLEANUP-009):
 
 ```typescript
 type TeamActivityType =
   | 'teammate-spawned' | 'teammate-shutdown'
   | 'task-claimed' | 'task-completed' | 'task-failed' | 'task-in-review'
   | 'quality-gate-passed' | 'quality-gate-failed' | 'review-feedback-sent'
-  | 'message-sent' | 'plan-submitted' | 'plan-approved' | 'plan-rejected'
-  | 'model-swapped' | 'escalation'
-  | 'integration-check-started' | 'integration-check-passed' | 'integration-check-failed'
-  | 'stall-detected' | 'file-conflict'
-  | 'checkpoint-created' | 'checkpoint-rollback'
-  | 'cost-warning'
-  | 'yolo-started' | 'yolo-phase-changed' | 'yolo-paused' | 'yolo-completed' | 'yolo-aborted'
+  | 'message-sent' | 'escalation'
+  | 'yolo-started' | 'yolo-paused' | 'yolo-completed' | 'yolo-aborted'
   | 'yolo-remediation-created' | 'yolo-spec-evolution-proposed'
   | 'phase-advanced' | 'phase-blocked'
+  | 'design-generation-started' | 'design-variant-ready' | 'design-selected'
   | 'error';
 ```
 
@@ -404,7 +570,8 @@ Team-Level Integration (IntegrationGate)
 | `quality-gates.ts` | Stage config, score computation, pass/fail logic, failure reports |
 | `review-loop.ts` | Review cycle orchestration, retry logic, escalation |
 | `integration-gate.ts` | Full-project verification, wiring checks |
-| `health-monitor.ts` | Stall/error-loop/retry-storm/context detection |
+| `health-monitor.ts` | Stall/error-loop/retry-storm/context detection + partial result capture |
+| `tool-call-throttle.ts` | Adaptive tool call throttle (TCP slow-start / AIMD congestion control) |
 | `yolo-orchestrator.ts` | Autonomous execution lifecycle |
 | `model-resolution.ts` | Per-role model/provider resolution from presets + config |
 | `routing-policy.ts` | Task domain classification, role enforcement |
@@ -422,10 +589,13 @@ Team-Level Integration (IntegrationGate)
 | File | Purpose |
 |------|---------|
 | `../agent/agent-team-manager.ts` | Central team lifecycle, tasks, messaging |
+| `../agent/claude-agent.ts` | SDK tool interception (Task, SendMessage, TeamCreate, TeamDelete) |
+| `../agent/codex-agent.ts` | Codex-mode SDK tool interception (same tools, different agent) |
 | `../workspaces/types.ts` | `AgentTeamsConfig` workspace settings |
 | `../providers/presets.ts` | Model preset definitions |
 | `@craft-agent/core/types/agent-teams.ts` | All shared types (TeamRole, TeamTask, QualityGateResult, etc.) |
 | `apps/electron/src/main/sessions.ts` | Session integration, role normalization, spawn handling |
+| `apps/electron/src/main/agent-team-completion-coordinator.ts` | Teammate completion → quality gate → relay to lead |
 | `apps/electron/src/main/teammate-codenames.ts` | Codename generation for teammates |
 
 ## Orchestrator Skill

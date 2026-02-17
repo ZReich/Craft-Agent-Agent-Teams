@@ -149,6 +149,35 @@ describe('Tool Call Throttle — TCP Slow-Start & AIMD', () => {
     expect(r3.reason).toContain('blocked');
   });
 
+  it('hardBlockTool permanently blocks a specific tool', () => {
+    const throttle = new ToolCallThrottle();
+
+    // Tool should work initially
+    const r1 = throttle.check('WebSearch', 'query');
+    expect(r1.allowed).toBe(true);
+
+    // Hard-block the tool externally (as health monitor would)
+    throttle.hardBlockTool('WebSearch', 'Blocked due to retry-storm. Synthesize your findings.');
+
+    // Now all calls to this tool should be blocked with custom reason
+    const r2 = throttle.check('WebSearch', 'different query');
+    expect(r2.allowed).toBe(false);
+    expect(r2.reason).toContain('Synthesize your findings');
+
+    // Other tools should still work
+    const r3 = throttle.check('Read', 'some-file');
+    expect(r3.allowed).toBe(true);
+  });
+
+  it('hardBlockTool uses default reason when none provided', () => {
+    const throttle = new ToolCallThrottle();
+    throttle.hardBlockTool('Bash');
+
+    const result = throttle.check('Bash', 'echo test');
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('blocked');
+  });
+
   it('records failure and halves budget', () => {
     const throttle = new ToolCallThrottle({ initialWindow: 4 });
 

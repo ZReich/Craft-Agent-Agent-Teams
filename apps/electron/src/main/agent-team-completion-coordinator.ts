@@ -23,6 +23,10 @@ type ManagedSessionLike = {
   isProcessing?: boolean
   teamLevelQgRunning?: boolean
   qgCycleCount?: number
+  /** Guard: teammate results already relayed to lead — prevents duplicate deliveries */
+  completionRelayed?: boolean
+  /** Guard: synthesis prompt already sent to this lead — prevents duplicate prompts */
+  synthesisPromptSent?: boolean
 }
 
 export type AgentTeamCompletionContext = {
@@ -59,6 +63,8 @@ export type AgentTeamCompletionContext = {
       sessionId?: string,
       teammateName?: string
     ) => void
+    /** Stop health monitoring + status check-in polling for a team. Optional for backwards compat. */
+    stopHealthMonitoring?: (teamId: string) => void
   }
 }
 
@@ -71,8 +77,28 @@ export class AgentTeamCompletionCoordinator {
   async handleAgentTeamCompletionOnStop(managed: ManagedSessionLike, sessionId: string, reason: StopReason): Promise<void> {
     if (reason !== 'complete' || !managed.parentSessionId || !managed.teammateName) return
 
+    // Guard: skip if this teammate's completion was already relayed to the lead.
+    // This covers two cases:
+    // 1. Teammate with subagents triggers onProcessingStopped multiple times (once per subagent)
+    // 2. Teammate sent results via SendMessage DM — relay already happened in the DM handler
+    // In case 2, we still need to update task status and check if the lead should synthesize.
+    if (managed.completionRelayed) {
+      sessionLog.info(`[AgentTeams] Skipping duplicate completion relay for "${managed.teammateName}" (${sessionId}) — already relayed`)
+      const lead = this.context.sessions.getById(managed.parentSessionId)
+      if (lead?.isTeamLead) {
+        // Still update task status and check synthesis even when skipping relay
+        const resolvedTeamId = this.context.team.resolveTeamId(managed.teamId ?? managed.parentSessionId)
+        this.context.teammate.updateTaskStatus(resolvedTeamId, managed.id, 'completed')
+        await this.maybePromptLeadSynthesis(lead, managed.parentSessionId)
+      }
+      return
+    }
+
     const lead = this.context.sessions.getById(managed.parentSessionId)
     if (!lead || !lead.isTeamLead) return
+
+    // Mark before async work to prevent races from concurrent stop events
+    managed.completionRelayed = true
 
     const lastAssistantMsg = [...managed.messages].reverse().find(m => m.role === 'assistant' && !m.isIntermediate)
     const outputPresent = Boolean(lastAssistantMsg?.content?.trim())
@@ -144,13 +170,21 @@ export class AgentTeamCompletionCoordinator {
   }
 
   private async maybePromptLeadSynthesis(lead: ManagedSessionLike, parentSessionId: string): Promise<void> {
+    // Guard: only send the synthesis prompt once per team lifecycle.
+    // Multiple teammates completing in quick succession can each trigger this check,
+    // but the lead should only receive one synthesis prompt.
+    if (lead.synthesisPromptSent) return
+
     const allDone = (lead.teammateSessionIds || []).every(tid => {
       const teammate = this.context.sessions.getById(tid)
       return teammate && !teammate.isProcessing
     })
 
     if (allDone && !lead.teamLevelQgRunning) {
+      lead.synthesisPromptSent = true  // Mark before sending to prevent races
       this.context.messaging.clearLeadTeamState(lead)
+      // Stop health monitoring — all teammates are done, no more check-ins needed
+      this.context.team.stopHealthMonitoring?.(lead.teamId ?? parentSessionId)
       await this.context.messaging.sendToSession(parentSessionId, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
     }
   }
@@ -162,13 +196,18 @@ export class AgentTeamCompletionCoordinator {
     })
     if (!allDone || lead.teamLevelQgRunning) return
 
+    // Guard: don't send duplicate synthesis prompts via the team-level QG path either
+    if (lead.synthesisPromptSent) return
+
     const allTaskTypes = (lead.teammateSessionIds || []).map(tid => {
       const t = this.context.sessions.getById(tid)
       return inferTaskType(t?.name || '')
     })
     const allNonCode = allTaskTypes.every(t => t != null && shouldSkipQualityGates(t))
     if (allNonCode) {
+      lead.synthesisPromptSent = true
       this.context.messaging.clearLeadTeamState(lead)
+      this.context.team.stopHealthMonitoring?.(lead.teamId ?? managed.parentSessionId!)
       await this.context.messaging.sendToSession(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results and synthesize a final response for the user.')
       return
     }
