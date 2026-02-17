@@ -53,8 +53,18 @@ if (!globalThis.DOMMatrix) {
 
 // Mock child components to simplify testing
 vi.mock('../TeamHeader', () => ({
-  TeamHeader: ({ team }: { team: AgentTeam }) => (
-    <div data-testid="team-header">Team: {team.name}</div>
+  TeamHeader: ({
+    team,
+    specCoveragePercent,
+    specIsDraft,
+  }: {
+    team: AgentTeam;
+    specCoveragePercent?: number;
+    specIsDraft?: boolean;
+  }) => (
+    <div data-testid="team-header">
+      Team: {team.name} Coverage: {specCoveragePercent ?? 'n/a'} Draft: {specIsDraft ? 'yes' : 'no'}
+    </div>
   ),
 }));
 
@@ -197,14 +207,18 @@ function createSessionMetaMap(teammates: AgentTeammate[]): Map<string, SessionMe
 describe('TeamDashboard - Phase 1 Tests', () => {
   let mockOnSendMessage: ReturnType<typeof vi.fn>;
   let mockOnCreateTeam: ReturnType<typeof vi.fn>;
+  let originalElectronApi: unknown;
 
   beforeEach(() => {
+    originalElectronApi = (window as any).electronAPI;
+    (window as any).electronAPI = undefined;
     mockOnSendMessage = vi.fn();
     mockOnCreateTeam = vi.fn();
     vi.clearAllMocks();
   });
 
   afterEach(() => {
+    (window as any).electronAPI = originalElectronApi;
     cleanup();
   });
 
@@ -467,6 +481,90 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       // Should still be on activity tab
       expect(activityTab).toHaveClass(/bg-foreground/);
       expect(screen.getByTestId('activity-feed')).toBeInTheDocument();
+    });
+
+    it('hides Knowledge tab when workspace memory metrics UI is disabled (REQ-008)', async () => {
+      (window as any).electronAPI = {
+        getWorkspaceSettings: vi.fn().mockResolvedValue({ agentTeamsKnowledgeMetricsUiEnabled: false }),
+        getPersistedTeamState: vi.fn().mockResolvedValue(null),
+        getYoloState: vi.fn().mockResolvedValue(null),
+      };
+
+      const session = createMockSession();
+      const teammates = [createMockTeammate('session-1', 'Lead Agent', true)];
+      const metaMap = createSessionMetaMap(teammates);
+
+      renderTeamDashboard({
+        session,
+        initialSessionMeta: metaMap,
+      });
+
+      await switchToFocusView();
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: /Knowledge/i })).not.toBeInTheDocument();
+      });
+    });
+
+    it('uses structured knowledge telemetry for hit-rate/query metrics (REQ-002)', async () => {
+      const now = Date.now();
+      (window as any).electronAPI = {
+        getWorkspaceSettings: vi.fn().mockResolvedValue({ agentTeamsKnowledgeMetricsUiEnabled: true }),
+        getPersistedTeamState: vi.fn().mockResolvedValue({
+          messages: [],
+          tasks: [],
+          activity: [],
+          knowledge: [{
+            id: 'kb-1',
+            type: 'discovery',
+            content: 'Auth flow discovery',
+            source: 'worker-1',
+            tags: ['auth'],
+            timestamp: now,
+          }],
+        }),
+        getYoloState: vi.fn().mockResolvedValue(null),
+      };
+
+      const session = createMockSession();
+      const teammates = [createMockTeammate('session-1', 'Lead Agent', true)];
+      const metaMap = createSessionMetaMap(teammates);
+      const activityEvents: TeamActivityEvent[] = [
+        {
+          id: 'evt-1',
+          timestamp: new Date(now).toISOString(),
+          type: 'phase-advanced',
+          details: '[KnowledgeBus][inject] hit entries=2',
+          telemetry: { channel: 'knowledge', operation: 'inject', scope: 'prompt-context', hit: true, resultCount: 2 },
+        },
+        {
+          id: 'evt-2',
+          timestamp: new Date(now).toISOString(),
+          type: 'phase-advanced',
+          details: '[KnowledgeBus][inject] miss entries=0',
+          telemetry: { channel: 'knowledge', operation: 'inject', scope: 'prompt-context', hit: false, resultCount: 0 },
+        },
+        {
+          id: 'evt-3',
+          timestamp: new Date(now).toISOString(),
+          type: 'phase-advanced',
+          details: '[KnowledgeBus][query] hit entries=2',
+          telemetry: { channel: 'knowledge', operation: 'query', scope: 'prompt-context', hit: true, resultCount: 2 },
+        },
+      ];
+
+      renderTeamDashboard({
+        session,
+        initialSessionMeta: metaMap,
+        activityEvents,
+      });
+
+      await switchToFocusView();
+      fireEvent.click(screen.getByRole('button', { name: /Knowledge/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/Query events observed: 1/i)).toBeInTheDocument();
+      });
+      expect(screen.getByText('50%')).toBeInTheDocument();
     });
   });
 
@@ -745,6 +843,154 @@ describe('TeamDashboard - Phase 1 Tests', () => {
       // (The actual deduplication should happen at a higher level)
       expect(screen.getByTestId('task-list')).toHaveTextContent('Tasks: 2');
     });
+
+    it('suppresses coverage percent for untouched template specs', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Document data inputs/outputs and persistence needs.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-003',
+            description: 'Outline performance, reliability, and security expectations.',
+            priority: 'medium',
+            status: 'pending',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: n/a');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: yes');
+    });
+
+    it('detects template spec even when compliance reports changed status to in-progress', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Document data inputs/outputs and persistence needs.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+          {
+            id: 'REQ-003',
+            description: 'Outline performance, reliability, and security expectations.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: n/a');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: yes');
+    });
+
+    it('shows computed coverage for non-template specs', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Implement lifecycle completion handshake for teammates.',
+            priority: 'high',
+            status: 'verified',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Ensure audit task routing uses parallel teammates.',
+            priority: 'high',
+            status: 'pending',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Coverage: 50');
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
+    });
+
+    it('does not treat mixed template and custom requirements as draft', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'in-progress',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Implement OAuth 2.0 authentication for all API endpoints.',
+            priority: 'high',
+            status: 'pending',
+          },
+        ],
+      });
+
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
+    });
+
+    it('does not treat template requirements plus user additions as draft', () => {
+      const session = createMockSession();
+      renderTeamDashboard({
+        session,
+        specModeEnabled: true,
+        specRequirements: [
+          {
+            id: 'REQ-001',
+            description: 'Define the primary user flow and key success criteria.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-002',
+            description: 'Document data inputs/outputs and persistence needs.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-003',
+            description: 'Outline performance, reliability, and security expectations.',
+            priority: 'medium',
+            status: 'pending',
+          },
+          {
+            id: 'REQ-004',
+            description: 'Add real-time WebSocket notifications for order updates.',
+            priority: 'high',
+            status: 'pending',
+          },
+        ],
+      });
+
+      // Not draft because a non-template requirement exists
+      expect(screen.getByTestId('team-header')).toHaveTextContent('Draft: no');
+    });
   });
 
   describe('Compact Sidebar Mode', () => {
@@ -818,6 +1064,5 @@ describe('TeamDashboard - Phase 1 Tests', () => {
     });
   });
 });
-
 
 

@@ -303,10 +303,12 @@ describe('Full Team Lifecycle', () => {
     const task1 = manager.createTask(team.id, 'Task 1', undefined, 'lead', { assignee: worker.id });
     const task2 = manager.createTask(team.id, 'Task 2', undefined, 'lead', { assignee: worker.id });
 
-    // Complete both (no review loop attached)
+    // Complete both (no review loop attached) — must transition through in_progress first
+    manager.updateTaskStatus(team.id, task1.id, 'in_progress', worker.id);
     manager.updateTaskStatus(team.id, task1.id, 'completed', worker.id);
-    expect(synthesisEvents).toHaveLength(0); // Not yet â€” task2 still open
+    expect(synthesisEvents).toHaveLength(0); // Not yet — task2 still open
 
+    manager.updateTaskStatus(team.id, task2.id, 'in_progress', worker.id);
     manager.updateTaskStatus(team.id, task2.id, 'completed', worker.id);
     expect(synthesisEvents).toHaveLength(1);
     expect(synthesisEvents[0].completedTasks).toHaveLength(2);
@@ -715,7 +717,7 @@ describe('Review Loop â€” Escalation', () => {
     expect(events['review:escalated']![0]!.escalationReport).toContain('dependency injection');
   });
 
-  it('returns task to in_progress after escalation for final attempt', async () => {
+  it('marks task completed after escalation (bypasses review loop)', async () => {
     const { manager, events } = createWiredSystem({
       maxCycles: 1,
       callbackOverrides: {
@@ -727,9 +729,9 @@ describe('Review Loop â€” Escalation', () => {
     manager.updateTaskStatus(team.id, tasks[0]!.id, 'completed', workerA.id);
     await vi.waitFor(() => expect(events['review:escalated']).toHaveLength(1));
 
-    // Task should be back in in_progress (one more chance with escalation advice)
+    // Task should be completed after escalation (bypasses review loop)
     const task = manager.getTasks(team.id).find(t => t.id === tasks[0]!.id);
-    expect(task?.status).toBe('in_progress');
+    expect(task?.status).toBe('completed');
   });
 
   it('includes escalation warning in penultimate cycle failure report', async () => {
@@ -767,10 +769,10 @@ describe('Review Loop â€” Escalation', () => {
     manager.updateTaskStatus(team.id, tasks[0]!.id, 'completed', workerA.id);
     await vi.waitFor(() => expect(events['review:escalated']).toHaveLength(1));
 
-    // Should fallback to default message
-    const feedback = (callbacks.sendFeedback as any).mock.calls[0][2];
-    expect(feedback).toContain('ESCALATED');
-    expect(feedback).toContain('manual review required');
+    // Should fallback to default message in the escalation report
+    const escalationReport = events['review:escalated']![0]!.escalationReport;
+    expect(escalationReport).toContain('failed');
+    expect(escalationReport).toContain('manual review required');
   });
 });
 
@@ -844,12 +846,12 @@ describe('Health Monitor Integration', () => {
 
     monitor.startMonitoring('team-1');
 
-    // Record 5 identical tool calls
+    // Record 5 identical tool calls (use a non-research tool)
     for (let i = 0; i < 5; i++) {
       monitor.recordActivity('team-1', 'mate-1', 'Worker A', {
         type: 'tool_call',
-        toolName: 'Read',
-        toolInput: '/src/app.ts',
+        toolName: 'Bash',
+        toolInput: 'echo test',
       });
     }
 
@@ -857,7 +859,7 @@ describe('Health Monitor Integration', () => {
 
     expect(issues).toHaveLength(1);
     expect(issues[0].type).toBe('retry-storm');
-    expect(issues[0].details).toContain('5 similar calls to "Read"');
+    expect(issues[0].details).toContain('5 similar calls to "Bash"');
   });
 
   it('detects context exhaustion above threshold', () => {

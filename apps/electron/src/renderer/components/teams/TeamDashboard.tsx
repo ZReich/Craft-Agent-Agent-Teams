@@ -22,6 +22,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
+import { stripMarkdown } from '@/utils/text'
 import { sessionMetaMapAtom } from '@/atoms/sessions'
 import type { SessionMeta } from '@/atoms/sessions'
 import type {
@@ -38,6 +39,7 @@ import type {
   ModelPresetId,
   YoloState,
   TeamPhase,
+  HeartbeatSnapshot,
 } from '../../../shared/types'
 
 import { TeamHeader } from './TeamHeader'
@@ -55,20 +57,45 @@ import { SpecChecklistModal } from './SpecChecklistModal'
 import { useTeamStateSync } from '@/hooks/useTeamEvents'
 import { ToolActivityIndicator } from './ToolActivityIndicator'
 import type { ToolActivity } from './ToolActivityIndicator'
+import { TeamCompletionBanner } from './TeamCompletionBanner'
+
+const MODEL_NAMES: Record<string, string> = {
+  'claude-opus-4-6': 'Opus 4.6',
+  'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
+  'claude-haiku-4-5-20251001': 'Haiku 4.5',
+  'kimi-k2.5': 'Kimi K2.5',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
+}
 
 const MAX_REALTIME_MESSAGES = 2000
 const MAX_REALTIME_ACTIVITY = 1500
 const MAX_TOOL_ACTIVITIES_PER_TEAMMATE = 5
 const MAX_HEALTH_ISSUES_PER_TEAMMATE = 3
 
+const TEMPLATE_REQUIREMENT_SNIPPETS = [
+  'define the primary user flow',
+  'document data inputs/outputs',
+  'outline performance, reliability, and security expectations',
+]
+
 interface TeammateHealthIssue {
   issueType: 'stall' | 'error-loop' | 'retry-storm' | 'context-exhaustion'
   details: string
   timestamp: string
 }
+interface TeamKnowledgeEntry {
+  id: string
+  type: string
+  content: string
+  source: string
+  filePaths?: string[]
+  tags: string[]
+  timestamp: number
+}
 const EMPTY_TASKS: TeamTask[] = []
 const EMPTY_MESSAGES: TeammateMessage[] = []
 const EMPTY_ACTIVITY: TeamActivityEvent[] = []
+type StructuredKnowledgeTelemetry = NonNullable<TeamActivityEvent['telemetry']>
 
 /**
  * Derive an AgentTeammateStatus from a teammate's SessionMeta
@@ -188,7 +215,7 @@ export function TeamDashboard({
   const [viewMode, setViewMode] = useState<'overview' | 'focus'>('overview')
   const [selectedTeammateId, setSelectedTeammateId] = useState<string | undefined>()
   const [taskListCollapsed, setTaskListCollapsed] = useState(true)
-  const [activeTab, setActiveTab] = useState<'teammate' | 'activity' | 'spec-coverage' | 'traceability'>('teammate')
+  const [activeTab, setActiveTab] = useState<'teammate' | 'activity' | 'spec-coverage' | 'traceability' | 'knowledge'>('teammate')
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [checklistOpen, setChecklistOpen] = useState(false)
   const [compactSidebarMode, setCompactSidebarMode] = useState(false)
@@ -202,10 +229,14 @@ export function TeamDashboard({
   const [realtimeMessages, setRealtimeMessages] = useState<TeammateMessage[]>(messages)
   const [realtimeTasks, setRealtimeTasks] = useState<TeamTask[]>(tasks)
   const [realtimeActivity, setRealtimeActivity] = useState<TeamActivityEvent[]>(activityEvents)
+  const [realtimeKnowledge, setRealtimeKnowledge] = useState<TeamKnowledgeEntry[]>([])
   const [realtimeToolActivity, setRealtimeToolActivity] = useState<Record<string, ToolActivity[]>>({})
   const [realtimeHealthIssues, setRealtimeHealthIssues] = useState<Record<string, TeammateHealthIssue[]>>({})
   const [yoloState, setYoloState] = useState<YoloState | null>(null)
   const [yoloPhases, setYoloPhases] = useState<TeamPhase[]>([])
+  const [completionBannerDismissed, setCompletionBannerDismissed] = useState(false)
+  // REQ-HB-001: Live heartbeat snapshots per teammate
+  const [heartbeatByTeammate, setHeartbeatByTeammate] = useState<Record<string, HeartbeatSnapshot>>({})
 
   // Read teammate session metadata from Jotai atoms
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
@@ -294,6 +325,18 @@ export function TeamDashboard({
           setYoloPhases(event.payload.phases)
         }
       },
+      // REQ-HB-001: Update per-teammate heartbeat snapshots
+      onHeartbeatBatch: (event) => {
+        const heartbeats = event.payload.heartbeats
+        if (!heartbeats?.length) return
+        setHeartbeatByTeammate((prev) => {
+          const next = { ...prev }
+          for (const hb of heartbeats) {
+            next[hb.teammateId] = hb
+          }
+          return next
+        })
+      },
     },
     {
       // Don't use mock mode in production
@@ -323,32 +366,69 @@ export function TeamDashboard({
     window.electronAPI.getPersistedTeamState(session.id)
       .then((state) => {
         if (cancelled || !state) return
-        if (state.messages?.length) {
+        // BUG-013 fix: Check cancelled before EACH state update to prevent unmounted updates
+        if (state.messages?.length && !cancelled) {
           setRealtimeMessages((prev) => {
-            // Merge: persisted first, then any live messages already received
             const existingIds = new Set(prev.map(m => m.id))
+            // BUG-016 fix: Sort by timestamp before capping to keep newest messages
             const merged = [...state.messages.filter(m => !existingIds.has(m.id)), ...prev]
+            merged.sort((a, b) => (a.timestamp ?? '').localeCompare(b.timestamp ?? ''))
             return merged.slice(-MAX_REALTIME_MESSAGES)
           })
         }
-        if (state.tasks?.length) {
+        if (state.tasks?.length && !cancelled) {
           setRealtimeTasks((prev) => {
             const existingIds = new Set(prev.map(t => t.id))
             const merged = [...state.tasks.filter(t => !existingIds.has(t.id)), ...prev]
             return merged
           })
         }
-        if (state.activity?.length) {
+        if (state.activity?.length && !cancelled) {
           setRealtimeActivity((prev) => {
             const existingIds = new Set(prev.map(a => a.id))
             const merged = [...state.activity.filter(a => !existingIds.has(a.id)), ...prev]
             return merged.slice(-MAX_REALTIME_ACTIVITY)
           })
         }
+        if (state.knowledge?.length && !cancelled) {
+          const knowledge = state.knowledge ?? []
+          setRealtimeKnowledge((prev) => {
+            const existingIds = new Set(prev.map(k => k.id))
+            const merged = [...knowledge.filter(k => !existingIds.has(k.id)), ...prev]
+            return merged
+              .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
+              .slice(0, 200)
+          })
+        }
       })
       .catch(() => { /* no persisted state — first-time team */ })
     return () => { cancelled = true }
   }, [session.id])
+
+  // Refresh memory entries periodically when viewing the Knowledge tab.
+  useEffect(() => {
+    if (workspaceSettings?.agentTeamsKnowledgeMetricsUiEnabled === false) return
+    if (activeTab !== 'knowledge') return
+    if (!window.electronAPI?.getPersistedTeamState) return
+    let cancelled = false
+    const load = async () => {
+      const state = await window.electronAPI.getPersistedTeamState(session.id)
+      if (cancelled || !state?.knowledge) return
+      const knowledge = state.knowledge ?? []
+      setRealtimeKnowledge(
+        knowledge
+          .slice()
+          .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
+          .slice(0, 200),
+      )
+    }
+    void load()
+    const timer = setInterval(() => { void load() }, 12_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [activeTab, session.id, workspaceSettings?.agentTeamsKnowledgeMetricsUiEnabled])
 
   // Sync realtime state with props when they change
   useEffect(() => {
@@ -377,6 +457,99 @@ export function TeamDashboard({
       cancelled = true
     }
   }, [session.workspaceId])
+
+  // Implements REQ-004 (spec clarity): explicitly detect untouched template specs.
+  // Check description text only — status may have been overridden by compliance
+  // report scanning (codebase refs to REQ-001/002/003 produce false "partial"
+  // coverage which changes status from 'pending' to 'in-progress').
+  const specIsDraft = useMemo(() => {
+    if (!specModeEnabled || specRequirements.length === 0) return false
+    const templateMatchCount = specRequirements.filter((req) => {
+      const normalized = req.description.toLowerCase()
+      return TEMPLATE_REQUIREMENT_SNIPPETS.some(snippet => normalized.includes(snippet))
+    }).length
+    return templateMatchCount === specRequirements.length
+  }, [specModeEnabled, specRequirements])
+
+  // Implements BUG-2: derive spec coverage percentage from requirements data
+  const specCoveragePercent = useMemo(() => {
+    if (!specModeEnabled || specRequirements.length === 0) return undefined
+    if (specIsDraft) return undefined
+
+    const verified = specRequirements.filter(r => r.status === 'verified').length
+    const implemented = specRequirements.filter(r => r.status === 'implemented').length
+    const inProgress = specRequirements.filter(r => r.status === 'in-progress').length
+    return Math.round(((verified + implemented * 0.75 + inProgress * 0.25) / specRequirements.length) * 100)
+  }, [specModeEnabled, specRequirements, specIsDraft])
+
+  const knowledgeHealth = useMemo(() => {
+    const now = Date.now()
+    const staleCutoff = now - (24 * 60 * 60 * 1000)
+    const previousWindowStart = now - (48 * 60 * 60 * 1000)
+
+    const total = realtimeKnowledge.length
+    const stale = realtimeKnowledge.filter((entry) => (entry.timestamp ?? 0) < staleCutoff).length
+    const stalePct = total > 0 ? Math.round((stale / total) * 100) : 0
+    const conflicts24h = realtimeKnowledge.filter((entry) =>
+      entry.type === 'warning'
+      && (entry.tags || []).some((tag) => tag.toLowerCase().includes('conflict'))
+      && (entry.timestamp ?? 0) >= staleCutoff
+    ).length
+    const conflictsPrev24h = realtimeKnowledge.filter((entry) =>
+      entry.type === 'warning'
+      && (entry.tags || []).some((tag) => tag.toLowerCase().includes('conflict'))
+      && (entry.timestamp ?? 0) < staleCutoff
+      && (entry.timestamp ?? 0) >= previousWindowStart
+    ).length
+
+    let injectionHits = 0
+    let injectionMisses = 0
+    let queryCount = 0
+    for (const event of realtimeActivity) {
+      const telemetry = event.telemetry as StructuredKnowledgeTelemetry | undefined
+      if (telemetry?.channel === 'knowledge') {
+        if (telemetry.operation === 'inject' && !telemetry.suppressed) {
+          if (telemetry.hit) injectionHits += 1
+          else injectionMisses += 1
+        }
+        if (telemetry.operation === 'query') {
+          queryCount += 1
+        }
+        continue
+      }
+      if (event.details?.includes('[KnowledgeBus][inject]')) {
+        if (event.details.includes('hit')) injectionHits += 1
+        else if (event.details.includes('miss')) injectionMisses += 1
+      }
+      if (event.details?.includes('[KnowledgeBus][query]')) {
+        queryCount += 1
+      }
+    }
+
+    const injectionHitRate = (injectionHits + injectionMisses) > 0
+      ? Math.round((injectionHits / (injectionHits + injectionMisses)) * 100)
+      : null
+
+    return {
+      total,
+      stale,
+      stalePct,
+      conflicts24h,
+      conflictsPrev24h,
+      injectionHitRate,
+      queryCount,
+    }
+  }, [realtimeKnowledge, realtimeActivity])
+
+  // Implements BUG-6: check if YOLO is enabled in workspace settings
+  const yoloEnabled = workspaceSettings?.yoloMode !== undefined && workspaceSettings.yoloMode !== 'off'
+  const knowledgeMetricsUiEnabled = workspaceSettings?.agentTeamsKnowledgeMetricsUiEnabled !== false
+
+  useEffect(() => {
+    if (!knowledgeMetricsUiEnabled && activeTab === 'knowledge') {
+      setActiveTab('teammate')
+    }
+  }, [knowledgeMetricsUiEnabled, activeTab])
 
   // Implements REQ-004: gate team creation when SDD is enabled without an active spec
   const sddBlocked = specModeEnabled && !session.activeSpecId
@@ -503,11 +676,6 @@ export function TeamDashboard({
     })
     return counts
   }, [realtimeTasks])
-  const specCoveragePercent = useMemo(() => {
-    if (specRequirements.length === 0) return 0
-    const fullyCovered = specRequirements.filter(r => (r.linkedTaskIds?.length || 0) > 0 && (r.linkedTestPatterns?.length || 0) > 0).length
-    return Math.round((fullyCovered / specRequirements.length) * 100)
-  }, [specRequirements])
 
   const compactRecentActivity = useMemo(() => realtimeActivity.slice(-5).reverse(), [realtimeActivity])
   const recentMessagesByTeammate = useMemo(() => {
@@ -594,16 +762,30 @@ export function TeamDashboard({
         onStopAllWorkers={onShutdownTeammate ? handleStopAllWorkers : undefined}
         specModeEnabled={specModeEnabled}
         specLabel={specLabel}
+        specCoveragePercent={specCoveragePercent}
+        specIsDraft={specIsDraft}
         isCompactSidebarMode={compactSidebarMode}
         onToggleCompactSidebarMode={() => {
           setCompactSidebarMode(prev => !prev)
           setCompactSidebarExpanded(false)
         }}
         yoloState={yoloState}
-        onYoloStart={handleYoloStart}
-        onYoloPause={handleYoloPause}
-        onYoloAbort={handleYoloAbort}
+        onYoloStart={yoloEnabled ? handleYoloStart : undefined}
+        onYoloPause={yoloEnabled ? handleYoloPause : undefined}
+        onYoloAbort={yoloEnabled ? handleYoloAbort : undefined}
       />
+
+      {/* REQ-UX-002: Completion banner when team is done */}
+      {team.status === 'completed' && !completionBannerDismissed && (
+        <TeamCompletionBanner
+          team={team}
+          tasks={realtimeTasks}
+          cost={cost}
+          specCoveragePercent={specCoveragePercent}
+          onDismiss={() => setCompletionBannerDismissed(true)}
+          className="mx-4 mt-3"
+        />
+      )}
 
       <div className="flex items-center justify-between px-4 py-2 border-b border-border">
         <p className="text-sm text-muted-foreground">
@@ -643,6 +825,7 @@ export function TeamDashboard({
               const draft = quickReplyByTeammate[teammate.id] ?? ''
               const toolActivities = realtimeToolActivity[teammate.id] ?? []
               const healthIssues = realtimeHealthIssues[teammate.id] ?? []
+              const heartbeat = heartbeatByTeammate[teammate.id]
               return (
                 <div
                   key={teammate.id}
@@ -666,7 +849,7 @@ export function TeamDashboard({
                       <div className="min-w-0">
                         <h3 className="text-sm font-semibold truncate">{teammate.name}</h3>
                         <p className="text-[11px] text-muted-foreground truncate capitalize">
-                          {teammate.role} • {teammate.model}
+                          {teammate.role} • {MODEL_NAMES[teammate.model] || teammate.model}
                         </p>
                       </div>
                       <div className="flex items-center gap-1.5">
@@ -693,6 +876,24 @@ export function TeamDashboard({
                       </div>
                     </div>
                     <p className="mt-2 text-[11px] text-muted-foreground">{activeCount} active tasks</p>
+                    {/* REQ-HB-001: Heartbeat activity summary */}
+                    {heartbeat && (
+                      <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+                        <span className={cn(
+                          'w-1.5 h-1.5 rounded-full shrink-0',
+                          heartbeat.appearsStalled ? 'bg-destructive' : 'bg-success animate-pulse'
+                        )} />
+                        <span className="truncate">{heartbeat.activitySummary}</span>
+                        {heartbeat.contextUsage != null && (
+                          <span className={cn(
+                            'ml-auto shrink-0 tabular-nums',
+                            heartbeat.contextUsage >= 0.7 ? 'text-destructive' : ''
+                          )}>
+                            Ctx {Math.round(heartbeat.contextUsage * 100)}%
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </button>
 
                   {/* Live tool activity feed */}
@@ -728,7 +929,7 @@ export function TeamDashboard({
                             <span className="font-medium text-foreground/85 mr-1">
                               {isFromTeammate ? teammate.name : msg.from === 'user' ? 'You' : msg.from}:
                             </span>
-                            <span className="text-muted-foreground">{msg.content.slice(0, 90)}</span>
+                            <span className="text-muted-foreground">{stripMarkdown(msg.content).slice(0, 90)}</span>
                           </div>
                         )
                       })
@@ -777,7 +978,7 @@ export function TeamDashboard({
               model: t.model,
             }))}
             activeTasks={tasks.filter(task => task.status === 'in_progress').length}
-            specCoverage={specCoveragePercent}
+            specCoverage={specCoveragePercent ?? 0}
             recentActivity={compactRecentActivity}
             isExpanded={compactSidebarExpanded}
             onToggleExpand={() => setCompactSidebarExpanded(prev => !prev)}
@@ -850,6 +1051,20 @@ export function TeamDashboard({
               <GitBranch className="size-3" />
               Traceability
             </button>
+            {knowledgeMetricsUiEnabled && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('knowledge')}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
+                  activeTab === 'knowledge'
+                    ? 'bg-foreground/5 text-foreground'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-foreground/[0.03]'
+                )}
+              >
+                Knowledge
+              </button>
+            )}
           </div>
 
           {/* Content */}
@@ -880,22 +1095,108 @@ export function TeamDashboard({
             ) : activeTab === 'activity' ? (
               <TeamActivityFeed events={realtimeActivity} />
             ) : activeTab === 'spec-coverage' ? (
-              <SpecCoveragePanel
-                requirements={specRequirements}
-                className="h-full"
-                onRequirementStatusChange={onSpecRequirementStatusChange}
-                onRequirementClick={(requirementId) => {
-                  const matchingRequirement = specRequirements.find((req) => req.id === requirementId)
-                  setHighlightedTaskIds(matchingRequirement?.linkedTaskIds || [])
-                  setTaskListCollapsed(false)
-                  onSpecRequirementClick?.(requirementId)
-                }}
-              />
+              specIsDraft ? (
+                <div className="flex items-center justify-center h-full text-muted-foreground">
+                  <div className="text-center space-y-2 max-w-xs">
+                    <AlertTriangle className="size-5 mx-auto text-yellow-500" />
+                    <p className="text-sm font-medium">Template Spec</p>
+                    <p className="text-xs">Edit the spec file to replace the default template requirements before coverage tracking begins.</p>
+                  </div>
+                </div>
+              ) : (
+                <SpecCoveragePanel
+                  requirements={specRequirements}
+                  className="h-full"
+                  onRequirementStatusChange={onSpecRequirementStatusChange}
+                  onRequirementClick={(requirementId) => {
+                    const matchingRequirement = specRequirements.find((req) => req.id === requirementId)
+                    setHighlightedTaskIds(matchingRequirement?.linkedTaskIds || [])
+                    setTaskListCollapsed(false)
+                    onSpecRequirementClick?.(requirementId)
+                  }}
+                />
+              )
             ) : activeTab === 'traceability' ? (
-              <SpecTraceabilityPanel
-                traceabilityMap={specTraceabilityMap}
-                className="h-full"
-              />
+              specIsDraft ? (
+                <div className="flex items-center justify-center h-full text-muted-foreground">
+                  <div className="text-center space-y-2 max-w-xs">
+                    <AlertTriangle className="size-5 mx-auto text-yellow-500" />
+                    <p className="text-sm font-medium">Template Spec</p>
+                    <p className="text-xs">Traceability data will appear once the spec contains real requirements.</p>
+                  </div>
+                </div>
+              ) : (
+                <SpecTraceabilityPanel
+                  traceabilityMap={specTraceabilityMap}
+                  specRequirementIds={specRequirements.map((req) => req.id)}
+                  className="h-full"
+                />
+              )
+            ) : activeTab === 'knowledge' ? (
+              <div className="h-full p-3">
+                <div className="rounded-lg border border-border bg-background/40 h-full flex flex-col min-h-0">
+                  <div className="px-3 py-2 border-b border-border">
+                    <h3 className="text-sm font-semibold">Team Knowledge Bus</h3>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Recent shared memory entries captured from team execution.
+                    </p>
+                    <div className="mt-2 grid grid-cols-2 lg:grid-cols-4 gap-2">
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Entries</p>
+                        <p className="text-xs font-semibold">{knowledgeHealth.total}</p>
+                      </div>
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Stale (&gt;24h)</p>
+                        <p className="text-xs font-semibold">{knowledgeHealth.stale} ({knowledgeHealth.stalePct}%)</p>
+                      </div>
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Inject hit rate</p>
+                        <p className="text-xs font-semibold">
+                          {knowledgeHealth.injectionHitRate == null ? 'N/A' : `${knowledgeHealth.injectionHitRate}%`}
+                        </p>
+                      </div>
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Conflicts (24h)</p>
+                        <p className="text-xs font-semibold">
+                          {knowledgeHealth.conflicts24h}
+                          <span className="text-muted-foreground font-normal"> (prev: {knowledgeHealth.conflictsPrev24h})</span>
+                        </p>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      Query events observed: {knowledgeHealth.queryCount}
+                    </p>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-auto p-2 space-y-2">
+                    {realtimeKnowledge.length === 0 ? (
+                      <p className="text-xs text-muted-foreground px-1">No knowledge entries captured yet.</p>
+                    ) : (
+                      realtimeKnowledge.map((entry) => (
+                        <div key={entry.id} className="rounded-md border border-border/70 p-2 bg-background/70">
+                          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <span className="font-medium text-foreground/80">{entry.type}</span>
+                            <span>•</span>
+                            <span>{entry.source}</span>
+                            <span>•</span>
+                            <span>{new Date(entry.timestamp).toLocaleString()}</span>
+                          </div>
+                          <p className="text-xs mt-1 whitespace-pre-wrap">{entry.content}</p>
+                          {entry.filePaths && entry.filePaths.length > 0 && (
+                            <p className="text-[11px] text-muted-foreground mt-1">
+                              Files: {entry.filePaths.slice(0, 3).join(', ')}
+                            </p>
+                          )}
+                          {entry.tags.length > 0 && (
+                            <p className="text-[11px] text-muted-foreground mt-0.5">
+                              Tags: {entry.tags.slice(0, 8).join(', ')}
+                            </p>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
                 <p className="text-sm">Select a teammate</p>
@@ -922,7 +1223,7 @@ export function TeamDashboard({
           open={checklistOpen}
           onOpenChange={setChecklistOpen}
           requirements={specRequirements}
-          coveragePercent={specCoveragePercent}
+          coveragePercent={specCoveragePercent ?? 0}
           onConfirmComplete={() => {
             setChecklistOpen(false)
             onCompleteTeam?.()

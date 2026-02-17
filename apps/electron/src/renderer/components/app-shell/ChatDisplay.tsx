@@ -195,6 +195,10 @@ interface ChatDisplayProps {
   yoloModeEnabled?: boolean
   /** Callback when YOLO Mode toggle changes */
   onYoloModeChange?: (enabled: boolean) => void
+  /** Whether Design Flow is enabled for this session */
+  designFlowEnabled?: boolean
+  /** Callback when Design Flow toggle changes */
+  onDesignFlowChange?: (enabled: boolean) => void
 }
 
 /**
@@ -354,6 +358,10 @@ function ProcessingIndicator({ startTime, statusMessage }: ProcessingIndicatorPr
 /**
  * Scrolls to target element on mount, before browser paint.
  * Uses useLayoutEffect to ensure scroll happens before content is visible.
+ *
+ * IMPORTANT: Only fires ONCE per mount. Uses a ref to prevent re-firing
+ * when props change (e.g. onScroll callback identity), which was causing
+ * the scroll to snap back to bottom on every React re-render.
  */
 function ScrollOnMount({
   targetRef,
@@ -364,17 +372,25 @@ function ScrollOnMount({
   onScroll?: () => void
   skip?: boolean
 }) {
+  const hasScrolledRef = React.useRef(false)
+  // Store onScroll in a ref so the effect doesn't depend on its identity
+  const onScrollRef = React.useRef(onScroll)
+  onScrollRef.current = onScroll
+
   React.useLayoutEffect(() => {
+    // Only scroll once per mount — prevent re-firing on prop changes
+    if (hasScrolledRef.current) return
     if (skip) return
+    hasScrolledRef.current = true
     targetRef.current?.scrollIntoView({ behavior: 'instant' })
-    onScroll?.()
+    onScrollRef.current?.()
     // Fallback: retry after layout settles (covers ScrollArea viewport init timing
     // when component remounts, e.g. switching back from Team Dashboard)
     const rafId = requestAnimationFrame(() => {
       targetRef.current?.scrollIntoView({ behavior: 'instant' })
     })
     return () => cancelAnimationFrame(rafId)
-  }, [skip, onScroll, targetRef])
+  }, [skip, targetRef])
   return null
 }
 
@@ -450,6 +466,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   onAgentTeamsChange,
   yoloModeEnabled = false,
   onYoloModeChange,
+  designFlowEnabled = false,
+  onDesignFlowChange,
 }, ref) {
   // Input is only disabled when explicitly disabled (e.g., agent needs activation)
   // User can type during streaming - submitting will stop the stream and send
@@ -462,6 +480,9 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   const [visibleTurnCount, setVisibleTurnCount] = React.useState(TURNS_PER_PAGE)
   // Sticky-bottom: When true, auto-scroll on content changes. Toggled by user scroll behavior.
   const isStickToBottomRef = React.useRef(true)
+  // Implements REQ-001: Track scroll direction to prevent false re-anchoring from layout shifts
+  const lastScrollTopRef = React.useRef(0)
+  const userScrolledUpRef = React.useRef(false)
   // Live-follow UI state: paused when user scrolls up, resumed when returning to bottom.
   const [isLiveFollowPaused, setIsLiveFollowPaused] = React.useState(false)
   const [unreadWhilePaused, setUnreadWhilePaused] = React.useState(0)
@@ -1094,18 +1115,34 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // - User scrolls up → unstick (stop auto-scrolling)
   // - User scrolls back to bottom → re-stick (resume auto-scrolling)
   // Also handles loading more turns when scrolling near top
+  // Implements REQ-001: Direction-aware scroll tracking prevents snap-back
   const handleScroll = React.useCallback(() => {
     const viewport = scrollViewportRef.current
     if (!viewport) return
     const { scrollTop, scrollHeight, clientHeight } = viewport
     const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-    // 20px threshold for "at bottom" detection
-    const isAtBottom = distanceFromBottom < 20
-    isStickToBottomRef.current = isAtBottom
-    if (isAtBottom) {
+    const scrollingDown = scrollTop > lastScrollTopRef.current
+    lastScrollTopRef.current = scrollTop
+
+    // 150px threshold — much more forgiving than the old 20px
+    const isNearBottom = distanceFromBottom < 150
+
+    // User explicitly scrolled UP past threshold — mark as "scrolled away"
+    if (!scrollingDown && distanceFromBottom > 150) {
+      userScrolledUpRef.current = true
+      isStickToBottomRef.current = false
+    }
+
+    // User scrolled DOWN back to near bottom — re-anchor
+    if (scrollingDown && isNearBottom) {
+      userScrolledUpRef.current = false
+      isStickToBottomRef.current = true
+    }
+
+    if (isNearBottom && !userScrolledUpRef.current) {
       setIsLiveFollowPaused(false)
       setUnreadWhilePaused(0)
-    } else if (distanceFromBottom > 120) {
+    } else if (distanceFromBottom > 150) {
       setIsLiveFollowPaused(true)
     }
 
@@ -1150,6 +1187,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     // On session switch: reset UI state (scroll handled by ScrollOnMount)
     if (isSessionSwitch) {
       isStickToBottomRef.current = true
+      userScrolledUpRef.current = false
+      lastScrollTopRef.current = 0
       setIsLiveFollowPaused(false)
       setUnreadWhilePaused(0)
       lastMessageCountRef.current = session?.messages.length ?? 0
@@ -1161,11 +1200,16 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
     const resizeObserver = new ResizeObserver(() => {
+      // REQ-001: Don't auto-scroll if user has explicitly scrolled up
+      if (userScrolledUpRef.current) return
       if (!isStickToBottomRef.current) return
 
       // Clear pending scroll and wait for layout to settle
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = setTimeout(() => {
+        // Re-check guards at resolution time — user may have scrolled up during the 200ms debounce
+        if (userScrolledUpRef.current) return
+        if (!isStickToBottomRef.current) return
         // Skip smooth scroll if we just did an instant scroll (session switch/lazy load)
         if (Date.now() < skipSmoothScrollUntilRef.current) return
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -1204,8 +1248,16 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
     lastMessageCountRef.current = messageCount
   }, [session?.id, session?.messages.length])
 
+  // Stable callback for ScrollOnMount — prevents useLayoutEffect re-fire on every render
+  const handleScrollOnMountComplete = React.useCallback(() => {
+    setIsLiveFollowPaused(false)
+    setUnreadWhilePaused(0)
+    skipSmoothScrollUntilRef.current = Date.now() + 500
+  }, [])
+
   const handleJumpToLive = React.useCallback(() => {
     isStickToBottomRef.current = true
+    userScrolledUpRef.current = false
     setIsLiveFollowPaused(false)
     setUnreadWhilePaused(0)
     skipSmoothScrollUntilRef.current = Date.now() + 300
@@ -1217,6 +1269,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   const handleSubmit = (message: string, attachments?: FileAttachment[], skillSlugs?: string[]) => {
     // Force stick-to-bottom when user sends a message
     isStickToBottomRef.current = true
+    userScrolledUpRef.current = false
     setIsLiveFollowPaused(false)
     setUnreadWhilePaused(0)
     onSendMessage(message, attachments, skillSlugs)
@@ -1353,11 +1406,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                   <ScrollOnMount
                     targetRef={messagesEndRef}
                     skip={skipScrollToBottom}
-                    onScroll={() => {
-                      setIsLiveFollowPaused(false)
-                      setUnreadWhilePaused(0)
-                      skipSmoothScrollUntilRef.current = Date.now() + 500
-                    }}
+                    onScroll={handleScrollOnMountComplete}
                   />
                   {/* Empty state for compact mode - inviting conversational prompt, centered in full popover */}
                   {compactMode && turns.length === 0 && (
@@ -1710,6 +1759,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
               onAgentTeamsChange={onAgentTeamsChange}
               yoloModeEnabled={yoloModeEnabled}
               onYoloModeChange={onYoloModeChange}
+              designFlowEnabled={designFlowEnabled}
+              onDesignFlowChange={onDesignFlowChange}
             />
           </div>
           </div>

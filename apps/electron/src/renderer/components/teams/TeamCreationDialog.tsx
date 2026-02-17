@@ -2,7 +2,7 @@
  * TeamCreationDialog
  *
  * Modal dialog for creating a new agent team.
- * Allows configuring team name, teammates (name, role, model), preset selection,
+ * Allows configuring team name, teammates (optional name, role), strategy selection,
  * and shows a live cost estimate.
  */
 
@@ -30,6 +30,24 @@ interface TeammateConfig {
   model: string
 }
 
+function normalizePresetForDialog(preset: ModelPresetId): ModelPresetId {
+  switch (preset) {
+    case 'max-quality':
+    case 'balanced':
+    case 'cost-optimized':
+      return 'smart'
+    case 'codex-balanced':
+    case 'codex-full':
+      return 'codex'
+    case 'budget':
+      return 'budget'
+    case 'custom':
+      return 'custom'
+    default:
+      return 'smart'
+  }
+}
+
 export interface TeamCreationDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -43,34 +61,32 @@ export interface TeamCreationDialogProps {
 }
 
 const PRESET_OPTIONS: { id: ModelPresetId; name: string; cost: string; description: string }[] = [
-  { id: 'cost-optimized', name: 'Cost Optimized', cost: '$$', description: 'Opus lead, Kimi workers' },
-  { id: 'balanced', name: 'Balanced', cost: '$$$', description: 'Opus lead, Sonnet workers' },
-  { id: 'max-quality', name: 'Max Quality', cost: '$$$$', description: 'Opus everywhere' },
-  { id: 'budget', name: 'Budget', cost: '$', description: 'Sonnet lead, Kimi workers' },
-  { id: 'codex-balanced', name: 'Codex Balanced', cost: '$$$', description: 'Codex lead/head, Sonnet workers' },
-  { id: 'codex-full', name: 'Codex Full', cost: '$$$$', description: 'Codex everywhere' },
+  { id: 'smart', name: 'Smart', cost: '$$$', description: 'Adaptive workers + auto thinking by role' },
+  { id: 'codex', name: 'Codex', cost: '$$$', description: 'Codex planning strategy with Claude execution' },
+  { id: 'budget', name: 'Budget', cost: '$', description: 'Lowest cost strategy' },
+  { id: 'custom', name: 'Custom', cost: '—', description: 'Use workspace custom role models' },
 ]
 
 const DEFAULT_TEAMMATES: TeammateConfig[] = [
-  { name: 'Head', role: 'head', model: 'auto' },
-  { name: 'Worker A', role: 'worker', model: 'auto' },
-  { name: 'Worker B', role: 'worker', model: 'auto' },
+  { name: '', role: 'head', model: 'auto' },
+  { name: '', role: 'worker', model: 'auto' },
+  { name: '', role: 'worker', model: 'auto' },
 ]
 
 export function TeamCreationDialog({
   open,
   onOpenChange,
-  defaultPreset = 'cost-optimized',
+  defaultPreset = 'smart',
   lockPresetSelection = false,
   onCreateTeam,
 }: TeamCreationDialogProps) {
   const [teamName, setTeamName] = useState('')
-  const [selectedPreset, setSelectedPreset] = useState<ModelPresetId>(defaultPreset)
+  const [selectedPreset, setSelectedPreset] = useState<ModelPresetId>(normalizePresetForDialog(defaultPreset))
   const [teammates, setTeammates] = useState<TeammateConfig[]>(DEFAULT_TEAMMATES)
 
   // Implements REQ-001: default preset to workspace settings when provided
   useEffect(() => {
-    setSelectedPreset(defaultPreset)
+    setSelectedPreset(normalizePresetForDialog(defaultPreset))
   }, [defaultPreset])
 
   const handleAddTeammate = useCallback(() => {
@@ -92,19 +108,25 @@ export function TeamCreationDialog({
 
   const costEstimate = useMemo(() => {
     const costMap: Record<ModelPresetId, number> = {
+      // New strategy presets
+      'smart': 7.5 + 3.75 * teammates.length,
+      'codex': 9.5 + 4.2 * teammates.length,
+      'budget': 2.25 + 1.425 * teammates.length,
+      'custom': 3.75 * teammates.length,
+      // Legacy presets (backward compatibility)
       'max-quality': 22.5 * teammates.length,
       'balanced': 7.5 + 3.75 * teammates.length,
       'cost-optimized': 7.5 + 1.425 * teammates.length,
-      'budget': 2.25 + 1.425 * teammates.length,
       'codex-balanced': 9.5 + 4.2 * teammates.length,
       'codex-full': 14 + 6.5 * teammates.length,
-      'custom': 3.75 * teammates.length,
     }
     return (costMap[selectedPreset] || 5).toFixed(2)
   }, [selectedPreset, teammates.length])
 
   const handleCreate = useCallback(() => {
-    const validTeammates = teammates.filter(t => t.name.trim())
+    const validTeammates = teammates
+      .filter(t => t.role.trim())
+      .map(t => ({ ...t, name: t.name.trim() }))
     if (validTeammates.length === 0) return
     onCreateTeam({
       name: teamName.trim() || 'Untitled Team',
@@ -114,7 +136,7 @@ export function TeamCreationDialog({
     // Reset
     setTeamName('')
     setTeammates(DEFAULT_TEAMMATES)
-    setSelectedPreset('cost-optimized')
+    setSelectedPreset('smart')
   }, [teamName, teammates, selectedPreset, onCreateTeam])
 
   return (
@@ -123,7 +145,7 @@ export function TeamCreationDialog({
         <DialogHeader>
           <DialogTitle>Create Agent Team</DialogTitle>
           <DialogDescription>
-            Configure your team of AI agents. The lead agent orchestrates, teammates execute tasks.
+            Configure your team of AI agents. The orchestrator coordinates, teammates execute tasks.
           </DialogDescription>
         </DialogHeader>
 
@@ -183,7 +205,7 @@ export function TeamCreationDialog({
                   <Input
                     value={teammate.name}
                     onChange={(e) => handleTeammateChange(index, 'name', e.target.value)}
-                    placeholder="Name"
+                    placeholder="Optional name (auto codename if blank)"
                     className="flex-1"
                   />
                   <Input

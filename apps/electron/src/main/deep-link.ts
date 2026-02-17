@@ -203,6 +203,11 @@ export function parseDeepLink(url: string): DeepLinkTarget | null {
  */
 function waitForWindowReady(window: BrowserWindow): Promise<void> {
   return new Promise((resolve) => {
+    // BUG-031 fix: Guard against destroyed window before registering listeners
+    if (window.isDestroyed() || window.webContents.isDestroyed()) {
+      resolve()
+      return
+    }
     if (window.webContents.isLoading()) {
       window.webContents.once('did-finish-load', () => {
         // TIMING NOTE: This 100ms delay allows React to mount and register

@@ -553,16 +553,26 @@ function readClipboardWindows(): FileAttachment[] {
 
     if (result !== 'no_files' && result.length > 0) {
       try {
-        // PowerShell returns single item as string, array as JSON array
-        const paths = result.startsWith('[') ? JSON.parse(result) : [result.replace(/^"|"$/g, '')];
+        // BUG-025 fix: Robust parsing of PowerShell clipboard output
+        // PowerShell returns single item as a quoted string, array as JSON array
+        let paths: string[];
+        if (result.startsWith('[')) {
+          const parsed = JSON.parse(result);
+          paths = Array.isArray(parsed) ? parsed.filter((p: unknown) => typeof p === 'string') : [];
+        } else {
+          // Single file path — strip surrounding quotes from PowerShell output
+          paths = [result.replace(/^"|"$/g, '').trim()];
+        }
         for (const filePath of paths) {
+          if (!filePath) continue;
           const attachment = readFileAttachment(filePath);
           if (attachment) {
             attachments.push(attachment);
           }
         }
-      } catch {
-        // JSON parse failed
+      } catch (parseErr) {
+        // BUG-025 fix: Log parse failure instead of silently swallowing
+        console.error('[Clipboard] Failed to parse PowerShell file list:', parseErr instanceof Error ? parseErr.message : parseErr);
       }
     }
   } catch {

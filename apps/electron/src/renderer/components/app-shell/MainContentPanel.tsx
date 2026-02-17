@@ -38,6 +38,51 @@ import { SourceInfoPage, ChatPage, FocusPage, AgentTeamsSettingsPage, UsageSetti
 import SkillInfoPage from '@/pages/SkillInfoPage'
 import { getSettingsPageComponent } from '@/pages/settings/settings-pages'
 
+// Implements REQ-004: Settings subpages (esp. Agent Teams) must not crash the app shell.
+class SettingsPageErrorBoundary extends React.Component<
+  { subpage: string; children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  componentDidCatch(error: Error) {
+    // Log loudly so the root cause is visible even when we render a fallback UI.
+    console.error(`[SettingsPageErrorBoundary] Settings page "${this.props.subpage}" crashed:`, error)
+  }
+
+  componentDidUpdate(prevProps: { subpage: string }) {
+    // Reset the boundary when the user switches to a different settings page.
+    if (prevProps.subpage !== this.props.subpage && this.state.error) {
+      // eslint-disable-next-line react/no-did-update-set-state
+      this.setState({ error: null })
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="h-full flex items-center justify-center">
+          <div className="max-w-xl px-6 py-8">
+            <div className="text-sm font-medium">This settings page crashed</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              Try selecting a different settings page. If this keeps happening, please check the app logs.
+            </div>
+            <pre className="mt-4 max-h-[240px] overflow-auto rounded-md bg-muted/40 p-3 text-[11px] leading-relaxed">
+              {String(this.state.error?.message || this.state.error)}
+            </pre>
+          </div>
+        </div>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
 export interface MainContentPanelProps {
   /** Whether the app is in focused mode (single chat, no sidebar) */
   isFocusedMode?: boolean
@@ -152,7 +197,9 @@ export function MainContentPanel({
     const SettingsPageComponent = getSettingsPageComponent(navState.subpage)
     return wrapWithStoplight(
       <Panel variant="grow" className={className}>
-        <SettingsPageComponent />
+        <SettingsPageErrorBoundary subpage={navState.subpage}>
+          <SettingsPageComponent />
+        </SettingsPageErrorBoundary>
       </Panel>
     )
   }

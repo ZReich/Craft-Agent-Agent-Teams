@@ -78,7 +78,7 @@ export interface SessionMenuProps {
   onUnarchive: () => void
   onMarkUnread: () => void
   onTodoStateChange: (state: TodoStateId) => void
-  onOpenInNewWindow: () => void
+  onOpenInNewWindow?: () => void
   onDelete: () => void
 }
 
@@ -334,10 +334,12 @@ export function SessionMenu({
       <Separator />
 
       {/* Open in New Window */}
-      <MenuItem onClick={onOpenInNewWindow}>
-        <AppWindow className="h-3.5 w-3.5" />
-        <span className="flex-1">Open in New Window</span>
-      </MenuItem>
+      {onOpenInNewWindow && (
+        <MenuItem onClick={onOpenInNewWindow}>
+          <AppWindow className="h-3.5 w-3.5" />
+          <span className="flex-1">Open in New Window</span>
+        </MenuItem>
+      )}
 
       {/* View in Finder */}
       <MenuItem onClick={handleShowInFinder}>

@@ -72,10 +72,13 @@ export type {
   TestStageResult,
   QualityGateResult,
   QualityGateStageConfig,
+  QualityGateBypassConfig,
+  QualityGateBypassOverrides,
   QualityGateConfig,
   TaskType,
   TDDPhase,
   TaskQualityReport,
+  KnowledgeTelemetryEvent,
   TeamActivityEvent,
   TeamActivityType,
   TeamCostSummary,
@@ -87,8 +90,16 @@ export type {
   SpecEvolutionProposal,
   // Phase types
   TeamPhase,
+  // Design Flow types (REQ-001, REQ-002, REQ-004, REQ-007, REQ-008)
+  ProjectStack,
+  DesignFlowConfig,
+  DesignVariantStatus,
+  DesignVariant,
+  DesignArtifact,
+  DesignMetadata,
+  DesignTemplate,
 } from './agent-teams.ts';
-export { DEFAULT_YOLO_CONFIG, CODE_TASK_TYPES, NON_CODE_TASK_TYPES, shouldSkipQualityGates } from './agent-teams.ts';
+export { DEFAULT_YOLO_CONFIG, CODE_TASK_TYPES, NON_CODE_TASK_TYPES, DEFAULT_DESIGN_FLOW_CONFIG, mergeDesignFlowConfig, normalizeTeamRole, TEAM_ROLE_DISPLAY } from './agent-teams.ts';
 
 // Team Dashboard View State types (Phase 1)
 export type {
@@ -132,6 +143,8 @@ export type {
   YoloStateChangedEvent,
   SynthesisRequestedEvent,
   TeamErrorEvent,
+  HeartbeatSnapshot,
+  HeartbeatBatchEvent,
   TeamEvent,
   TeamEventBatch,
 } from './team-events.ts';

@@ -1,0 +1,120 @@
+{
+  "feature": "Agent Teams Flow Validation",
+  "description": "Comprehensive test + fix cycle for the entire agent teams subsystem",
+  "generatedAt": "2026-02-16T21:26:00.000Z",
+  "completedAt": "2026-02-17T00:05:00.000Z",
+  "maxIterations": 30,
+  "currentIteration": 8,
+  "stories": [
+    {
+      "id": "story-001",
+      "title": "Tool Call Throttle — TCP Slow-Start & AIMD",
+      "description": "Tests for ToolCallThrottle: slow-start budget, diverse success doubling, ssthresh transition, backoff on similar calls, hard block, failure budget halving, reset, per-tool independence",
+      "category": "test",
+      "priority": 1,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"Tool Call Throttle\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-002",
+      "title": "Task Domain Routing — Classification, Routing, Spawn Strategy",
+      "description": "Tests for classifyTaskDomain, decideTeammateRouting (REQ-005 enforcement), decideSpawnStrategy (flat vs managed)",
+      "category": "test",
+      "priority": 2,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"Task Domain Routing\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-003",
+      "title": "Task Type Inference & QG Skip",
+      "description": "Tests for inferTaskType keyword matching and shouldSkipQualityGates logic",
+      "category": "test",
+      "priority": 3,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"Task Type Inference\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-004",
+      "title": "Team State Store — JSONL Persistence",
+      "description": "Tests for TeamStateStore: append/load messages, tasks, activity, QG results, YOLO state, compaction, malformed line handling",
+      "category": "test",
+      "priority": 4,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"Team State Store\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-005",
+      "title": "Activity Event Limits & Cost Tracking",
+      "description": "Tests for cost aggregation per teammate/model, cumulative usage, zero-cost default",
+      "category": "test",
+      "priority": 5,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"Activity Event Limits\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-006",
+      "title": "YOLO Orchestrator Lifecycle",
+      "description": "Tests for full YOLO lifecycle, abort, pause, integration failure handling",
+      "category": "test",
+      "priority": 6,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"YOLO Orchestrator\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-007",
+      "title": "Manager Lifecycle Edge Cases",
+      "description": "Tests for team resolution by name, evictAllTeamData, spec management, hydration idempotency",
+      "category": "test",
+      "priority": 7,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/agent-teams-flow.test.ts -t \"Manager Lifecycle\""
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-008",
+      "title": "Existing E2E Quality Orchestration",
+      "description": "Verify all existing e2e tests still pass (regression check)",
+      "category": "test",
+      "priority": 8,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/e2e-quality-orchestration.test.ts"
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-009",
+      "title": "Existing Health Monitor Tests",
+      "description": "Verify existing health monitor tests still pass",
+      "category": "test",
+      "priority": 9,
+      "verificationSteps": [
+        "Run: npx vitest run packages/shared/src/agent-teams/__tests__/health-monitor.test.ts"
+      ],
+      "passes": true
+    },
+    {
+      "id": "story-010",
+      "title": "TypeScript Compilation",
+      "description": "Ensure the shared package compiles without errors",
+      "category": "test",
+      "priority": 10,
+      "verificationSteps": [
+        "Run: cd packages/shared && npx tsc --noEmit"
+      ],
+      "passes": true
+    }
+  ]
+}

@@ -349,12 +349,24 @@ export class ConfigWatcher {
   private watchWorkspaceDir(): void {
     debug('[ConfigWatcher] Setting up workspace watcher for:', this.workspaceDir);
     try {
+      // Implements PERF-001: Filter noisy session file events before debug logging.
+      // During file-reading operations (audits, tool calls), Claude Code reads many
+      // files inside sessions/. Without this filter, every read triggers a watcher
+      // callback → debug log → debounce timer, creating a CPU storm.
       const watcher = watch(this.workspaceDir, { recursive: true }, (eventType, filename) => {
-        debug('[ConfigWatcher] RAW FILE EVENT:', eventType, filename);
         if (!filename) return;
 
         // Normalize path separators
         const normalizedPath = filename.replace(/\\/g, '/');
+
+        // Fast-path: skip session sub-paths that aren't session.jsonl.
+        // Only session.jsonl header changes are interesting (metadata edits).
+        // Everything else (tool results, attachments, plans, data) is noise.
+        if (normalizedPath.startsWith('sessions/') && !normalizedPath.endsWith('/session.jsonl')) {
+          return;
+        }
+
+        debug('[ConfigWatcher] File event:', eventType, normalizedPath);
         this.handleWorkspaceFileChange(normalizedPath, eventType);
       });
 

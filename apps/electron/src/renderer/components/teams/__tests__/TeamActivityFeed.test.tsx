@@ -36,7 +36,7 @@ describe('TeamActivityFeed', () => {
   it('shows YOLO lifecycle events in Tasks filter', () => {
     const events: TeamActivityEvent[] = [
       makeEvent({ id: '1', type: 'yolo-started', details: 'YOLO run started' }),
-      makeEvent({ id: '2', type: 'yolo-phase-changed', details: 'Phase changed to reviewing' }),
+      makeEvent({ id: '2', type: 'phase-advanced', details: 'Phase changed to reviewing' }),
       makeEvent({ id: '3', type: 'message-sent', details: 'Lead sent update' }),
     ]
 

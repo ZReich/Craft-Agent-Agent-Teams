@@ -49,6 +49,16 @@ export interface AgentTeamsConfig {
   reviewerModel?: string;
   /** Model ID for escalation handling */
   escalationModel?: string;
+  /** Whether extended thinking is enabled for the Lead role (Custom preset only) */
+  leadThinking?: boolean;
+  /** Whether extended thinking is enabled for the Head role (Custom preset only) */
+  headThinking?: boolean;
+  /** Whether extended thinking is enabled for the Worker role (Custom preset only) */
+  workerThinking?: boolean;
+  /** Whether extended thinking is enabled for the Reviewer role (Custom preset only) */
+  reviewerThinking?: boolean;
+  /** Whether extended thinking is enabled for the Escalation role (Custom preset only) */
+  escalationThinking?: boolean;
   /** Cost cap per session in USD (optional) */
   costCapUsd?: number;
   /** Auto-escalation: upgrade worker model after N failures */
@@ -57,6 +67,15 @@ export interface AgentTeamsConfig {
   qualityGates?: Partial<QualityGateConfig>;
   /** YOLO mode configuration — autonomous execution without manual intervention */
   yolo?: Partial<import('@craft-agent/core/types').YoloConfig>;
+  /** Design flow configuration — generate multiple UI design variants before coding (REQ-002) */
+  designFlow?: Partial<import('@craft-agent/core/types').DesignFlowConfig>;
+  /** Memory/knowledge runtime controls (REQ-008). */
+  memory?: {
+    /** Kill-switch for prompt-time shared-memory injection. Default: true */
+    injectionEnabled?: boolean;
+    /** Kill-switch for Team Dashboard Knowledge metrics surface. Default: true */
+    metricsUiEnabled?: boolean;
+  };
 }
 
 /**
@@ -87,6 +106,8 @@ export interface SDDWorkspaceConfig {
   requireFullCoverage?: boolean;
   /** Auto-generate compliance report artifacts on completion */
   autoGenerateComplianceReports?: boolean;
+  /** Currently active spec ID for the workspace (default for new sessions) */
+  activeSpecId?: string;
 }
 
 /**

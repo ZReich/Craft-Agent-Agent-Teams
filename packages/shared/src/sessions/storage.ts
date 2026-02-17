@@ -382,6 +382,7 @@ export function listSessions(workspaceRootPath: string): SessionMetadata[] {
   const entries = readdirSync(sessionsDir, { withFileTypes: true });
   span.mark('readdir');
   const sessions: SessionMetadata[] = [];
+  let skippedHeaders = 0;
 
   for (const entry of entries) {
     if (entry.isDirectory()) {
@@ -401,9 +402,18 @@ export function listSessions(workspaceRootPath: string): SessionMetadata[] {
         if (header) {
           const metadata = headerToMetadata(header, workspaceRootPath);
           if (metadata) sessions.push(metadata);
+        } else {
+          // Implements REQ-FIX-003: Log specific session ID for failed header reads
+          // so the issue is visible in logs (previously only a count was logged via debug).
+          console.warn(`[sessions] Failed to read header for session "${sessionId}" — possible oversized or corrupted header`);
+          skippedHeaders++;
         }
       }
     }
+  }
+
+  if (skippedHeaders > 0) {
+    debug(`[jsonl] Skipped ${skippedHeaders} sessions with unreadable headers`);
   }
   span.mark('parsed');
   span.setMetadata('count', sessions.length);
@@ -481,6 +491,7 @@ function headerToMetadata(header: SessionHeader, workspaceRootPath: string): Ses
       teammateName: header.teammateName,
       teammateSessionIds: header.teammateSessionIds,
       teamColor: header.teamColor,
+      teamStatus: header.teamStatus,
     };
   } catch (error) {
     debug(`[sessions] Failed to convert header to metadata for session "${header?.id}" in ${workspaceRootPath}:`, error);
@@ -611,6 +622,7 @@ export async function updateSessionMetadata(
     | 'sddComplianceReports'
     | 'isArchived'
     | 'archivedAt'
+    | 'teamStatus'
   >>
 ): Promise<void> {
   const session = loadSession(workspaceRootPath, sessionId);
@@ -636,6 +648,7 @@ export async function updateSessionMetadata(
   if (updates.sddComplianceReports !== undefined) session.sddComplianceReports = updates.sddComplianceReports;
   if (updates.isArchived !== undefined) session.isArchived = updates.isArchived;
   if ('archivedAt' in updates) session.archivedAt = updates.archivedAt;
+  if (updates.teamStatus !== undefined) session.teamStatus = updates.teamStatus;
 
   await saveSession(session);
 }

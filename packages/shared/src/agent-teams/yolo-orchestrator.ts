@@ -26,10 +26,32 @@ import type {
   TeamPhase,
   SpecEvolutionProposal,
   Spec,
+  DesignFlowConfig,
+  DesignVariant,
+  DesignArtifact,
+  ProjectStack,
 } from '@craft-agent/core/types';
-import { DEFAULT_YOLO_CONFIG } from '@craft-agent/core/types';
+import { DEFAULT_YOLO_CONFIG, DEFAULT_DESIGN_FLOW_CONFIG, mergeDesignFlowConfig } from '@craft-agent/core/types';
 import type { AgentTeamManager } from '../agent/agent-team-manager';
 import type { ReviewLoopOrchestrator } from './review-loop';
+import { classifyTaskDomain } from './routing-policy';
+import { selectArchitectureMode, type ArchitectureLearningHint } from './architecture-selector';
+
+// ============================================================
+// Conditional Head Spawning (REQ-P1)
+// ============================================================
+
+// Implements REQ-P1: Conditional Head spawning
+// Flat mode for simple single-domain teams, managed mode for complex multi-domain work
+
+export type SpawnStrategy =
+  | { mode: 'flat' }
+  | { mode: 'managed'; heads: DomainHeadPlan[] }
+
+export interface DomainHeadPlan {
+  domain: string
+  taskIds: string[]
+}
 
 // ============================================================
 // Callback Interface
@@ -67,6 +89,20 @@ export interface YoloCallbacks {
 
   /** Request approval for spec changes (smart mode, when requireApprovalForSpecChanges is true) */
   requestApproval?(teamId: string, proposals: SpecEvolutionProposal[]): Promise<SpecEvolutionProposal[]>;
+
+  // ── Design Flow Callbacks (REQ-003) ──────────────────────────
+
+  /** Detect the project's technology stack. Called during stack-detection phase. */
+  detectStack?(teamId: string, workingDir: string): Promise<ProjectStack>;
+
+  /** Generate design variants using Head-UX + Workers. Returns the generated variants. */
+  generateDesignVariants?(teamId: string, stack: ProjectStack, spec: Spec, count: number): Promise<DesignVariant[]>;
+
+  /**
+   * Present design variants to the user and wait for selection.
+   * Returns the selected variant ID, or 'regenerate' to generate more.
+   */
+  presentDesignVariants?(teamId: string, variants: DesignVariant[], round: number): Promise<string>;
 }
 
 // ============================================================
@@ -78,6 +114,9 @@ export class YoloOrchestrator extends EventEmitter {
   private teamId: string | null = null;
   private timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   private costCheckInterval: ReturnType<typeof setInterval> | null = null;
+  // Implements C2: Store poll timer refs so cleanup() can clear them
+  private pollTimerHandle: ReturnType<typeof setTimeout> | null = null;
+  private waitTimerHandle: ReturnType<typeof setTimeout> | null = null;
   private aborted = false;
   private boundHandlers: Array<{ event: string; handler: (...args: unknown[]) => void }> = [];
 
@@ -97,7 +136,7 @@ export class YoloOrchestrator extends EventEmitter {
    * Start an autonomous YOLO run for a team.
    * This is the main entry point — it drives the full lifecycle.
    */
-  async start(teamId: string, objective: string, config: Partial<YoloConfig> = {}): Promise<YoloState> {
+  async start(teamId: string, objective: string, config: Partial<YoloConfig> = {}, designFlowConfig?: Partial<DesignFlowConfig>): Promise<YoloState> {
     if (this.state && this.state.phase !== 'idle' && this.state.phase !== 'completed' && this.state.phase !== 'aborted') {
       throw new Error(`YOLO is already running (phase: ${this.state.phase})`);
     }
@@ -125,8 +164,10 @@ export class YoloOrchestrator extends EventEmitter {
 
     this.logActivity('yolo-started', `YOLO ${mergedConfig.mode} mode started — objective: "${objective.slice(0, 100)}"`);
 
+    const mergedDesignFlow = mergeDesignFlowConfig(designFlowConfig);
+
     try {
-      await this.runLifecycle(teamId, objective, mergedConfig);
+      await this.runLifecycle(teamId, objective, mergedConfig, mergedDesignFlow);
     } catch (err) {
       if (!this.aborted) {
         this.transition('aborted');
@@ -143,12 +184,15 @@ export class YoloOrchestrator extends EventEmitter {
 
   /**
    * Pause the YOLO run (can be resumed later).
+   * Implements PERF-002: Stops cost check interval and timeout during pause
+   * to eliminate idle CPU polling when the orchestrator is not executing.
    */
   pause(reason: YoloState['pauseReason'] = 'user-requested'): void {
     if (!this.state || this.state.phase === 'completed' || this.state.phase === 'aborted') return;
     this.state.pauseReason = reason;
     this.transition('paused');
     this.logActivity('yolo-paused', `YOLO paused: ${reason}`);
+    this.cleanup();
   }
 
   /**
@@ -187,7 +231,7 @@ export class YoloOrchestrator extends EventEmitter {
   // Core Lifecycle
   // ============================================================
 
-  private async runLifecycle(teamId: string, objective: string, config: YoloConfig): Promise<void> {
+  private async runLifecycle(teamId: string, objective: string, config: YoloConfig, designFlow: DesignFlowConfig = DEFAULT_DESIGN_FLOW_CONFIG): Promise<void> {
     // Phase 1: Generate spec
     this.transition('spec-generation');
     this.checkAborted();
@@ -217,6 +261,17 @@ export class YoloOrchestrator extends EventEmitter {
 
     // Build phases from task definitions (pass created tasks so IDs are populated)
     const phases = this.buildPhases(taskDefs, createdTasks);
+
+    // ── Design Flow Phases (REQ-003) ──────────────────────────
+    // When designFlow.enabled, inject stack-detection → design-generation → design-selection
+    // between task-decomposition and executing. Backend/research tasks can still run in parallel.
+    if (designFlow.enabled) {
+      const designArtifact = await this.runDesignFlow(teamId, spec, designFlow);
+      if (designArtifact && this.state) {
+        this.state.designArtifact = designArtifact;
+      }
+      if (this.aborted) return;
+    }
 
     // Phase 3: Execute (phase-aware)
     if (phases.length > 0) {
@@ -277,6 +332,100 @@ export class YoloOrchestrator extends EventEmitter {
     this.state!.completedAt = new Date().toISOString();
     this.transition('completed');
     this.logActivity('yolo-completed', `YOLO completed — ${createdTasks.length} tasks executed`);
+  }
+
+  // ============================================================
+  // Design Flow (REQ-003)
+  // ============================================================
+
+  /**
+   * Run the design flow: stack detection → variant generation → user selection.
+   * Supports multiple generation rounds (user can request "generate 4 more").
+   * Returns the selected DesignArtifact, or undefined if aborted.
+   */
+  private async runDesignFlow(
+    teamId: string,
+    spec: Spec,
+    designFlow: DesignFlowConfig,
+  ): Promise<DesignArtifact | undefined> {
+    // Step 1: Stack Detection
+    this.transition('stack-detection');
+    this.checkAborted();
+    this.logActivity('design-generation-started', 'Design flow started — detecting project stack');
+
+    if (!this.callbacks.detectStack) {
+      this.logActivity('error', 'Design flow enabled but detectStack callback not provided — skipping');
+      return undefined;
+    }
+
+    // Use the team manager's workspace root or fall back to cwd
+    const workingDir = process.cwd();
+    const stack = await this.callbacks.detectStack(teamId, workingDir);
+
+    if (!stack.framework) {
+      this.logActivity('error', 'Could not detect project framework — skipping design flow');
+      return undefined;
+    }
+
+    // Step 2: Design Generation (supports multiple rounds)
+    this.transition('design-generation');
+    this.checkAborted();
+
+    if (!this.callbacks.generateDesignVariants || !this.callbacks.presentDesignVariants) {
+      this.logActivity('error', 'Design flow callbacks not fully provided — skipping');
+      return undefined;
+    }
+
+    let allVariants: DesignVariant[] = [];
+    let round = 0;
+    let selectedVariantId: string | undefined;
+
+    while (!selectedVariantId) {
+      round++;
+      this.checkAborted();
+
+      this.logActivity('design-generation-started', `Generating ${designFlow.variantsPerRound} design variants (round ${round})`);
+      const variants = await this.callbacks.generateDesignVariants(teamId, stack, spec, designFlow.variantsPerRound);
+      allVariants.push(...variants);
+
+      // Mark each variant as ready
+      for (const v of variants) {
+        this.logActivity('design-variant-ready', `Design variant "${v.name}" ready (${v.status})`);
+      }
+
+      // Step 3: Design Selection
+      this.transition('design-selection');
+      this.checkAborted();
+
+      const selection = await this.callbacks.presentDesignVariants(teamId, allVariants, round);
+
+      if (selection === 'regenerate') {
+        // User wants more variants — loop back to generation
+        this.transition('design-generation');
+        continue;
+      }
+
+      selectedVariantId = selection;
+    }
+
+    // Build the design artifact from the selected variant
+    const selected = allVariants.find(v => v.id === selectedVariantId);
+    if (!selected) {
+      this.logActivity('error', `Selected variant ${selectedVariantId} not found`);
+      return undefined;
+    }
+
+    this.logActivity('design-selected', `Design "${selected.name}" selected — proceeding to implementation`);
+
+    return {
+      selectedVariantId: selected.id,
+      selectedVariantName: selected.name,
+      brief: selected.brief,
+      componentSpec: selected.componentSpec,
+      filePaths: selected.files.map(f => f.path),
+      projectStack: stack,
+      selectedAt: new Date().toISOString(),
+    };
   }
 
   // ============================================================
@@ -357,22 +506,98 @@ export class YoloOrchestrator extends EventEmitter {
    * Execute a flat list of tasks (no phase ordering).
    * Respects maxConcurrency by batching.
    */
+  /**
+   * Implements REQ-B2: Dependency-aware task execution.
+   * Tasks start as soon as their dependencies are satisfied, up to maxConcurrency.
+   * No longer blocks on entire batches — when one task finishes, the next ready
+   * task starts immediately.
+   */
   private async executeFlat(teamId: string, tasks: TeamTask[], config: YoloConfig): Promise<void> {
     this.transition('executing');
     this.checkAborted();
 
-    const taskIds = tasks.map(t => t.id);
+    if (tasks.length === 0) return;
 
-    // Spawn teammates and assign work in batches of maxConcurrency
-    const batches = this.chunk(taskIds, config.maxConcurrency);
+    const taskMap = new Map(tasks.map(t => [t.id, t]));
+    const terminalStatuses = new Set(['completed', 'failed']);
+    const inFlight = new Set<string>();
+    const completed = new Set<string>();
 
-    for (const batch of batches) {
-      this.checkAborted();
-      await this.callbacks.spawnAndAssign(teamId, batch);
+    /**
+     * A task is ready to run when all its dependencies are in the completed set
+     * and it hasn't started yet.
+     */
+    const getReadyTasks = (): string[] => {
+      const ready: string[] = [];
+      for (const task of tasks) {
+        if (inFlight.has(task.id) || completed.has(task.id)) continue;
+        const deps = task.dependencies ?? [];
+        const depsReady = deps.every(depId => completed.has(depId));
+        if (depsReady) ready.push(task.id);
+      }
+      return ready;
+    };
 
-      // Wait for all tasks in this batch to reach a terminal state
-      await this.waitForTasks(teamId, batch);
-    }
+    // Implements C2: Increased from 2s to 5s, store timer ref for cleanup
+    const POLL_INTERVAL = 5000;
+    const MAX_WAIT_MS = 30 * 60 * 1000;
+
+    return new Promise<void>((resolve) => {
+      const startTime = Date.now();
+
+      const tick = async (): Promise<void> => {
+        if (this.aborted) { resolve(); return; }
+        if (Date.now() - startTime > MAX_WAIT_MS) {
+          this.logActivity('yolo-paused', `Dependency-aware execution timed out after ${MAX_WAIT_MS / 60_000} minutes`);
+          resolve();
+          return;
+        }
+
+        // Check for newly completed tasks
+        const allTasks = this.teamManager.getTasks(teamId);
+        for (const t of allTasks) {
+          if (inFlight.has(t.id) && terminalStatuses.has(t.status)) {
+            inFlight.delete(t.id);
+            completed.add(t.id);
+          }
+        }
+
+        // All tasks done?
+        if (completed.size >= tasks.length) { resolve(); return; }
+
+        // Find tasks ready to start (dependencies satisfied + under concurrency limit)
+        const ready = getReadyTasks();
+        const slotsAvailable = config.maxConcurrency - inFlight.size;
+        const toSpawn = ready.slice(0, slotsAvailable);
+
+        if (toSpawn.length > 0) {
+          for (const taskId of toSpawn) {
+            inFlight.add(taskId);
+          }
+          try {
+            this.checkAborted();
+            await this.callbacks.spawnAndAssign(teamId, toSpawn);
+          } catch (err) {
+            // If spawn fails, remove from in-flight so they can be retried
+            for (const taskId of toSpawn) {
+              inFlight.delete(taskId);
+            }
+          }
+        }
+
+        // Check if we're stuck: no in-flight tasks and no ready tasks but not all done
+        if (inFlight.size === 0 && ready.length === 0 && completed.size < tasks.length) {
+          const stuck = tasks.filter(t => !completed.has(t.id));
+          this.logActivity('phase-blocked', `${stuck.length} tasks blocked by unsatisfied dependencies`);
+          resolve();
+          return;
+        }
+
+        this.pollTimerHandle = setTimeout(tick, POLL_INTERVAL);
+      };
+
+      void tick();
+    });
   }
 
   /**
@@ -381,7 +606,8 @@ export class YoloOrchestrator extends EventEmitter {
    * Times out after 30 minutes to prevent infinite hangs from stuck tasks.
    */
   private async waitForTasks(teamId: string, taskIds: string[]): Promise<void> {
-    const POLL_INTERVAL = 2000;
+    // Implements C2: Increased from 2s to 5s, store timer ref for cleanup
+    const POLL_INTERVAL = 5000;
     const MAX_WAIT_MS = 30 * 60 * 1000; // 30 minutes
     const terminalStatuses = new Set(['completed', 'failed']);
 
@@ -408,7 +634,7 @@ export class YoloOrchestrator extends EventEmitter {
         if (allDone || relevant.length === 0) {
           resolve();
         } else {
-          setTimeout(check, POLL_INTERVAL);
+          this.waitTimerHandle = setTimeout(check, POLL_INTERVAL);
         }
       };
 
@@ -421,6 +647,13 @@ export class YoloOrchestrator extends EventEmitter {
   // ============================================================
 
   private wireReviewEvents(): void {
+    // Implements C3: Clear any previously attached handlers before wiring new ones
+    // to prevent listener accumulation on YOLO restart without full cleanup.
+    for (const { event, handler } of this.boundHandlers) {
+      this.reviewLoop.off(event, handler);
+    }
+    this.boundHandlers = [];
+
     // When the review loop detects missing requirements, create remediation tasks
     const remediationHandler = (data: {
       teamId: string;
@@ -518,7 +751,7 @@ export class YoloOrchestrator extends EventEmitter {
         this.pause('cost-cap');
         this.logActivity('yolo-paused', `YOLO paused: cost cap $${costCapUsd.toFixed(2)} reached ($${cost.totalCostUsd.toFixed(2)} spent)`);
       }
-    }, 10_000); // Check every 10 seconds
+    }, 60_000); // Implements H2: Reduced from 10s to 60s to lower CPU overhead
   }
 
   // ============================================================
@@ -527,6 +760,8 @@ export class YoloOrchestrator extends EventEmitter {
 
   private transition(phase: YoloPhase): void {
     if (!this.state) return;
+    // Don't overwrite 'aborted' with a subsequent phase — abort is terminal
+    if (this.aborted && phase !== 'aborted') return;
     this.state.phase = phase;
     if (this.teamId) {
       // Deep copy to prevent consumers from mutating orchestrator state
@@ -603,12 +838,134 @@ export class YoloOrchestrator extends EventEmitter {
       clearInterval(this.costCheckInterval);
       this.costCheckInterval = null;
     }
+    // Implements C2: Clear poll timer refs that were previously leaked
+    if (this.pollTimerHandle) {
+      clearTimeout(this.pollTimerHandle);
+      this.pollTimerHandle = null;
+    }
+    if (this.waitTimerHandle) {
+      clearTimeout(this.waitTimerHandle);
+      this.waitTimerHandle = null;
+    }
     // Remove only the handlers this orchestrator attached
     for (const { event, handler } of this.boundHandlers) {
       this.reviewLoop.off(event, handler);
     }
     this.boundHandlers = [];
   }
+}
+
+// ============================================================
+// Spawn Strategy Decision (REQ-P1)
+// ============================================================
+
+/**
+ * Decide whether to spawn Heads (managed) or workers directly (flat).
+ *
+ * - 2 domains AND ≤4 tasks per domain → flat (skill-injected workers, lower overhead)
+ * - 2 domains AND >4 tasks in any domain → managed
+ * - 3+ domains → managed
+ * - 1 domain AND 8+ tasks → managed (raised threshold from 6)
+ * - Research/explore only → always flat (independent by nature)
+ * - UX/design work always keeps a Head path (hard enforcement preservation)
+ */
+export function decideSpawnStrategy(
+  tasks: { id: string; title: string; description?: string; taskType?: string; dependencies?: string[] }[],
+  options?: { learningHint?: ArchitectureLearningHint },
+): SpawnStrategy {
+  if (tasks.length === 0) return { mode: 'flat' }
+
+  const architectureDecision = selectArchitectureMode(tasks, { learningHint: options?.learningHint })
+
+  if (architectureDecision.mode === 'single' || architectureDecision.mode === 'flat') {
+    return { mode: 'flat' }
+  }
+
+  // Classify each task by domain
+  const tasksByDomain = new Map<string, string[]>()
+  for (const task of tasks) {
+    const text = `${task.title} ${task.description ?? ''}`
+    const { domain } = classifyTaskDomain(text)
+    const existing = tasksByDomain.get(domain) ?? []
+    existing.push(task.id)
+    tasksByDomain.set(domain, existing)
+  }
+
+  // Filter out 'other' and count meaningful domains
+  const meaningfulDomains = [...tasksByDomain.entries()].filter(
+    ([domain]) => domain !== 'other'
+  )
+  const forceManaged = architectureDecision.mode === 'managed' || architectureDecision.mode === 'hybrid'
+
+  if (forceManaged) {
+    const managedDomains: Array<[string, string[]]> = meaningfulDomains.length > 0
+      ? meaningfulDomains.map(([domain, taskIds]) => [domain, taskIds])
+      : [['other', tasks.map((t) => t.id)]]
+    const heads: DomainHeadPlan[] = managedDomains.map(([domain, taskIds]) => ({ domain, taskIds }))
+
+    const otherTasks = tasksByDomain.get('other')
+    if (otherTasks?.length && heads.length > 0 && !heads.some((head) => head.domain === 'other')) {
+      const largest = heads.reduce((a, b) => a.taskIds.length >= b.taskIds.length ? a : b)
+      largest.taskIds.push(...otherTasks)
+    }
+    return { mode: 'managed', heads }
+  }
+
+  // Research/explore only → always flat
+  const researchOnly = meaningfulDomains.every(
+    ([domain]) => domain === 'research' || domain === 'search'
+  )
+  if (researchOnly) return { mode: 'flat' }
+
+  // REQ-NEXT-010: Preserve UX/design hard enforcement by keeping managed mode.
+  if (meaningfulDomains.some(([domain]) => domain === 'ux_design')) {
+    const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({ domain, taskIds }))
+    return { mode: 'managed', heads }
+  }
+
+  // REQ-NEXT-010: 3+ meaningful domains still warrant managed coordination.
+  if (meaningfulDomains.length >= 3) {
+    const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({
+      domain,
+      taskIds,
+    }))
+    // Include 'other' tasks in the largest domain's Head
+    const otherTasks = tasksByDomain.get('other')
+    if (otherTasks?.length && heads.length > 0) {
+      const largest = heads.reduce((a, b) => a.taskIds.length >= b.taskIds.length ? a : b)
+      largest.taskIds.push(...otherTasks)
+    }
+    return { mode: 'managed', heads }
+  }
+
+  // REQ-NEXT-010: exactly 2 meaningful domains can run flat for small loads.
+  if (meaningfulDomains.length === 2) {
+    const perDomainWithinFlatBudget = meaningfulDomains.every(([, taskIds]) => taskIds.length <= 4)
+    if (perDomainWithinFlatBudget) {
+      return { mode: 'flat' }
+    }
+
+    const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({
+      domain,
+      taskIds,
+    }))
+    const otherTasks = tasksByDomain.get('other')
+    if (otherTasks?.length && heads.length > 0) {
+      const largest = heads.reduce((a, b) => a.taskIds.length >= b.taskIds.length ? a : b)
+      largest.taskIds.push(...otherTasks)
+    }
+    return { mode: 'managed', heads }
+  }
+
+  // Single domain — raised managed threshold (REQ-NEXT-010).
+  if (tasks.length >= 8) {
+    const allTaskIds = tasks.map(t => t.id)
+    const domain = meaningfulDomains[0]?.[0] ?? 'other'
+    return { mode: 'managed', heads: [{ domain, taskIds: allTaskIds }] }
+  }
+
+  // Simple case: single domain, ≤7 tasks → flat
+  return { mode: 'flat' }
 }
 
 // ============================================================

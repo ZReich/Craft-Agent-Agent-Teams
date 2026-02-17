@@ -30,6 +30,7 @@ import type {
   TDDPhase,
   Spec,
   SpecRequirement,
+  DesignArtifact,
 } from '@craft-agent/core/types';
 import { resolveReviewProvider, type ReviewProvider } from '@craft-agent/shared/agent-teams/review-provider';
 
@@ -127,6 +128,40 @@ Return a JSON object with this exact structure:
 
 Score guide: 95-100 = fully complete and integrated, 85-94 = nearly done, 70-84 = gaps remain, below 70 = substantially incomplete.
 CRITICAL: If integrationVerified is false, score MUST be below 70 regardless of other factors. Dead code is never acceptable.`,
+
+  design_compliance: `You are a design fidelity reviewer checking that an approved UI design has been preserved during implementation.
+
+A design variant was approved before coding began. The implementation MUST preserve:
+1. **Visual structure** — Layout hierarchy, spacing, component arrangement must match the approved design
+2. **Component usage** — The specific UI components from the design brief must be used (no swapping Button for a plain <button>, etc.)
+3. **Animations and transitions** — All motion/animation code from the design must be preserved
+4. **Responsive behavior** — Mobile/tablet breakpoints from the design must be intact
+5. **Typography and color** — Font sizes, weights, and color tokens from the design must be used
+
+The implementation MAY add:
+- Data binding (connecting props to real data)
+- Event handlers (click, submit, etc.)
+- API integration
+- State management
+
+The implementation MUST NOT:
+- Change the visual layout or component hierarchy
+- Remove animations or transitions
+- Swap components for different ones
+- Alter the responsive breakpoints
+- Change typography or color tokens
+
+## Approved Design Context
+{designContext}
+
+Analyze the diff against the approved design. Return a JSON object:
+{
+  "score": <number 0-100>,
+  "issues": [<string descriptions of design deviations>],
+  "suggestions": [<string suggestions for preserving the design>]
+}
+
+Score guide: 95-100 = design fully preserved, 85-94 = minor deviations, 70-84 = notable changes, below 70 = design significantly altered.`,
 };
 
 // ============================================================
@@ -144,6 +179,10 @@ export interface TaskContext {
   tddPhase?: TDDPhase;
   /** Optional SDD specification context (used by SDD quality gate stages) */
   spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>;
+  /** Optional design artifact — when present, enables design compliance review (REQ-011) */
+  designArtifact?: DesignArtifact;
+  /** Current review cycle count (for QG feedback messages) */
+  cycleCount?: number;
 }
 
 interface ApiKeyProvider {
@@ -156,6 +195,79 @@ type TestFailureKind = 'none' | 'no-tests' | 'test-failures' | 'infra-failure' |
 interface TestBaselineOptions {
   enabled: boolean;
   knownFailingTests: string[];
+}
+
+type AIReviewStage = 'architecture' | 'simplicity' | 'errors' | 'completeness';
+
+interface ScopedDiff {
+  stage: AIReviewStage;
+  relevantHunks: string;
+  fileCount: number;
+  truncated: boolean;
+}
+
+interface ParsedDiffBlock {
+  filePath: string;
+  content: string;
+  isNewFile: boolean;
+  isBinary: boolean;
+}
+
+interface BypassContext {
+  diffLineCount: number;
+  fileCount: number;
+  hasNewFiles: boolean;
+  testsPassed: boolean;
+  testCount: number;
+  hasAsyncAwait: boolean;
+  maxFunctionLinesInDiff: number;
+}
+
+interface DeterministicAnchor {
+  score: number;
+  summary: string;
+}
+
+const QUALITY_GATE_DEFAULTS = {
+  stagePassScore: 70,
+  stageDiffMaxChars: 50_000,
+  deterministicAnchor: {
+    minWeight: 0,
+    maxWeight: 0.6,
+    defaultWeight: 0.3,
+    architecture: {
+      sourceFilePenaltyHigh: { threshold: 8, points: 18 },
+      sourceFilePenaltyMedium: { threshold: 5, points: 10 },
+      newSourceFilePenalty: { threshold: 2, points: 12 },
+      avgLinesPenaltyHigh: { threshold: 120, points: 18 },
+      avgLinesPenaltyMedium: { threshold: 80, points: 10 },
+      crossLayerPenalty: 8,
+    },
+    simplicity: {
+      functionLinesPenaltyHigh: { threshold: 90, points: 28 },
+      functionLinesPenaltyMedium: { threshold: 60, points: 16 },
+      functionLinesPenaltyLow: { threshold: 40, points: 8 },
+      branchPenaltyHigh: { threshold: 18, points: 18 },
+      branchPenaltyMedium: { threshold: 10, points: 10 },
+      changedLinesPenaltyHigh: { threshold: 180, points: 10 },
+      changedLinesPenaltyMedium: { threshold: 100, points: 6 },
+    },
+    errors: {
+      asyncWithoutTryCatchPenalty: 18,
+      boundaryWithoutGuardsPenalty: 14,
+      weakTestsPenalty: 12,
+      largeDiffPenalty: { threshold: 140, points: 10 },
+    },
+  },
+  bypass: {
+    architecture: { maxDiffLines: 50, maxFilesChanged: 2, allowNewFiles: false, defaultScore: 90 },
+    simplicity: { maxDiffLines: 100, maxFunctionLines: 50, defaultScore: 90 },
+    errors: { maxDiffLines: 50, requirePassingTests: true, minTestCount: 1, disallowAsyncAwait: true, defaultScore: 90 },
+  },
+} as const;
+
+function clampScore(value: number): number {
+  return Math.max(0, Math.min(100, value));
 }
 
 // ============================================================
@@ -296,6 +408,9 @@ export class QualityGateRunner {
     spec?: Pick<Spec, 'requirements' | 'rolloutPlan' | 'rollbackPlan' | 'observabilityPlan'>,
   ): Promise<QualityGateResult> {
     qgLog.info('[QualityGates] Starting pipeline run');
+    // AUDIT-FIX-5: Pre-slice diff once to avoid redundant 50KB string allocations per stage.
+    // Previously each AI stage called diff.slice(0, 50000) independently (up to 7× per cycle).
+    const truncatedDiff = diff.slice(0, 50000);
     const preferredReviewProvider = resolveReviewProvider(config.reviewModel, config.reviewProvider);
     let activeReviewProvider = preferredReviewProvider;
     let activeReviewModel = config.reviewModel;
@@ -350,8 +465,8 @@ export class QualityGateRunner {
       }
     }
 
-    // Stages 3-6: AI Reviews (parallel for speed)
-    type AIReviewStage = 'architecture' | 'simplicity' | 'errors' | 'completeness';
+    // Stages 3-6: AI Reviews
+    // Implements REQ-NEXT-009 (diff scoping), REQ-NEXT-012 (batched call), REQ-NEXT-013 (tiered bypass)
     const aiStages: AIReviewStage[] = ['architecture', 'simplicity', 'errors', 'completeness'];
     const enabledAiStages = aiStages.filter(s => config.stages[s].enabled);
     let aiReviewUnavailable = false;
@@ -377,23 +492,79 @@ export class QualityGateRunner {
           qgLog.warn(`[QualityGates] ${executionConfig.warning}`);
         }
 
-        qgLog.info(`[QualityGates] Running ${enabledAiStages.length} AI review stages in parallel`);
-        const aiResults = await Promise.allSettled(
-          enabledAiStages.map(stage => this.runAIReview(stage, diff, taskContext, resultConfig, activeReviewProvider))
-        );
+        const scopedDiffs = new Map<AIReviewStage, ScopedDiff>();
+        for (const stage of enabledAiStages) {
+          scopedDiffs.set(stage, this.scopeDiffForStage(diff, stage));
+        }
 
-        for (let i = 0; i < enabledAiStages.length; i++) {
-          const stageName = enabledAiStages[i];
-          const result = aiResults[i];
-          if (result.status === 'fulfilled') {
-            stages[stageName] = result.value;
+        const bypassContext = this.buildBypassContext(diff, stages.tests as TestStageResult);
+        const stagesNeedingReview: AIReviewStage[] = [];
+        for (const stage of enabledAiStages) {
+          const bypassed = this.tryBypassStage(stage, bypassContext, resultConfig);
+          if (bypassed) {
+            stages[stage] = bypassed;
           } else {
-            const errorDetails = this.serializeError(result.reason);
-            qgLog.error(`[QualityGates] AI review stage "${stageName}" failed:`, errorDetails);
-            stages[stageName] = this.createStageFailureResult(
-              `AI review stage "${stageName}" failed: ${errorDetails.message}`,
-              ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
+            stagesNeedingReview.push(stage);
+          }
+        }
+
+        if (stagesNeedingReview.length > 0) {
+          const useCombinedReview = (resultConfig.useCombinedReview ?? true) && stagesNeedingReview.length > 1;
+          if (useCombinedReview) {
+            qgLog.info(`[QualityGates] Running ${stagesNeedingReview.length} AI stages via single combined review call`);
+            const combinedResults = await this.runCombinedAIReview(
+              stagesNeedingReview,
+              scopedDiffs,
+              taskContext,
+              resultConfig,
+              activeReviewProvider,
             );
+            for (const stageName of stagesNeedingReview) {
+              const stageResult = combinedResults[stageName];
+              if (stageResult) {
+                stages[stageName] = stageResult;
+                continue;
+              }
+
+              // Graceful fallback for partial/failed combined parse (REQ-NEXT-012)
+              const scoped = scopedDiffs.get(stageName);
+              stages[stageName] = await this.runAIReview(
+                stageName,
+                scoped?.relevantHunks ?? truncatedDiff,
+                taskContext,
+                resultConfig,
+                activeReviewProvider,
+              );
+            }
+          } else {
+            qgLog.info(`[QualityGates] Running ${stagesNeedingReview.length} AI review stages individually`);
+            const aiResults = await Promise.allSettled(
+              stagesNeedingReview.map((stage) => {
+                const scoped = scopedDiffs.get(stage);
+                return this.runAIReview(
+                  stage,
+                  scoped?.relevantHunks ?? truncatedDiff,
+                  taskContext,
+                  resultConfig,
+                  activeReviewProvider,
+                );
+              }),
+            );
+
+            for (let i = 0; i < stagesNeedingReview.length; i++) {
+              const stageName = stagesNeedingReview[i];
+              const result = aiResults[i];
+              if (result.status === 'fulfilled') {
+                stages[stageName] = result.value;
+              } else {
+                const errorDetails = this.serializeError(result.reason);
+                qgLog.error(`[QualityGates] AI review stage "${stageName}" failed:`, errorDetails);
+                stages[stageName] = this.createStageFailureResult(
+                  `AI review stage "${stageName}" failed: ${errorDetails.message}`,
+                  ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
+                );
+              }
+            }
           }
         }
       }
@@ -426,23 +597,59 @@ export class QualityGateRunner {
         return this.buildResult(stages, resultConfig, activeReviewProvider);
       }
 
-      if (config.stages.spec_compliance.enabled) {
-        stages.spec_compliance = await this.runSpecComplianceReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
-      }
-
-      if (config.stages.traceability.enabled) {
-        stages.traceability = await this.runTraceabilityReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
-      }
-
+      // AUDIT-FIX-5: Run SDD stages in parallel (they are independent of each other)
       const shouldRunRolloutSafety =
         config.stages.rollout_safety.enabled &&
         Boolean(activeSpec.rolloutPlan || activeSpec.rollbackPlan || activeSpec.observabilityPlan);
 
+      type SDDStageEntry = { name: string; promise: Promise<QualityGateStageResult> };
+      const sddTasks: SDDStageEntry[] = [];
+
+      if (config.stages.spec_compliance.enabled) {
+        sddTasks.push({ name: 'spec_compliance', promise: this.runSpecComplianceReview(truncatedDiff, taskContext, activeSpec, resultConfig, activeReviewProvider) });
+      }
+      if (config.stages.traceability.enabled) {
+        sddTasks.push({ name: 'traceability', promise: this.runTraceabilityReview(truncatedDiff, taskContext, activeSpec, resultConfig, activeReviewProvider) });
+      }
       if (shouldRunRolloutSafety) {
-        stages.rollout_safety = await this.runRolloutSafetyReview(diff, taskContext, activeSpec, resultConfig, activeReviewProvider);
+        sddTasks.push({ name: 'rollout_safety', promise: this.runRolloutSafetyReview(truncatedDiff, taskContext, activeSpec, resultConfig, activeReviewProvider) });
+      }
+
+      if (sddTasks.length > 0) {
+        qgLog.info(`[QualityGates] Running ${sddTasks.length} SDD stages in parallel`);
+        const sddResults = await Promise.allSettled(sddTasks.map(t => t.promise));
+        for (let i = 0; i < sddTasks.length; i++) {
+          const result = sddResults[i];
+          const stageName = sddTasks[i].name as keyof typeof stages;
+          if (result.status === 'fulfilled') {
+            (stages as Record<string, QualityGateStageResult>)[stageName] = result.value;
+          } else {
+            const errorDetails = this.serializeError(result.reason);
+            qgLog.error(`[QualityGates] SDD stage "${stageName}" failed:`, errorDetails);
+            (stages as Record<string, QualityGateStageResult>)[stageName] = this.createStageFailureResult(
+              `SDD stage "${stageName}" failed: ${errorDetails.message}`,
+              ['Fix model/provider credentials or endpoint configuration, then rerun quality gates'],
+            );
+          }
+        }
       }
     } else {
       qgLog.info('[QualityGates] No spec provided; skipping SDD review stages');
+    }
+
+    // Design compliance stage: run only when a design artifact is attached (REQ-011)
+    if (taskContext.designArtifact && config.stages.design_compliance.enabled) {
+      if (aiReviewUnavailable) {
+        stages.design_compliance = this.createStageSkippedResult(
+          aiUnavailableReason ?? 'AI review stages unavailable',
+          ['Configure review model credentials to run design compliance checks'],
+        );
+      } else {
+        qgLog.info('[QualityGates] Running design compliance review');
+        stages.design_compliance = await this.runDesignComplianceReview(
+          truncatedDiff, taskContext, resultConfig, activeReviewProvider,
+        );
+      }
     }
 
     return this.buildResult(stages, resultConfig, activeReviewProvider);
@@ -826,7 +1033,7 @@ export class QualityGateRunner {
 
     const prompt = promptTemplate.replace('{taskDescription}', taskContext.taskDescription || 'No description provided');
 
-    const userMessage = `Here is the code diff to review:\n\n\`\`\`diff\n${diff.slice(0, 50000)}\`\`\`\n\nTask: ${taskContext.taskDescription || 'No description'}`;
+    const userMessage = `Here is the code diff to review:\n\n\`\`\`diff\n${diff}\`\`\`\n\nTask: ${taskContext.taskDescription || 'No description'}`;
 
     try {
       const responseText = await this.callReviewModel(prompt, userMessage, config, reviewProvider);
@@ -859,10 +1066,17 @@ export class QualityGateRunner {
       }
 
       return {
-        score,
-        passed: score >= 70,
-        issues: parsed.issues,
-        suggestions: parsed.suggestions,
+        ...this.applyDeterministicAnchor(
+          stage as AIReviewStage,
+          {
+            score,
+            passed: score >= QUALITY_GATE_DEFAULTS.stagePassScore,
+            issues: parsed.issues,
+            suggestions: parsed.suggestions,
+          },
+          diff,
+          config,
+        ),
       };
     } catch (err) {
       const errorDetails = this.serializeError(err);
@@ -871,6 +1085,485 @@ export class QualityGateRunner {
         `AI review stage "${stage}" encountered an error: ${errorDetails.message}`,
         ['Verify provider credentials and model compatibility for this review stage'],
       );
+    }
+  }
+
+  private splitDiffBlocks(fullDiff: string): ParsedDiffBlock[] {
+    const blocks = fullDiff.split(/(?=^diff --git )/m).filter(Boolean);
+    const parsed: ParsedDiffBlock[] = [];
+
+    for (const block of blocks) {
+      const pathMatch = block.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+      if (!pathMatch) continue;
+
+      const filePath = (pathMatch[2] || pathMatch[1] || '').trim();
+      if (!filePath) continue;
+
+      parsed.push({
+        filePath,
+        content: block,
+        isNewFile: /(^|\n)new file mode\s+/m.test(block) || /(^|\n)--- \/dev\/null(\n|$)/m.test(block),
+        isBinary: /(^|\n)Binary files .* differ(\n|$)/m.test(block),
+      });
+    }
+
+    return parsed;
+  }
+
+  private isTestFile(filePath: string): boolean {
+    return /(^|\/)(__tests__|tests)\//i.test(filePath) || /\.(test|spec)\.[jt]sx?$/i.test(filePath);
+  }
+
+  private isConfigFile(filePath: string): boolean {
+    return /(^|\/)(tsconfig|package\.json|bunfig|vitest\.config|vite\.config|jest\.config|eslint|prettier|webpack|rollup|turbo|nx|biome|commitlint|pnpm-workspace|\.env)/i.test(filePath)
+      || /\.(ya?ml|toml|ini|conf)$/i.test(filePath);
+  }
+
+  private isStyleFile(filePath: string): boolean {
+    return /\.(css|scss|sass|less|styl)$/i.test(filePath);
+  }
+
+  private isSourceFile(filePath: string): boolean {
+    return /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(filePath);
+  }
+
+  private isTypeDefinitionFile(filePath: string): boolean {
+    return /\.d\.ts$/i.test(filePath);
+  }
+
+  private isLockFile(filePath: string): boolean {
+    return /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lock|Cargo\.lock)$/i.test(filePath);
+  }
+
+  private isApiBoundaryFile(filePath: string): boolean {
+    return /(api|route|routes|controller|handler|middleware|server|client|http|request|response|rpc|service)/i.test(filePath);
+  }
+
+  private scopeDiffForStage(fullDiff: string, stage: AIReviewStage): ScopedDiff {
+    const blocks = this.splitDiffBlocks(fullDiff);
+    const selected = blocks.filter((block) => {
+      const { filePath } = block;
+
+      if (stage === 'architecture') {
+        return this.isSourceFile(filePath) && !this.isTestFile(filePath) && !this.isConfigFile(filePath) && !this.isStyleFile(filePath);
+      }
+
+      if (stage === 'simplicity') {
+        return this.isSourceFile(filePath)
+          && !this.isTypeDefinitionFile(filePath)
+          && !this.isTestFile(filePath)
+          && !this.isConfigFile(filePath);
+      }
+
+      if (stage === 'errors') {
+        if (this.isTestFile(filePath) || this.isStyleFile(filePath)) return false;
+        return this.isSourceFile(filePath) || this.isApiBoundaryFile(filePath);
+      }
+
+      // completeness: everything except binary + lockfiles
+      return !block.isBinary && !this.isLockFile(filePath);
+    });
+
+    let scoped = selected.map((block) => block.content).join('\n');
+    if (!scoped.trim()) {
+      scoped = '[No stage-relevant hunks after diff scoping]';
+    }
+
+    const truncated = scoped.length > QUALITY_GATE_DEFAULTS.stageDiffMaxChars;
+    if (truncated) {
+      scoped = `${scoped.slice(0, QUALITY_GATE_DEFAULTS.stageDiffMaxChars)}\n\n[... scoped diff truncated at ${QUALITY_GATE_DEFAULTS.stageDiffMaxChars} characters ...]`;
+    }
+
+    return {
+      stage,
+      relevantHunks: scoped,
+      fileCount: selected.length,
+      truncated,
+    };
+  }
+
+  private countChangedLines(diff: string): number {
+    return diff
+      .split(/\r?\n/)
+      .filter((line) => (line.startsWith('+') || line.startsWith('-')) && !line.startsWith('+++') && !line.startsWith('---'))
+      .length;
+  }
+
+  private estimateMaxFunctionLinesInDiff(diff: string): number {
+    const addedLines = diff
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .map((line) => line.slice(1));
+
+    // Heuristic only: estimate contiguous added function spans without brace parsing.
+    // This avoids brittle brace counting across comments/template literals.
+    const functionStartPattern = /(?:\basync\s+)?\bfunction\b|\b=>\s*\{|\b(class|constructor)\b|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?\(/;
+    const declarationBoundaryPattern = /^(?:export\s+)?(?:const|let|var|class|function|type|interface)\b/;
+    const getIndent = (line: string): number => (line.match(/^\s*/)?.[0].replace(/\t/g, '  ').length ?? 0);
+
+    let maxLines = 0;
+
+    for (let i = 0; i < addedLines.length; i++) {
+      const startLine = addedLines[i];
+      if (!functionStartPattern.test(startLine)) continue;
+
+      const startIndent = getIndent(startLine);
+      let span = 1;
+
+      for (let j = i + 1; j < addedLines.length; j++) {
+        const line = addedLines[j];
+        const trimmed = line.trim();
+
+        if (!trimmed) {
+          span += 1;
+          continue;
+        }
+
+        const indent = getIndent(line);
+        const startsNextFunction = functionStartPattern.test(line) && indent <= startIndent;
+        const startsNextDeclaration = declarationBoundaryPattern.test(trimmed) && indent <= startIndent;
+        if (startsNextFunction || startsNextDeclaration) break;
+
+        span += 1;
+      }
+
+      maxLines = Math.max(maxLines, span);
+    }
+
+    return maxLines;
+  }
+
+  private buildBypassContext(diff: string, testsStage: TestStageResult): BypassContext {
+    const blocks = this.splitDiffBlocks(diff);
+    const addedLines = diff
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .map((line) => line.slice(1))
+      .join('\n');
+
+    return {
+      diffLineCount: this.countChangedLines(diff),
+      fileCount: blocks.length,
+      hasNewFiles: blocks.some((block) => block.isNewFile),
+      testsPassed: Boolean(testsStage?.passed),
+      testCount: Number(testsStage?.totalTests ?? 0),
+      hasAsyncAwait: /\basync\b|\bawait\b/.test(addedLines),
+      maxFunctionLinesInDiff: this.estimateMaxFunctionLinesInDiff(diff),
+    };
+  }
+
+  /**
+   * Implements REQ-NEXT-003: blend deterministic anchors with LLM stage scoring.
+   */
+  private applyDeterministicAnchor(
+    stage: AIReviewStage,
+    stageResult: QualityGateStageResult,
+    diff: string,
+    config: QualityGateConfig,
+    testsStage?: TestStageResult,
+  ): QualityGateStageResult {
+    if (!config.deterministicAnchors?.enabled) return stageResult;
+    if (stage !== 'architecture' && stage !== 'simplicity' && stage !== 'errors') return stageResult;
+
+    const anchor = this.computeDeterministicAnchor(stage, diff, testsStage);
+    if (!anchor) return stageResult;
+
+    const weight = Math.min(
+      QUALITY_GATE_DEFAULTS.deterministicAnchor.maxWeight,
+      Math.max(
+        QUALITY_GATE_DEFAULTS.deterministicAnchor.minWeight,
+        config.deterministicAnchors.weight ?? QUALITY_GATE_DEFAULTS.deterministicAnchor.defaultWeight,
+      ),
+    );
+    const blendedScore = Math.round(stageResult.score * (1 - weight) + anchor.score * weight);
+
+    return {
+      ...stageResult,
+      score: blendedScore,
+      passed: blendedScore >= QUALITY_GATE_DEFAULTS.stagePassScore,
+      suggestions: [
+        ...stageResult.suggestions,
+        `Deterministic anchor (${stage}): ${anchor.score}/100 — ${anchor.summary}`,
+      ],
+    };
+  }
+
+  private computeDeterministicAnchor(
+    stage: AIReviewStage,
+    diff: string,
+    testsStage?: TestStageResult,
+  ): DeterministicAnchor | null {
+    const changedLines = this.countChangedLines(diff);
+    const blocks = this.splitDiffBlocks(diff);
+    const addedText = diff
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .map((line) => line.slice(1))
+      .join('\n');
+
+    if (stage === 'architecture') {
+      const sourceBlocks = blocks.filter((block) =>
+        this.isSourceFile(block.filePath) && !this.isTestFile(block.filePath) && !this.isConfigFile(block.filePath) && !this.isStyleFile(block.filePath),
+      );
+      const sourceCount = Math.max(1, sourceBlocks.length);
+      const newSourceCount = sourceBlocks.filter((block) => block.isNewFile).length;
+      const avgLinesPerFile = changedLines / sourceCount;
+      const hasCrossLayerTouch =
+        sourceBlocks.some((b) => /renderer|components|ui\//i.test(b.filePath)) &&
+        sourceBlocks.some((b) => /main|server|api|service/i.test(b.filePath));
+
+      let score = 100;
+      const architectureRules = QUALITY_GATE_DEFAULTS.deterministicAnchor.architecture;
+      if (sourceCount > architectureRules.sourceFilePenaltyHigh.threshold) score -= architectureRules.sourceFilePenaltyHigh.points;
+      else if (sourceCount > architectureRules.sourceFilePenaltyMedium.threshold) score -= architectureRules.sourceFilePenaltyMedium.points;
+      if (newSourceCount > architectureRules.newSourceFilePenalty.threshold) score -= architectureRules.newSourceFilePenalty.points;
+      if (avgLinesPerFile > architectureRules.avgLinesPenaltyHigh.threshold) score -= architectureRules.avgLinesPenaltyHigh.points;
+      else if (avgLinesPerFile > architectureRules.avgLinesPenaltyMedium.threshold) score -= architectureRules.avgLinesPenaltyMedium.points;
+      if (hasCrossLayerTouch) score -= architectureRules.crossLayerPenalty;
+
+      score = clampScore(score);
+      return {
+        score,
+        summary: `files=${sourceCount}, newFiles=${newSourceCount}, avgLinesPerFile=${Math.round(avgLinesPerFile)}, crossLayer=${hasCrossLayerTouch}`,
+      };
+    }
+
+    if (stage === 'simplicity') {
+      const maxFunctionLines = this.estimateMaxFunctionLinesInDiff(diff);
+      const branchCount = (addedText.match(/\b(if|else if|switch|case|for|while|catch)\b/g) || []).length;
+      let score = 100;
+      const simplicityRules = QUALITY_GATE_DEFAULTS.deterministicAnchor.simplicity;
+      if (maxFunctionLines > simplicityRules.functionLinesPenaltyHigh.threshold) score -= simplicityRules.functionLinesPenaltyHigh.points;
+      else if (maxFunctionLines > simplicityRules.functionLinesPenaltyMedium.threshold) score -= simplicityRules.functionLinesPenaltyMedium.points;
+      else if (maxFunctionLines > simplicityRules.functionLinesPenaltyLow.threshold) score -= simplicityRules.functionLinesPenaltyLow.points;
+      if (branchCount > simplicityRules.branchPenaltyHigh.threshold) score -= simplicityRules.branchPenaltyHigh.points;
+      else if (branchCount > simplicityRules.branchPenaltyMedium.threshold) score -= simplicityRules.branchPenaltyMedium.points;
+      if (changedLines > simplicityRules.changedLinesPenaltyHigh.threshold) score -= simplicityRules.changedLinesPenaltyHigh.points;
+      else if (changedLines > simplicityRules.changedLinesPenaltyMedium.threshold) score -= simplicityRules.changedLinesPenaltyMedium.points;
+      score = clampScore(score);
+      return {
+        score,
+        summary: `maxFunctionLines=${maxFunctionLines}, branchOps=${branchCount}, changedLines=${changedLines}`,
+      };
+    }
+
+    if (stage === 'errors') {
+      const hasBoundaryFiles = blocks.some((block) => this.isApiBoundaryFile(block.filePath));
+      const hasAsyncAwait = /\basync\b|\bawait\b/.test(addedText);
+      const hasTryCatch = /\btry\s*\{|\bcatch\s*\(/.test(addedText);
+      const hasGuarding = /\bif\s*\(|\?\?|\?\./.test(addedText);
+      const testsHealthy = testsStage ? testsStage.passed && testsStage.totalTests > 0 : true;
+
+      let score = 100;
+      const errorRules = QUALITY_GATE_DEFAULTS.deterministicAnchor.errors;
+      if (hasAsyncAwait && !hasTryCatch) score -= errorRules.asyncWithoutTryCatchPenalty;
+      if (hasBoundaryFiles && !hasGuarding) score -= errorRules.boundaryWithoutGuardsPenalty;
+      if (!testsHealthy) score -= errorRules.weakTestsPenalty;
+      if (changedLines > errorRules.largeDiffPenalty.threshold) score -= errorRules.largeDiffPenalty.points;
+      score = clampScore(score);
+
+      return {
+        score,
+        summary: `async=${hasAsyncAwait}, tryCatch=${hasTryCatch}, boundaryFiles=${hasBoundaryFiles}, guarding=${hasGuarding}, testsHealthy=${testsHealthy}`,
+      };
+    }
+
+    return null;
+  }
+
+  private createBypassedStageResult(stage: AIReviewStage, score: number, reason: string): QualityGateStageResult {
+    return {
+      score,
+      passed: score >= QUALITY_GATE_DEFAULTS.stagePassScore,
+      issues: [],
+      suggestions: [`Bypassed — low-risk change (${stage}): ${reason}`],
+    };
+  }
+
+  private tryBypassStage(
+    stage: AIReviewStage,
+    context: BypassContext,
+    config: QualityGateConfig,
+  ): QualityGateStageResult | null {
+    if (stage === 'completeness') return null; // REQ-NEXT-013: completeness is never bypassed
+
+    const bypass = config.bypass;
+    if (!bypass?.enabled) return null;
+
+    if (stage === 'architecture') {
+      const maxDiffLines = bypass.architecture?.maxDiffLines ?? QUALITY_GATE_DEFAULTS.bypass.architecture.maxDiffLines;
+      const maxFilesChanged = bypass.architecture?.maxFilesChanged ?? QUALITY_GATE_DEFAULTS.bypass.architecture.maxFilesChanged;
+      const allowNewFiles = bypass.architecture?.allowNewFiles ?? QUALITY_GATE_DEFAULTS.bypass.architecture.allowNewFiles;
+      const defaultScore = bypass.architecture?.defaultScore ?? QUALITY_GATE_DEFAULTS.bypass.architecture.defaultScore;
+
+      if (
+        context.diffLineCount <= maxDiffLines
+        && context.fileCount <= maxFilesChanged
+        && (allowNewFiles || !context.hasNewFiles)
+      ) {
+        return this.createBypassedStageResult(stage, defaultScore, `≤${maxDiffLines} changed lines, ≤${maxFilesChanged} files, no risky architecture churn`);
+      }
+      return null;
+    }
+
+    if (stage === 'simplicity') {
+      const maxDiffLines = bypass.simplicity?.maxDiffLines ?? QUALITY_GATE_DEFAULTS.bypass.simplicity.maxDiffLines;
+      const maxFunctionLines = bypass.simplicity?.maxFunctionLines ?? QUALITY_GATE_DEFAULTS.bypass.simplicity.maxFunctionLines;
+      const defaultScore = bypass.simplicity?.defaultScore ?? QUALITY_GATE_DEFAULTS.bypass.simplicity.defaultScore;
+
+      if (
+        context.diffLineCount <= maxDiffLines
+        && context.maxFunctionLinesInDiff <= maxFunctionLines
+      ) {
+        return this.createBypassedStageResult(stage, defaultScore, `≤${maxDiffLines} changed lines and no detected function > ${maxFunctionLines} added lines`);
+      }
+      return null;
+    }
+
+    if (stage === 'errors') {
+      const maxDiffLines = bypass.errors?.maxDiffLines ?? QUALITY_GATE_DEFAULTS.bypass.errors.maxDiffLines;
+      const requirePassingTests = bypass.errors?.requirePassingTests ?? QUALITY_GATE_DEFAULTS.bypass.errors.requirePassingTests;
+      const minTestCount = bypass.errors?.minTestCount ?? QUALITY_GATE_DEFAULTS.bypass.errors.minTestCount;
+      const disallowAsyncAwait = bypass.errors?.disallowAsyncAwait ?? QUALITY_GATE_DEFAULTS.bypass.errors.disallowAsyncAwait;
+      const defaultScore = bypass.errors?.defaultScore ?? QUALITY_GATE_DEFAULTS.bypass.errors.defaultScore;
+
+      const testsOk = !requirePassingTests || (context.testsPassed && context.testCount >= minTestCount);
+      const asyncOk = !disallowAsyncAwait || !context.hasAsyncAwait;
+
+      if (context.diffLineCount <= maxDiffLines && testsOk && asyncOk) {
+        return this.createBypassedStageResult(stage, defaultScore, `≤${maxDiffLines} changed lines with strong deterministic safety signals`);
+      }
+    }
+
+    return null;
+  }
+
+  private normalizeCombinedStageResult(
+    stage: AIReviewStage,
+    payload: Record<string, unknown>,
+  ): QualityGateStageResult | null {
+    const score = Math.max(0, Math.min(100, Number(payload.score)));
+    if (!Number.isFinite(score)) return null;
+
+    const issues = Array.isArray(payload.issues)
+      ? payload.issues.filter((issue): issue is string => typeof issue === 'string')
+      : [];
+    const suggestions = Array.isArray(payload.suggestions)
+      ? payload.suggestions.filter((suggestion): suggestion is string => typeof suggestion === 'string')
+      : [];
+
+    if (stage === 'completeness' && payload.integrationVerified === false) {
+      const capped = Math.min(score, 65);
+      const integrationIssue = 'INTEGRATION FAILURE: New code is not connected to existing code — components, functions, or handlers are dead code';
+      return {
+        score: capped,
+        passed: false,
+        issues: issues.some((issue) => issue.includes('INTEGRATION FAILURE'))
+          ? issues
+          : [integrationIssue, ...issues],
+        suggestions,
+      };
+    }
+
+    return {
+      score,
+      passed: score >= QUALITY_GATE_DEFAULTS.stagePassScore,
+      issues,
+      suggestions,
+    };
+  }
+
+  private async runCombinedAIReview(
+    stagesToReview: AIReviewStage[],
+    scopedDiffs: Map<AIReviewStage, ScopedDiff>,
+    taskContext: TaskContext,
+    config: QualityGateConfig,
+    reviewProvider: ReviewProvider,
+  ): Promise<Partial<Record<AIReviewStage, QualityGateStageResult>>> {
+    const stageInstructions = stagesToReview.map((stage) => {
+      const title = stage === 'errors'
+        ? 'Error Analysis'
+        : stage.charAt(0).toUpperCase() + stage.slice(1);
+      const scoped = scopedDiffs.get(stage);
+      const stageDiff = scoped?.relevantHunks ?? '[Missing scoped diff]';
+
+      let rubric = '';
+      if (stage === 'architecture') {
+        rubric = '- Evaluate module boundaries, coupling, and separation of concerns.';
+      } else if (stage === 'simplicity') {
+        rubric = '- Evaluate readability, complexity, and avoidable abstraction.';
+      } else if (stage === 'errors') {
+        rubric = '- Evaluate runtime risk, missing guards, and boundary error handling.';
+      } else {
+        rubric = '- Evaluate end-to-end completeness and whether new code is integrated and wired.';
+      }
+
+      return `## ${title}
+${rubric}
+Scoped diff:
+\`\`\`diff
+${stageDiff}
+\`\`\``;
+    }).join('\n\n');
+
+    const requiredShape = stagesToReview
+      .map((stage) => {
+        if (stage === 'completeness') {
+          return `"${stage}": { "score": <0-100>, "integrationVerified": <boolean>, "issues": [<string>], "suggestions": [<string>] }`;
+        }
+        return `"${stage}": { "score": <0-100>, "issues": [<string>], "suggestions": [<string>] }`;
+      })
+      .join(',\n  ');
+
+    const systemPrompt = `You are a senior code reviewer.
+Review the staged scoped diffs below and return JSON only.
+
+Return an object with EXACTLY these stage keys:
+{
+  ${requiredShape}
+}
+
+Scoring rubric:
+- 95-100 excellent
+- 85-94 good
+- 70-84 needs work
+- below 70 failing
+- For completeness: if integration is not verified, integrationVerified MUST be false and score must be below 70.`;
+
+    const userMessage = `Task: ${taskContext.taskDescription || 'No task description provided'}
+
+${stageInstructions}`;
+
+    const result: Partial<Record<AIReviewStage, QualityGateStageResult>> = {};
+
+    try {
+      const responseText = await this.callReviewModel(systemPrompt, userMessage, config, reviewProvider);
+      const parsed = this.parseJsonObject(responseText);
+      if (!parsed) {
+        qgLog.warn('[QualityGates] Combined AI review returned non-JSON output; falling back to per-stage calls');
+        return result;
+      }
+
+      for (const stage of stagesToReview) {
+        const raw = parsed[stage];
+        if (!raw || typeof raw !== 'object') continue;
+        const normalized = this.normalizeCombinedStageResult(stage, raw as Record<string, unknown>);
+        if (normalized) {
+          const scoped = scopedDiffs.get(stage);
+          result[stage] = this.applyDeterministicAnchor(
+            stage,
+            normalized,
+            scoped?.relevantHunks ?? '',
+            config,
+          );
+        }
+      }
+
+      return result;
+    } catch (err) {
+      const details = this.serializeError(err);
+      qgLog.error('[QualityGates] Combined AI review failed:', details);
+      return result;
     }
   }
 
@@ -917,7 +1610,7 @@ ${requirementsList || '(No requirements provided)'}
 
 Code diff to review:
 \`\`\`diff
-${diff.slice(0, 50000)}
+${diff}
 \`\`\``;
 
     try {
@@ -969,7 +1662,7 @@ ${diff.slice(0, 50000)}
 
       return {
         score,
-        passed: score >= 70,
+        passed: score >= QUALITY_GATE_DEFAULTS.stagePassScore,
         issues: Array.from(new Set(issues)),
         suggestions,
       };
@@ -1019,7 +1712,7 @@ Requirement IDs: ${requirementIds || '(none)'}
 
 Code diff to review:
 \`\`\`diff
-${diff.slice(0, 50000)}
+${diff}
 \`\`\``;
 
     try {
@@ -1088,7 +1781,7 @@ ${diff.slice(0, 50000)}
 
       return {
         score,
-        passed: score >= 70,
+        passed: score >= QUALITY_GATE_DEFAULTS.stagePassScore,
         issues: Array.from(new Set(issues)),
         suggestions,
       };
@@ -1143,7 +1836,7 @@ Specification rollout context:
 
 Code diff to review:
 \`\`\`diff
-${diff.slice(0, 50000)}
+${diff}
 \`\`\``;
 
     try {
@@ -1182,7 +1875,7 @@ ${diff.slice(0, 50000)}
 
       return {
         score: reviewScore,
-        passed: reviewScore >= 70,
+        passed: reviewScore >= QUALITY_GATE_DEFAULTS.stagePassScore,
         issues: Array.from(new Set(issues)),
         suggestions,
       };
@@ -1192,6 +1885,79 @@ ${diff.slice(0, 50000)}
       return this.createStageFailureResult(
         `Rollout safety stage encountered an error: ${errorDetails.message}`,
         ['Fix the review model/provider setup and rerun rollout safety checks'],
+      );
+    }
+  }
+
+  /**
+   * Design compliance review — checks that the approved design is preserved.
+   * Only runs when a DesignArtifact is attached to the task context.
+   *
+   * Implements REQ-011: Design Compliance Quality Gate
+   */
+  async runDesignComplianceReview(
+    diff: string,
+    taskContext: TaskContext,
+    config: QualityGateConfig,
+    reviewProvider: ReviewProvider,
+  ): Promise<QualityGateStageResult> {
+    const artifact = taskContext.designArtifact;
+    if (!artifact) {
+      return { score: 100, passed: true, issues: [], suggestions: [] };
+    }
+
+    // Build the design context that replaces {designContext} in the prompt
+    const designContext = `### Selected Design: ${artifact.selectedVariantName}
+
+### Design Brief
+${artifact.brief}
+
+### Component Spec
+${artifact.componentSpec}
+
+### Design Files
+${artifact.filePaths.map(f => `- \`${f}\``).join('\n')}
+
+### Stack
+- Framework: ${artifact.projectStack.framework}
+- TypeScript: ${artifact.projectStack.typescript}
+- Styling: ${artifact.projectStack.styling.tailwind ? 'Tailwind CSS' : 'Other'}
+- Animation: ${artifact.projectStack.animationLibrary ?? 'None'}
+- UI Library: ${artifact.projectStack.uiLibrary ?? 'None'}`;
+
+    const promptTemplate = REVIEW_PROMPTS.design_compliance;
+    const systemPrompt = promptTemplate.replace('{designContext}', designContext);
+
+    const userMessage = `Task: ${taskContext.taskDescription || 'No task description provided'}
+
+Code diff to review:
+\`\`\`diff
+${diff}
+\`\`\``;
+
+    try {
+      const responseText = await this.callReviewModel(systemPrompt, userMessage, config, reviewProvider);
+      const parsed = this.parseAiReviewResponse(responseText);
+
+      if (!parsed) {
+        return this.createStageFailureResult(
+          'Design compliance review returned an unexpected response format',
+          ['Ensure the review model returns valid JSON and rerun design compliance checks'],
+        );
+      }
+
+      return {
+        score: parsed.score,
+        passed: parsed.score >= QUALITY_GATE_DEFAULTS.stagePassScore,
+        issues: parsed.issues,
+        suggestions: parsed.suggestions,
+      };
+    } catch (err) {
+      const errorDetails = this.serializeError(err);
+      qgLog.error('[QualityGates] Design compliance review failed:', errorDetails);
+      return this.createStageFailureResult(
+        `Design compliance stage encountered an error: ${errorDetails.message}`,
+        ['Fix the review model/provider setup and rerun design compliance checks'],
       );
     }
   }
@@ -1468,9 +2234,11 @@ Please analyze the diff and provide:
 3. Whether the original task description was ambiguous or too complex`;
 
     try {
+      const truncDiff = diff.slice(0, 50000);
+      const diffMessage = `Diff:\n\`\`\`\n${truncDiff}\`\`\`\n\nTask: ${taskContext.taskDescription}`;
       const response = config.escalationProvider === 'moonshot'
-        ? await this.callMoonshotApi(escalationPrompt, `Diff:\n\`\`\`\n${diff.slice(0, 50000)}\`\`\`\n\nTask: ${taskContext.taskDescription}`, config.escalationModel)
-        : await this.callAnthropicApi(escalationPrompt, `Diff:\n\`\`\`\n${diff.slice(0, 50000)}\`\`\`\n\nTask: ${taskContext.taskDescription}`, config.escalationModel);
+        ? await this.callMoonshotApi(escalationPrompt, diffMessage, config.escalationModel)
+        : await this.callAnthropicApi(escalationPrompt, diffMessage, config.escalationModel);
 
       return response;
     } catch (err) {

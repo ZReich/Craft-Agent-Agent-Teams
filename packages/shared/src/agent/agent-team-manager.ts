@@ -9,6 +9,8 @@
 
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
+import { existsSync, statSync } from 'fs';
+import { isAbsolute, resolve as resolvePath } from 'path';
 import type {
   AgentTeam,
   AgentTeammate,
@@ -20,17 +22,31 @@ import type {
   ModelPresetId,
   TeamActivityEvent,
   TeamActivityType,
+  KnowledgeTelemetryEvent,
   TeamCostSummary,
   TeammateTokenUsage,
   Spec,
   DRIAssignment,
   YoloState,
   TeamPhase,
+  QualityGateResult,
+  DesignArtifact,
 } from '@craft-agent/core/types';
 import type { ReviewLoopOrchestrator } from '../agent-teams/review-loop';
 import type { YoloOrchestrator } from '../agent-teams/yolo-orchestrator';
 import { TeamStateStore } from '../agent-teams/team-state-store';
 import type { TeamState } from '../agent-teams/team-state-store';
+import {
+  type ConflictWarning,
+  type KnowledgeEntry,
+  type KnowledgeEntryInput,
+} from '../agent-teams/team-knowledge-bus';
+import {
+  buildKnowledgeInjectionBlock,
+  clearAllTeamKnowledgeBuses,
+  clearTeamKnowledgeBus,
+  getOrCreateTeamKnowledgeBus,
+} from '../agent-teams/team-knowledge-bus-registry';
 
 // ============================================================
 // Types
@@ -73,6 +89,11 @@ export interface TeamManagerEvents {
   }) => void;
 }
 
+interface TaskCompletionContract {
+  requiredArtifacts: string[];
+  requireNonEmptyArtifacts: boolean;
+}
+
 // ============================================================
 // Manager Implementation
 // ============================================================
@@ -94,6 +115,12 @@ export class AgentTeamManager extends EventEmitter {
   private yoloOrchestrators = new Map<string, YoloOrchestrator>();  // teamId → orchestrator
   // Implements REQ-002: persist team state across close/reopen
   private teamStateStores = new Map<string, TeamStateStore>();  // teamId → state store
+  // Implements BUG-7: store quality gate results per teammate
+  private qualityGateResults = new Map<string, Map<string, QualityGateResult>>();  // teamId → (teammateSessionId → result)
+  /** Team workspace roots for resolving relative completion artifact paths */
+  private teamWorkspaceRoots = new Map<string, string>();  // teamId → workspace root
+  /** Optional per-task completion contracts (artifact requirements, etc.) */
+  private taskCompletionContracts = new Map<string, Map<string, TaskCompletionContract>>(); // teamId → taskId → contract
 
   /** Review loop orchestrator — when set, task completions are routed through quality gates */
   private reviewLoop: ReviewLoopOrchestrator | null = null;
@@ -149,6 +176,58 @@ export class AgentTeamManager extends EventEmitter {
     return store.load();
   }
 
+  // ── Hydration (restore persisted state on reload) ────────────
+
+  /**
+   * Hydrate a task from persisted state into in-memory Maps.
+   * Implements REQ-002: persist team state across close/reopen.
+   * Unlike createTask(), this does NOT emit events or persist again.
+   */
+  hydrateTask(teamId: string, task: TeamTask): void {
+    const tasks = this.tasks.get(teamId) || [];
+    // Avoid duplicates (idempotent reload)
+    if (!tasks.some(t => t.id === task.id)) {
+      tasks.push(task);
+      this.tasks.set(teamId, tasks);
+    }
+  }
+
+  /**
+   * Hydrate a message from persisted state into in-memory Maps.
+   * Implements REQ-002: persist team state across close/reopen.
+   */
+  hydrateMessage(teamId: string, message: TeammateMessage): void {
+    const messages = this.messages.get(teamId) || [];
+    // Avoid duplicates
+    if (!messages.some(m => m.id === message.id)) {
+      this.pushCapped(messages, message, AgentTeamManager.MAX_TEAM_MESSAGES);
+      this.messages.set(teamId, messages);
+    }
+  }
+
+  /**
+   * Hydrate an activity event from persisted state into in-memory Maps.
+   * Implements REQ-002: persist team state across close/reopen.
+   */
+  hydrateActivity(teamId: string, event: TeamActivityEvent): void {
+    const log = this.activityLog.get(teamId) || [];
+    // Avoid duplicates
+    if (!log.some(e => e.id === event.id)) {
+      this.pushCapped(log, event, AgentTeamManager.MAX_ACTIVITY_EVENTS);
+      this.activityLog.set(teamId, log);
+    }
+  }
+
+  /**
+   * Hydrate a knowledge entry from persisted team state.
+   * Implements REQ-NEXT-001: shared memory survives app restart.
+   */
+  hydrateKnowledgeEntry(teamId: string, entry: KnowledgeEntry): void {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    const bus = getOrCreateTeamKnowledgeBus(resolvedTeamId)
+    bus.publishHydrated(entry)
+  }
+
   private pushCapped<T>(arr: T[], item: T, max: number): void {
     arr.push(item);
     if (arr.length > max) {
@@ -193,6 +272,10 @@ export class AgentTeamManager extends EventEmitter {
     this.messages.set(team.id, []);
     this.activityLog.set(team.id, []);
     this.teamDRIAssignments.set(team.id, []);
+    this.teamWorkspaceRoots.set(team.id, options.workspaceRootPath);
+    this.taskCompletionContracts.set(team.id, new Map());
+    // Implements REQ-NEXT-001: initialize shared team knowledge bus on team creation.
+    getOrCreateTeamKnowledgeBus(team.id)
 
     // Initialize state store for persistence (REQ-002)
     if (options.workspaceRootPath) {
@@ -205,6 +288,30 @@ export class AgentTeamManager extends EventEmitter {
     this.addActivity(team.id, 'teammate-spawned', 'Team created', undefined, undefined);
 
     return team;
+  }
+
+  /**
+   * Clear all in-memory team data. Called on app startup before restoring
+   * fresh state from disk.
+   * Implements C5: Prevent unbounded Map growth across long-lived Electron sessions.
+   */
+  evictAllTeamData(): void {
+    this.teams.clear();
+    this.tasks.clear();
+    this.messages.clear();
+    this.activityLog.clear();
+    this.teamSpecs.clear();
+    this.teamDRIAssignments.clear();
+    this.synthesisRequested.clear();
+    this.yoloStates.clear();
+    this.teamPhases.clear();
+    this.yoloOrchestrators.clear();
+    this.teamStateStores.clear();
+    this.qualityGateResults.clear();
+    this.teamWorkspaceRoots.clear();
+    this.taskCompletionContracts.clear();
+    if (this.designArtifacts) this.designArtifacts.clear();
+    clearAllTeamKnowledgeBuses()
   }
 
   /** Clean up a team — shut down all teammates and mark as completed */
@@ -236,17 +343,27 @@ export class AgentTeamManager extends EventEmitter {
     // Stop YOLO if running
     this.stopYolo(teamId, 'Team cleanup');
 
-    // Release hot runtime memory immediately after cleanup.
-    this.tasks.delete(teamId);
-    this.messages.delete(teamId);
-    this.activityLog.delete(teamId);
-    this.teamSpecs.delete(teamId);
-    this.teamDRIAssignments.delete(teamId);
-    this.synthesisRequested.delete(teamId);
-    this.yoloStates.delete(teamId);
-    this.yoloOrchestrators.delete(teamId);
-    this.teamPhases.delete(teamId);
-    this.teams.delete(teamId);
+    // BUG-015 fix: Release hot runtime memory, resilient to partial failures.
+    // Each delete is independent — continue cleanup even if one fails.
+    const maps: Map<unknown, unknown>[] = [
+      this.tasks, this.messages, this.activityLog, this.teamSpecs,
+      this.teamDRIAssignments, this.yoloStates, this.yoloOrchestrators,
+      this.teamPhases, this.designArtifacts, this.qualityGateResults,
+      this.teamStateStores, this.teamWorkspaceRoots, this.taskCompletionContracts, this.teams,
+    ];
+    for (const map of maps) {
+      try { map.delete(teamId); } catch { /* continue cleanup */ }
+    }
+    try { this.synthesisRequested.delete(teamId); } catch { /* continue */ }
+    try { clearTeamKnowledgeBus(teamId) } catch { /* continue */ }
+  }
+
+  /** Update team lifecycle status and emit 'team:updated' */
+  updateTeamStatus(teamId: string, status: AgentTeam['status']): void {
+    const team = this.teams.get(teamId);
+    if (!team) return;
+    team.status = status;
+    this.emit('team:updated', team);
   }
 
   /** Get team status */
@@ -288,6 +405,120 @@ export class AgentTeamManager extends EventEmitter {
   /** Set DRI assignments for a team */
   setTeamDRIAssignments(teamId: string, assignments: DRIAssignment[]): void {
     this.teamDRIAssignments.set(teamId, assignments);
+  }
+
+  // Implements BUG-1: Toggle delegate mode for a team
+  toggleDelegateMode(teamId: string): boolean {
+    const team = this.teams.get(teamId);
+    if (!team) return false;
+    team.delegateMode = !team.delegateMode;
+    this.emit('team:updated', team);
+    this.addActivity(
+      teamId,
+      team.delegateMode ? 'teammate-spawned' : 'teammate-shutdown',
+      `Delegate mode ${team.delegateMode ? 'enabled' : 'disabled'} — lead is ${team.delegateMode ? 'coordination-only' : 'fully active'}`,
+    );
+    return team.delegateMode;
+  }
+
+  // Implements BUG-7: Store quality gate result for a teammate
+  storeQualityResult(teamId: string, teammateSessionId: string, result: QualityGateResult): void {
+    if (!this.qualityGateResults.has(teamId)) {
+      this.qualityGateResults.set(teamId, new Map());
+    }
+    this.qualityGateResults.get(teamId)!.set(teammateSessionId, result);
+    // BUG-020 fix: Persist quality gate result to disk
+    this.teamStateStores.get(teamId)?.appendQualityGate(teammateSessionId, result);
+  }
+
+  // Implements BUG-7: Get quality gate results for all teammates in a team
+  getQualityReports(teamId: string): Record<string, QualityGateResult> {
+    const results = this.qualityGateResults.get(teamId);
+    if (!results) return {};
+    const out: Record<string, QualityGateResult> = {};
+    for (const [sessionId, result] of results) {
+      out[sessionId] = result;
+    }
+    return out;
+  }
+
+  // ============================================================
+  // Team Knowledge Bus (REQ-NEXT-001)
+  // ============================================================
+
+  /**
+   * Publish a shared knowledge entry for a team and persist it to TeamStateStore.
+   */
+  publishKnowledge(teamId: string, entry: KnowledgeEntryInput): string {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    const bus = getOrCreateTeamKnowledgeBus(resolvedTeamId)
+    const entryId = bus.publish(entry)
+    const persisted = bus.getById(entryId)
+    if (persisted) {
+      this.teamStateStores.get(resolvedTeamId)?.appendKnowledge(persisted)
+    }
+    return entryId
+  }
+
+  /**
+   * Query knowledge by semantic tags.
+   */
+  queryKnowledge(teamId: string, tags: string[], limit?: number): KnowledgeEntry[] {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    return getOrCreateTeamKnowledgeBus(resolvedTeamId).query(tags, limit)
+  }
+
+  /**
+   * Query knowledge by natural-language text.
+   * Implements REQ-NEXT-001: shared memory retrieval without forcing exact tag matches.
+   */
+  queryKnowledgeText(teamId: string, query: string, limit?: number): KnowledgeEntry[] {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    return getOrCreateTeamKnowledgeBus(resolvedTeamId).queryText(query, limit)
+  }
+
+  /**
+   * Query knowledge entries connected to a file path.
+   */
+  queryKnowledgeByFile(teamId: string, filePath: string): KnowledgeEntry[] {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    return getOrCreateTeamKnowledgeBus(resolvedTeamId).queryByFile(filePath)
+  }
+
+  /**
+   * Build compact shared-memory context for task prompt injection.
+   * Keeps payload within a bounded character budget (~token-aware guardrail).
+   */
+  buildKnowledgeContext(
+    teamId: string,
+    taskPrompt: string,
+    options?: { maxChars?: number; maxEntries?: number; maxTokens?: number },
+  ): string {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    return buildKnowledgeInjectionBlock(resolvedTeamId, taskPrompt, options)
+  }
+
+  /**
+   * Record a file-edit attempt for overlap detection.
+   * Returns a conflict warning when two teammates overlap on the same file
+   * within the configured window, and persists warning entries automatically.
+   */
+  recordKnowledgeFileEdit(
+    teamId: string,
+    params: { filePath: string; teammateId: string; teammateName: string; taskId?: string },
+  ): ConflictWarning | null {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    const bus = getOrCreateTeamKnowledgeBus(resolvedTeamId)
+    const { conflict, warningEntry } = bus.recordFileEdit(params)
+    if (warningEntry) {
+      this.teamStateStores.get(resolvedTeamId)?.appendKnowledge(warningEntry)
+    }
+    return conflict
+  }
+
+  getKnowledgeConflicts(teamId: string, filePath: string): ConflictWarning[] {
+    const resolvedTeamId = this.resolveTeamId(teamId)
+    return getOrCreateTeamKnowledgeBus(resolvedTeamId).getConflicts(filePath)
   }
 
   // ============================================================
@@ -394,6 +625,10 @@ export class AgentTeamManager extends EventEmitter {
       assignee?: string;
       dependencies?: string[];
       taskType?: TeamTask['taskType'];
+      /** Relative or absolute paths that must exist before task can complete */
+      requiredArtifacts?: string[];
+      /** When true (default), required artifacts must be non-empty files */
+      requireNonEmptyArtifacts?: boolean;
     }
   ): TeamTask {
     const task: TeamTask = {
@@ -415,6 +650,20 @@ export class AgentTeamManager extends EventEmitter {
     const teamTasks = this.tasks.get(teamId) || [];
     this.pushCapped(teamTasks, task, AgentTeamManager.MAX_TEAM_TASKS + 100);
     this.tasks.set(teamId, this.trimTasks(teamTasks));
+
+    // Store completion contract (separate from TeamTask type to avoid type churn in shared core model)
+    const requiredArtifacts = (options?.requiredArtifacts || [])
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (requiredArtifacts.length > 0) {
+      if (!this.taskCompletionContracts.has(teamId)) {
+        this.taskCompletionContracts.set(teamId, new Map());
+      }
+      this.taskCompletionContracts.get(teamId)!.set(task.id, {
+        requiredArtifacts,
+        requireNonEmptyArtifacts: options?.requireNonEmptyArtifacts ?? true,
+      });
+    }
 
     // Persist to disk (REQ-002)
     this.teamStateStores.get(teamId)?.appendTask(task);
@@ -444,6 +693,51 @@ export class AgentTeamManager extends EventEmitter {
     const task = teamTasks.find(t => t.id === taskId);
     if (!task) return;
 
+    // Enforce completion contracts (if any) before accepting completion.
+    // Implements REQ-102/REQ-104: strict completion artifact contract for deterministic handoffs.
+    if (status === 'completed') {
+      const validation = this.validateTaskCompletionContract(teamId, taskId);
+      if (!validation.valid) {
+        task.status = 'failed';
+        const reasons: string[] = [];
+        if (validation.missing.length > 0) {
+          reasons.push(`missing artifacts: ${validation.missing.join(', ')}`);
+        }
+        if (validation.empty.length > 0) {
+          reasons.push(`empty artifacts: ${validation.empty.join(', ')}`);
+        }
+        const reasonText = reasons.join(' | ');
+        this.teamStateStores.get(teamId)?.appendTask(task);
+        this.emit('task:updated', task);
+        this.tasks.set(teamId, this.trimTasks(teamTasks));
+        this.addActivity(
+          teamId,
+          'task-failed',
+          `Task "${task.title}" completion contract failed (${reasonText})`,
+          undefined,
+          undefined,
+          taskId
+        );
+        return;
+      }
+    }
+
+    // BUG-021 fix: Validate state transitions to prevent invalid status changes
+    const validTransitions: Record<TeamTaskStatus, TeamTaskStatus[]> = {
+      pending: ['in_progress', 'blocked', 'failed'],
+      in_progress: ['completed', 'in_review', 'failed', 'blocked'],
+      in_review: ['completed', 'in_progress', 'failed'],
+      blocked: ['pending', 'in_progress', 'failed'],
+      completed: ['in_progress'], // Allow reopening completed tasks
+      failed: ['pending', 'in_progress'], // Allow retrying failed tasks
+    };
+    const allowed = validTransitions[task.status];
+    if (allowed && !allowed.includes(status)) {
+      // Log but don't throw — callers may not expect exceptions
+      console.warn(`[AgentTeamManager] Invalid task transition: ${task.status} → ${status} for task "${task.title}" (${taskId})`);
+      return;
+    }
+
     // --- Review Loop Interception ---
     // When a teammate marks a task "completed" and a review loop is attached,
     // route through quality gates instead of accepting immediately.
@@ -463,6 +757,7 @@ export class AgentTeamManager extends EventEmitter {
 
     task.status = status;
     if (assignee !== undefined) task.assignee = assignee;
+    if (status === 'in_progress' && !task.startedAt) task.startedAt = new Date().toISOString();
     if (status === 'completed') task.completedAt = new Date().toISOString();
 
     // Persist updated task to disk (REQ-002)
@@ -488,6 +783,48 @@ export class AgentTeamManager extends EventEmitter {
         this.autoSynthesize(teamId);
       }
     }
+  }
+
+  private validateTaskCompletionContract(
+    teamId: string,
+    taskId: string,
+  ): { valid: boolean; missing: string[]; empty: string[] } {
+    const contract = this.taskCompletionContracts.get(teamId)?.get(taskId);
+    if (!contract || contract.requiredArtifacts.length === 0) {
+      return { valid: true, missing: [], empty: [] };
+    }
+
+    const workspaceRoot = this.teamWorkspaceRoots.get(teamId) || process.cwd();
+    const missing: string[] = [];
+    const empty: string[] = [];
+
+    for (const artifactPath of contract.requiredArtifacts) {
+      const resolvedPath = isAbsolute(artifactPath)
+        ? artifactPath
+        : resolvePath(workspaceRoot, artifactPath);
+
+      if (!existsSync(resolvedPath)) {
+        missing.push(artifactPath);
+        continue;
+      }
+
+      if (contract.requireNonEmptyArtifacts) {
+        try {
+          const stats = statSync(resolvedPath);
+          if (!stats.isFile() || stats.size <= 0) {
+            empty.push(artifactPath);
+          }
+        } catch {
+          empty.push(artifactPath);
+        }
+      }
+    }
+
+    return {
+      valid: missing.length === 0 && empty.length === 0,
+      missing,
+      empty,
+    };
   }
 
   /** Get task list for a team */
@@ -547,7 +884,8 @@ export class AgentTeamManager extends EventEmitter {
     details: string,
     teammateId?: string,
     teammateName?: string,
-    taskId?: string
+    taskId?: string,
+    telemetry?: KnowledgeTelemetryEvent,
   ): void {
     const event: TeamActivityEvent = {
       id: `act-${randomUUID().slice(0, 8)}`,
@@ -558,6 +896,7 @@ export class AgentTeamManager extends EventEmitter {
       teammateId,
       teammateName,
       taskId,
+      telemetry,
     };
 
     const log = this.activityLog.get(teamId) || [];
@@ -577,9 +916,10 @@ export class AgentTeamManager extends EventEmitter {
     details: string,
     teammateId?: string,
     teammateName?: string,
-    taskId?: string
+    taskId?: string,
+    telemetry?: KnowledgeTelemetryEvent,
   ): void {
-    this.addActivity(teamId, type, details, teammateId, teammateName, taskId);
+    this.addActivity(teamId, type, details, teammateId, teammateName, taskId, telemetry);
   }
 
   /** Get activity log for a team */
@@ -743,6 +1083,8 @@ export class AgentTeamManager extends EventEmitter {
   /** Update YOLO state for a team (called by the orchestrator's onStateChange callback) */
   updateYoloState(teamId: string, state: YoloState): void {
     this.yoloStates.set(teamId, state);
+    // BUG-020 fix: Persist YOLO state snapshot to disk
+    this.teamStateStores.get(teamId)?.appendYoloState(state);
     this.emit('yolo:state_changed', teamId, state);
   }
 
@@ -758,6 +1100,23 @@ export class AgentTeamManager extends EventEmitter {
   isYoloActive(teamId: string): boolean {
     const orchestrator = this.yoloOrchestrators.get(teamId);
     return orchestrator?.isRunning() ?? false;
+  }
+
+  // ============================================================
+  // Design Artifacts (REQ-007)
+  // ============================================================
+
+  private designArtifacts = new Map<string, DesignArtifact>();  // teamId → design artifact
+
+  /** Attach a design artifact to a team (after design selection) */
+  setDesignArtifact(teamId: string, artifact: DesignArtifact): void {
+    this.designArtifacts.set(teamId, artifact);
+    this.addActivity(teamId, 'design-selected', `Design "${artifact.selectedVariantName}" selected as implementation starting point`);
+  }
+
+  /** Get the design artifact for a team */
+  getDesignArtifact(teamId: string): DesignArtifact | undefined {
+    return this.designArtifacts.get(teamId);
   }
 
   // ============================================================

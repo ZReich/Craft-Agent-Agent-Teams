@@ -1,0 +1,200 @@
+{
+  "prdVersion": "1.0",
+  "id": "agent-teams-unresolved-remediation-2026-02-15",
+  "generatedAt": "2026-02-15T23:07:00-07:00",
+  "title": "Agent Teams: Naming Conventions + Unresolved Architecture Remediation",
+  "owner": "Craft Agent",
+  "status": "in_progress",
+  "summary": "Remediate unresolved agent-teams issues: codename bypass, legacy role drift, partial strategy migration, missing QG-aware model wiring, and incomplete completion-safety guardrails.",
+  "problemStatement": {
+    "currentState": [
+      "Role-flavored codenames exist but are bypassed by explicit naming in prompts and internal spawn paths.",
+      "Role naming conventions (Orchestrator/Team Manager) are inconsistent across validation, UI labels, and runtime logic.",
+      "Smart strategy behavior exists in model resolution but QG-awareness is not threaded through all spawn paths.",
+      "Team creation UI still defaults to legacy presets and explicit teammate names, reducing consistency with current strategy model.",
+      "Lead completion guard tracks pending spawns but safety timeout execution path is incomplete."
+    ],
+    "impact": [
+      "Users do not observe expected naming conventions in active teams.",
+      "Routing/model behavior is less predictable than design intent.",
+      "UI/settings and runtime orchestration diverge, increasing operational confusion and regressions."
+    ]
+  },
+  "goals": [
+    "Enforce codename-first behavior whenever teammate name is omitted or blank.",
+    "Ensure current strategy conventions (smart/codex/budget/custom) are reflected in team creation flows.",
+    "Thread quality-gate state into worker model resolution in all primary spawn paths.",
+    "Harden completion safety to avoid indefinite pending-spawn state.",
+    "Align visible role terminology toward Orchestrator naming without breaking runtime compatibility."
+  ],
+  "nonGoals": [
+    "Replacing MCP tool schema for Task/TeamCreate in this pass.",
+    "Full persisted role-value migration from lead/head to orchestrator/team-manager in storage.",
+    "Large-scale redesign of team dashboard information architecture."
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "priority": "high",
+      "title": "Primary user flow and success criteria",
+      "description": "When users spawn teammates without names, teammates must receive deterministic role-flavored codenames and those names must appear in logs/events/UI.",
+      "acceptanceTests": [
+        "Task tool guidance marks name as optional and recommends omission for codename generation.",
+        "Internal YOLO worker/head spawn paths no longer hardcode worker-* or head-* names.",
+        "Blank teammate names from UI do not block team creation and result in generated codenames."
+      ],
+      "dri": "Craft Agent"
+    },
+    {
+      "id": "REQ-002",
+      "priority": "high",
+      "title": "Data input/output and persistence behavior",
+      "description": "Role aliases and teammate naming inputs are normalized consistently at ingress points while preserving runtime compatibility.",
+      "acceptanceTests": [
+        "IPC teammate spawn accepts orchestrator/team-manager aliases and maps safely.",
+        "Session role normalization accepts old/new names and normalizes deterministically.",
+        "Legacy preset inputs in team creation dialog normalize to current strategy presets."
+      ],
+      "dri": "Craft Agent"
+    },
+    {
+      "id": "REQ-003",
+      "priority": "high",
+      "title": "Performance, reliability, and safety",
+      "description": "Spawn/model logic must use quality-gate context where intended and completion state must avoid deadlock.",
+      "acceptanceTests": [
+        "resolveTeamModelForRole receives qgEnabled in teammate and YOLO spawn paths.",
+        "Pending teammate spawn safety timeout is set and clears blocked lead completion.",
+        "No regression in teammate session creation and completion event flow."
+      ],
+      "dri": "Craft Agent"
+    }
+  ],
+  "ralphLoop": {
+    "name": "Ralph Loop",
+    "description": "Iterative remediation loop: Diagnose → Patch → Verify → Review → Synthesize.",
+    "stages": [
+      {
+        "id": "R1",
+        "name": "Diagnose",
+        "outputs": [
+          "Root-cause map for each unresolved issue",
+          "Traceability from issue to source file"
+        ]
+      },
+      {
+        "id": "R2",
+        "name": "Patch",
+        "outputs": [
+          "Minimal targeted code changes",
+          "Backward-compatible normalization paths"
+        ]
+      },
+      {
+        "id": "R3",
+        "name": "Verify",
+        "outputs": [
+          "Targeted tests/typechecks for changed modules",
+          "Manual assertion checklist"
+        ]
+      },
+      {
+        "id": "R4",
+        "name": "Review",
+        "outputs": [
+          "Blocking vs non-blocking findings",
+          "Risk and rollback notes"
+        ]
+      },
+      {
+        "id": "R5",
+        "name": "Synthesize",
+        "outputs": [
+          "Requirement coverage status",
+          "Remaining gaps and next iteration backlog"
+        ]
+      }
+    ]
+  },
+  "traceability": [
+    {
+      "requirementId": "REQ-001",
+      "files": [
+        "packages/shared/src/agent/core/prompt-builder.ts",
+        "apps/electron/src/main/sessions.ts",
+        "apps/electron/src/renderer/components/teams/TeamCreationDialog.tsx"
+      ],
+      "tests": [
+        "apps/electron/src/main/__tests__/teammate-codenames.test.ts"
+      ]
+    },
+    {
+      "requirementId": "REQ-002",
+      "files": [
+        "apps/electron/src/main/sessions.ts",
+        "apps/electron/src/main/ipc.ts",
+        "apps/electron/src/renderer/components/app-shell/SessionList.tsx",
+        "apps/electron/src/renderer/components/teams/TeamStatusBar.tsx"
+      ],
+      "tests": [
+        "apps/electron/src/main/__tests__/teammate-codenames.test.ts"
+      ]
+    },
+    {
+      "requirementId": "REQ-003",
+      "files": [
+        "apps/electron/src/main/sessions.ts"
+      ],
+      "tests": [
+        "packages/shared/src/agent-teams/yolo-orchestrator.test.ts"
+      ]
+    }
+  ],
+  "rolloutPlan": {
+    "strategy": "Incremental",
+    "steps": [
+      "Ship normalization + codename-path updates behind existing agent-teams toggle.",
+      "Verify new teams exhibit expected naming in logs/UI.",
+      "Monitor spawn/completion telemetry for timeout warnings and regressions."
+    ],
+    "featureFlags": [
+      "agentTeams.enabled"
+    ],
+    "monitoring": [
+      "AgentTeams spawn/completion logs",
+      "Pending spawn timeout warning frequency",
+      "Team creation success/failure rate"
+    ]
+  },
+  "rollbackPlan": {
+    "triggerConditions": [
+      "Increased teammate spawn failures",
+      "Completion events no longer emitted for lead sessions",
+      "Unexpected role-routing regressions"
+    ],
+    "steps": [
+      "Revert modified files in this PRD scope.",
+      "Restore previous prompt guidance and team creation defaults.",
+      "Disable new normalization paths if partial rollback is needed."
+    ]
+  },
+  "risks": [
+    {
+      "id": "RISK-001",
+      "severity": "medium",
+      "description": "Alias normalization could mask invalid role inputs.",
+      "mitigation": "Log coercions and default only when alias map misses."
+    },
+    {
+      "id": "RISK-002",
+      "severity": "medium",
+      "description": "UI text changes may diverge from internal role values.",
+      "mitigation": "Keep runtime legacy values while gradually harmonizing display labels."
+    }
+  ],
+  "successMetrics": [
+    ">=95% teammate spawns without explicit name use generated codenames in production logs.",
+    "0 unresolved lead sessions blocked by pending spawn count after timeout window.",
+    "No increase in team spawn failure rate after deployment."
+  ]
+}

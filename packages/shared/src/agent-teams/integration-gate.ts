@@ -18,10 +18,32 @@ import { promisify } from 'util';
 import { runTypeCheckCached, runTestSuiteCached } from './local-checks';
 
 const execAsync = promisify(exec);
+const CODE_FILE_PATTERN = /\.(ts|tsx|js|jsx)$/;
+const WIRING_EXCLUDE_PATTERNS: RegExp[] = [
+  /\.test\./,
+  /\.spec\./,
+  /__tests__\//,
+  /\.d\.ts$/,
+  /\.config\./,
+  /vitest\./,
+  /jest\./,
+  /index\.(ts|tsx|js|jsx)$/, // barrel files are valid import targets
+];
 
 // ============================================================
 // Types
 // ============================================================
+
+export interface WiringCheckResult {
+  /** Whether all new files are wired into the project */
+  passed: boolean;
+  /** New files that ARE imported by existing code */
+  wiredFiles: string[];
+  /** New files that are NOT imported anywhere — potentially dead code */
+  unwiredFiles: string[];
+  /** Warnings (e.g., test files excluded from wiring check) */
+  warnings: string[];
+}
 
 export interface IntegrationCheckResult {
   /** Whether all integration checks passed */
@@ -46,6 +68,8 @@ export interface IntegrationCheckResult {
     hasConflicts: boolean;
     conflictFiles: string[];
   };
+  /** Wiring verification — checks new files are imported from project */
+  wiring?: WiringCheckResult;
   /** Which teammates' changes may have caused failures */
   brokenBy: string[];
   /** When the check ran */
@@ -114,6 +138,14 @@ export class IntegrationGate extends EventEmitter {
       testSuite = { passed: false, total: 0, passed_count: 0, failed: 0, skipped: 0, failedTests: ['Skipped — type check failed'] };
     }
 
+    // Run wiring verification — check that new files are imported from existing code
+    let wiring: WiringCheckResult | undefined;
+    try {
+      wiring = await this.verifyWiring(workDir);
+    } catch {
+      // Wiring check is advisory — don't block on errors
+    }
+
     const passed = typeCheck.passed && testSuite.passed && !conflicts.hasConflicts;
     const durationMs = Date.now() - startTime;
 
@@ -132,6 +164,7 @@ export class IntegrationGate extends EventEmitter {
       typeCheck,
       testSuite,
       conflicts,
+      wiring,
       brokenBy,
       timestamp: new Date().toISOString(),
       durationMs,
@@ -232,5 +265,113 @@ export class IntegrationGate extends EventEmitter {
     }
 
     return Array.from(breakers);
+  }
+
+  /**
+   * Verify that new files created in the working tree are actually imported/used
+   * by existing code. Catches the "built but not connected" problem where features
+   * are implemented correctly but never wired into the project.
+   *
+   * Strategy:
+   * 1. Get list of new (untracked or added) .ts/.tsx/.js/.jsx files from git diff
+   * 2. For each new file, search the codebase for import statements that reference it
+   * 3. Report any files that have zero importers as "unwired"
+   *
+   * Excludes: test files, type declaration files, config files, index barrel files
+   */
+  async verifyWiring(workDir: string): Promise<WiringCheckResult> {
+    const allNewFiles = await this.collectNewFiles(workDir);
+    const newCodeFiles = allNewFiles.filter(file => this.isWiringTarget(file));
+
+    if (newCodeFiles.length === 0) {
+      return {
+        passed: true,
+        wiredFiles: [],
+        unwiredFiles: [],
+        warnings: ['No new code files detected in diff'],
+      };
+    }
+
+    const wiredFiles: string[] = [];
+    const unwiredFiles: string[] = [];
+    const warnings: string[] = [];
+
+    for (const filePath of newCodeFiles) {
+      const importers = await this.findImporters(workDir, filePath);
+      if (importers.length > 0) {
+        wiredFiles.push(filePath);
+      } else {
+        unwiredFiles.push(filePath);
+      }
+    }
+
+    const excludedFiles = allNewFiles.filter(f =>
+      CODE_FILE_PATTERN.test(f) && WIRING_EXCLUDE_PATTERNS.some(p => p.test(f))
+    );
+    if (excludedFiles.length > 0) {
+      warnings.push(`${excludedFiles.length} test/config files excluded from wiring check`);
+    }
+
+    return {
+      passed: unwiredFiles.length === 0,
+      wiredFiles,
+      unwiredFiles,
+      warnings,
+    };
+  }
+
+  private async collectNewFiles(workDir: string): Promise<string[]> {
+    const diffOutput = await this.readNewFileDiff(workDir);
+    const untrackedOutput = await this.readUntrackedFiles(workDir);
+    return [...diffOutput.trim().split('\n'), ...untrackedOutput.trim().split('\n')]
+      .filter(Boolean)
+      .filter((f, i, arr) => arr.indexOf(f) === i);
+  }
+
+  private async readNewFileDiff(workDir: string): Promise<string> {
+    try {
+      const r = await execAsync('git diff --name-only --diff-filter=A HEAD', { cwd: workDir, timeout: 10000 });
+      return r.stdout;
+    } catch {
+      try {
+        const r = await execAsync('git diff --name-only --diff-filter=A --cached', { cwd: workDir, timeout: 10000 });
+        return r.stdout;
+      } catch {
+        return '';
+      }
+    }
+  }
+
+  private async readUntrackedFiles(workDir: string): Promise<string> {
+    try {
+      const r = await execAsync('git ls-files --others --exclude-standard', { cwd: workDir, timeout: 10000 });
+      return r.stdout;
+    } catch {
+      return '';
+    }
+  }
+
+  private isWiringTarget(filePath: string): boolean {
+    return CODE_FILE_PATTERN.test(filePath) && !WIRING_EXCLUDE_PATTERNS.some(p => p.test(filePath));
+  }
+
+  private async findImporters(workDir: string, filePath: string): Promise<string[]> {
+    const fileName = filePath.replace(/\.(ts|tsx|js|jsx)$/, '').split('/').pop() || filePath;
+
+    try {
+      const { stdout } = await execAsync(
+        `git grep -l --untracked -E "(import|require).*['\\"](\.\./|\./|@).*${this.escapeRegex(fileName)}['\\"]" -- "*.ts" "*.tsx" "*.js" "*.jsx"`,
+        { cwd: workDir, timeout: 15000 },
+      );
+
+      return stdout.trim().split('\n').filter(Boolean)
+        .filter(f => f !== filePath && !f.includes('.test.') && !f.includes('.spec.'));
+    } catch {
+      return [];
+    }
+  }
+
+  private escapeRegex(str: string): string {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 }

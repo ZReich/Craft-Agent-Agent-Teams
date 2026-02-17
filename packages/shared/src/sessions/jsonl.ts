@@ -20,6 +20,19 @@ import { pickSessionFields } from './utils.ts';
 
 const SESSION_PATH_TOKEN = '{{SESSION_PATH}}';
 
+// Implements REQ-FIX-001: Progressive buffer for oversized session headers.
+// Agent team sessions with SDD compliance reports can exceed 8KB.
+// Start small for fast reads on normal sessions, grow as needed.
+const HEADER_INITIAL_BUFFER = 8192;   // 8KB — covers most sessions
+const HEADER_MAX_BUFFER = 524_288;    // 512KB — upper bound safety limit
+
+// Implements REQ-FIX-002: Cap compliance reports stored in session header.
+// Each report is ~970 bytes; 5 entries ≈ 5KB, well within the initial 8KB buffer.
+const MAX_COMPLIANCE_REPORTS_IN_HEADER = 5;
+
+// Implements BUG-E: Strip trailing \r from JSONL lines (Windows CRLF handling)
+const stripCR = (line: string): string => line.endsWith('\r') ? line.slice(0, -1) : line;
+
 /**
  * Replace absolute session directory paths with a portable token.
  * Applied after JSON.stringify so paths embedded anywhere in message content
@@ -50,21 +63,44 @@ export function expandSessionPath(jsonLine: string, sessionDir: string): string 
 /**
  * Read only the header (first line) from a session.jsonl file.
  * Uses low-level fs to read minimal bytes for fast list loading.
+ *
+ * Implements REQ-FIX-001: Progressive buffer growth for oversized headers.
+ * Agent team sessions with SDD can accumulate large sddComplianceReports arrays
+ * that push the header beyond a fixed buffer size. We start at 8KB and double
+ * up to 512KB until the first newline is found.
  */
 export function readSessionHeader(sessionFile: string): SessionHeader | null {
   try {
     const fd = openSync(sessionFile, 'r');
-    const buffer = Buffer.alloc(8192); // 8KB is plenty for metadata header
-    const bytesRead = readSync(fd, buffer, 0, 8192, 0);
-    closeSync(fd);
+    try {
+      let bufferSize = HEADER_INITIAL_BUFFER;
+      let content = '';
 
-    const content = buffer.toString('utf-8', 0, bytesRead);
-    const firstNewline = content.indexOf('\n');
-    const firstLine = firstNewline > 0 ? content.slice(0, firstNewline) : content;
+      while (bufferSize <= HEADER_MAX_BUFFER) {
+        const buffer = Buffer.alloc(bufferSize);
+        const bytesRead = readSync(fd, buffer, 0, bufferSize, 0);
+        content = buffer.toString('utf-8', 0, bytesRead);
 
-    return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
-  } catch (error) {
-    debug('[jsonl] Failed to read session header:', sessionFile, error);
+        const firstNewline = content.indexOf('\n');
+        if (firstNewline > 0 || bytesRead < bufferSize) {
+          // Found newline or reached EOF — extract first line
+          const firstLine = stripCR(firstNewline > 0 ? content.slice(0, firstNewline) : content);
+          return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
+        }
+
+        // No newline found and buffer was full — header is larger, double and retry
+        bufferSize *= 2;
+      }
+
+      // Exceeded max buffer — try parsing what we have (likely truncated)
+      debug(`[jsonl] Session header exceeds ${HEADER_MAX_BUFFER} bytes, may be truncated:`, sessionFile);
+      const firstLine = stripCR(content);
+      return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // Silently return null — caller (listSessions) tracks and summarizes failures
     return null;
   }
 }
@@ -76,7 +112,7 @@ export function readSessionHeader(sessionFile: string): SessionHeader | null {
 export function readSessionJsonl(sessionFile: string): StoredSession | null {
   try {
     const content = readFileSync(sessionFile, 'utf-8');
-    const lines = content.split('\n').filter(Boolean);
+    const lines = content.split('\n').map(stripCR).filter(Boolean);
 
     const firstLine = lines[0];
     if (!firstLine) return null;
@@ -140,8 +176,17 @@ export function writeSessionJsonl(sessionFile: string, session: StoredSession): 
  * Uses pickSessionFields() to ensure all persistent fields are included.
  */
 export function createSessionHeader(session: StoredSession): SessionHeader {
+  const fields = pickSessionFields(session);
+
+  // Implements REQ-FIX-002: Cap compliance reports to prevent unbounded header growth.
+  // Agent team sessions with SDD accumulate reports over time (~970 bytes each).
+  // Without this cap, headers exceed the read buffer and sessions silently disappear on restart.
+  if (Array.isArray(fields.sddComplianceReports) && fields.sddComplianceReports.length > MAX_COMPLIANCE_REPORTS_IN_HEADER) {
+    fields.sddComplianceReports = fields.sddComplianceReports.slice(-MAX_COMPLIANCE_REPORTS_IN_HEADER);
+  }
+
   return {
-    ...pickSessionFields(session),
+    ...fields,
     // Path conversion for portability
     workspaceRootPath: toPortablePath(session.workspaceRootPath),
     // Override lastUsedAt with current timestamp (save time, not original)
@@ -161,6 +206,7 @@ export function createSessionHeader(session: StoredSession): SessionHeader {
     teammateName: session.teammateName,
     teammateSessionIds: session.teammateSessionIds,
     teamColor: session.teamColor,
+    teamStatus: session.teamStatus,
   } as SessionHeader;
 }
 
@@ -220,16 +266,33 @@ function extractPreview(messages: StoredMessage[]): string | undefined {
 /**
  * Async version of readSessionHeader for parallel I/O.
  * Uses fs/promises for non-blocking reads.
+ *
+ * Implements REQ-FIX-001: Progressive buffer growth (same as sync version).
  */
 export async function readSessionHeaderAsync(sessionFile: string): Promise<SessionHeader | null> {
   try {
     const handle = await open(sessionFile, 'r');
     try {
-      const buffer = Buffer.alloc(8192);
-      const { bytesRead } = await handle.read(buffer, 0, 8192, 0);
-      const content = buffer.toString('utf-8', 0, bytesRead);
-      const firstNewline = content.indexOf('\n');
-      const firstLine = firstNewline > 0 ? content.slice(0, firstNewline) : content;
+      let bufferSize = HEADER_INITIAL_BUFFER;
+      let content = '';
+
+      while (bufferSize <= HEADER_MAX_BUFFER) {
+        const buffer = Buffer.alloc(bufferSize);
+        const { bytesRead } = await handle.read(buffer, 0, bufferSize, 0);
+        content = buffer.toString('utf-8', 0, bytesRead);
+
+        const firstNewline = content.indexOf('\n');
+        if (firstNewline > 0 || bytesRead < bufferSize) {
+          const firstLine = stripCR(firstNewline > 0 ? content.slice(0, firstNewline) : content);
+          return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
+        }
+
+        bufferSize *= 2;
+      }
+
+      // Exceeded max buffer
+      debug(`[jsonl] Session header exceeds ${HEADER_MAX_BUFFER} bytes (async):`, sessionFile);
+      const firstLine = stripCR(content);
       return safeJsonParse(expandSessionPath(firstLine, dirname(sessionFile))) as SessionHeader;
     } finally {
       await handle.close();
@@ -248,7 +311,7 @@ export async function readSessionHeaderAsync(sessionFile: string): Promise<Sessi
 export function readSessionMessages(sessionFile: string): StoredMessage[] {
   try {
     const content = readFileSync(sessionFile, 'utf-8');
-    const lines = content.split('\n').filter(Boolean);
+    const lines = content.split('\n').map(stripCR).filter(Boolean);
     // Skip first line (header), expand session path tokens, parse rest as messages resiliently
     const sessionDir = dirname(sessionFile);
     const expandedLines = lines.slice(1).map(line => expandSessionPath(line, sessionDir));

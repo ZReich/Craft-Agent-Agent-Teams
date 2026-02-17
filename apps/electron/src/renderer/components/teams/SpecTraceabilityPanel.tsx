@@ -12,6 +12,7 @@ export interface SpecTraceabilityPanelProps {
     tasks: string[]
     tickets: string[]
   }>
+  specRequirementIds?: string[]
   className?: string
 }
 
@@ -63,16 +64,40 @@ function ItemPill({ icon: Icon, value, title }: { icon: React.ComponentType<{ cl
   )
 }
 
-export function SpecTraceabilityPanel({ traceabilityMap, className }: SpecTraceabilityPanelProps) {
+export function SpecTraceabilityPanel({ traceabilityMap, specRequirementIds = [], className }: SpecTraceabilityPanelProps) {
   const [expandedRows, setExpandedRows] = React.useState<Record<string, boolean>>({})
+  const executionRequirementIds = React.useMemo(
+    () => traceabilityMap.map((entry) => entry.requirementId),
+    [traceabilityMap],
+  )
+  const specOnly = React.useMemo(
+    () => specRequirementIds.filter((id) => !executionRequirementIds.includes(id)),
+    [specRequirementIds, executionRequirementIds],
+  )
+  const executionOnly = React.useMemo(
+    () => executionRequirementIds.filter((id) => !specRequirementIds.includes(id)),
+    [executionRequirementIds, specRequirementIds],
+  )
+  const hasMismatch = specOnly.length > 0 || executionOnly.length > 0
 
   return (
     <div className={cn('flex flex-col h-full', className)}>
       <div className="px-4 py-3 border-b border-border bg-background/50">
         <h3 className="text-sm font-semibold">Spec Traceability</h3>
         <p className="text-xs text-muted-foreground mt-0.5">
-          Requirements ? Files ? Tests ? Tasks
+          Requirements • Files • Test refs • Tasks
         </p>
+        <p className="text-[11px] text-muted-foreground mt-0.5">
+          Note: test refs are linked files/patterns, not executed test runs.
+        </p>
+        <p className="text-[11px] text-muted-foreground mt-1">
+          Spec: {specRequirementIds.length} • Execution: {executionRequirementIds.length}
+        </p>
+        {hasMismatch && (
+          <p className="text-[11px] text-yellow-600 dark:text-yellow-400 mt-0.5">
+            Mismatch detected • Spec-only: {specOnly.length} • Execution-only: {executionOnly.length}
+          </p>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 overflow-auto">
@@ -85,7 +110,7 @@ export function SpecTraceabilityPanel({ traceabilityMap, className }: SpecTracea
             <div className="grid grid-cols-[220px_1fr_1fr_1fr_110px] text-[11px] text-muted-foreground uppercase tracking-wide px-3 py-2 border-b border-border bg-background/30 sticky top-0 z-10">
               <div>Requirement</div>
               <div>Files</div>
-              <div>Tests</div>
+              <div>Test Refs</div>
               <div>Tasks</div>
               <div>Status</div>
             </div>
@@ -148,13 +173,13 @@ export function SpecTraceabilityPanel({ traceabilityMap, className }: SpecTracea
                             </div>
 
                             <div className="space-y-1">
-                              <p className="text-[11px] font-medium text-muted-foreground">Tests</p>
+                              <p className="text-[11px] font-medium text-muted-foreground">Test references</p>
                               <div className="flex flex-wrap gap-1">
                                 {entry.tests.length > 0
                                   ? entry.tests.map((test) => (
                                     <ItemPill key={test} icon={TestTube2} value={test} title={test} />
                                   ))
-                                  : <span className="text-[11px] text-muted-foreground">No linked tests</span>}
+                                  : <span className="text-[11px] text-muted-foreground">No linked test references</span>}
                               </div>
                             </div>
 

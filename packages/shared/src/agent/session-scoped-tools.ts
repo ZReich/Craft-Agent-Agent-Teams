@@ -19,11 +19,12 @@
  * - source_microsoft_oauth_trigger: Start Microsoft OAuth authentication
  * - source_credential_prompt: Prompt user for API credentials
  * - transform_data: Transform data files via script for datatable/spreadsheet blocks
+ * - TeamKnowledgeQuery: Query shared team memory (REQ-NEXT-001)
  */
 
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { getSessionPlansPath, getSessionDataPath, getSessionPath } from '../sessions/storage.ts';
+import { getSessionPlansPath, getSessionDataPath, getSessionPath, loadSession } from '../sessions/storage.ts';
 import { debug } from '../utils/debug.ts';
 import { DOC_REFS } from '../docs/index.ts';
 import { createClaudeContext } from './claude-context.ts';
@@ -31,6 +32,7 @@ import { basename, join, normalize, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { teamManager } from './agent-team-manager.ts';
 
 // Import handlers from session-tools-core
 import {
@@ -245,6 +247,14 @@ const transformDataSchema = {
   outputFile: z.string().describe('Output file name relative to session data/ dir (e.g., "transactions.json")'),
 };
 
+const teamKnowledgeQuerySchema = {
+  tags: z.array(z.string()).optional().describe('Semantic tags to query (e.g., ["auth", "api", "jwt"]). If omitted, returns the most recent team knowledge entries.'),
+  filePath: z.string().optional().describe('Optional file path filter for file-specific knowledge and conflict warnings'),
+  query: z.string().optional().describe('Optional free-text query. Keywords are converted to tags when tags are not provided.'),
+  limit: z.number().int().min(1).max(25).optional().describe('Max number of knowledge entries to return (default: 10)'),
+  includeConflicts: z.boolean().optional().describe('Include conflict registry warnings (requires filePath for precise filtering)'),
+};
+
 // ============================================================
 // Tool Descriptions
 // ============================================================
@@ -358,6 +368,18 @@ Use this tool when you need to transform large datasets (20+ rows) into structur
 - Output must be valid JSON: \`{"title": "...", "columns": [...], "rows": [...]}\`
 
 **Security:** Runs in an isolated subprocess with no access to API keys or credentials. 30-second timeout.`,
+
+  TeamKnowledgeQuery: `Query shared team memory from the Team Knowledge Bus (REQ-NEXT-001).
+
+Use this tool when you want explicit memory retrieval instead of rediscovering context from scratch.
+It returns cross-teammate discoveries, patterns, decisions, interface-contract notes, and conflict warnings.
+
+Best use cases:
+- "What do we already know about auth/session handling?"
+- "Show prior discoveries for src/api/routes.ts"
+- "Did anyone report conflicts on this file?"
+
+If tags are omitted, the tool returns the most recent knowledge entries for the active team session.`,
 
   source_credential_prompt: `Prompt the user to enter credentials for a source.
 
@@ -524,6 +546,165 @@ async function handleTransformData(
 }
 
 // ============================================================
+// TeamKnowledgeQuery Handler (REQ-NEXT-001)
+// ============================================================
+
+function keywordTagsFromQuery(query?: string): string[] {
+  if (!query) return [];
+  return Array.from(
+    new Set(
+      query
+        .toLowerCase()
+        .split(/[^a-z0-9_-]+/g)
+        .map((part) => part.trim())
+        .filter((part) => part.length >= 3)
+        .slice(0, 20),
+    ),
+  );
+}
+
+function resolveTeamIdForSession(workspaceRootPath: string, sessionId: string): string | null {
+  const session = loadSession(workspaceRootPath, sessionId);
+  if (!session) return null;
+
+  if (session.teamId) {
+    return teamManager.resolveTeamId(session.teamId);
+  }
+
+  if (session.parentSessionId) {
+    const parent = loadSession(workspaceRootPath, session.parentSessionId);
+    if (parent?.teamId) {
+      return teamManager.resolveTeamId(parent.teamId);
+    }
+  }
+
+  return null;
+}
+
+async function handleTeamKnowledgeQuery(
+  sessionId: string,
+  workspaceRootPath: string,
+  args: {
+    tags?: string[];
+    filePath?: string;
+    query?: string;
+    limit?: number;
+    includeConflicts?: boolean;
+  },
+): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+  const teamId = resolveTeamIdForSession(workspaceRootPath, sessionId);
+  if (!teamId) {
+    return {
+      content: [{
+        type: 'text',
+        text: 'No active team context found for this session. Team knowledge is available only inside agent-team sessions.',
+      }],
+      isError: true,
+    };
+  }
+
+  const limit = Math.max(1, Math.min(25, Number(args.limit ?? 10)));
+  const tags = (args.tags && args.tags.length > 0)
+    ? args.tags
+    : keywordTagsFromQuery(args.query);
+
+  const rows: Array<{
+    id: string;
+    type: string;
+    source: string;
+    content: string;
+    tags: string[];
+    filePaths: string[];
+    timestamp: number;
+  }> = [];
+  const seen = new Set<string>();
+
+  const addRows = (entries: Array<{
+    id: string;
+    type: string;
+    source: string;
+    content: string;
+    tags: string[];
+    filePaths?: string[];
+    timestamp: number;
+  }>) => {
+    for (const entry of entries) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      rows.push({
+        id: entry.id,
+        type: entry.type,
+        source: entry.source,
+        content: entry.content,
+        tags: entry.tags ?? [],
+        filePaths: entry.filePaths ?? [],
+        timestamp: entry.timestamp,
+      });
+    }
+  };
+
+  if (args.filePath) {
+    addRows(teamManager.queryKnowledgeByFile(teamId, args.filePath));
+  }
+  if (args.query && args.query.trim().length > 0) {
+    addRows(teamManager.queryKnowledgeText(teamId, args.query, limit));
+  }
+  addRows(teamManager.queryKnowledge(teamId, tags, limit));
+
+  const ordered = rows
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, limit);
+
+  const actorSession = loadSession(workspaceRootPath, sessionId);
+  const actorName = actorSession?.teammateName || actorSession?.name || sessionId;
+  teamManager.logActivity(
+    teamId,
+    'phase-advanced',
+    `[KnowledgeBus][query] results=${ordered.length} limit=${limit}${args.filePath ? ` file=${args.filePath}` : ''}${args.query ? ' text=true' : ''}`,
+    sessionId,
+    actorName,
+  );
+
+  const lines: string[] = [];
+  lines.push(`Team Knowledge results (${ordered.length}) for team "${teamId}":`);
+
+  if (ordered.length === 0) {
+    lines.push('- No matching shared knowledge entries found.');
+    lines.push('- Tip: try broader tags or omit filters to fetch recent memory.');
+  } else {
+    for (const entry of ordered) {
+      const whenIso = new Date(entry.timestamp).toISOString();
+      const fileHint = entry.filePaths.length > 0 ? ` | files: ${entry.filePaths.slice(0, 3).join(', ')}` : '';
+      const tagHint = entry.tags.length > 0 ? ` | tags: ${entry.tags.slice(0, 6).join(', ')}` : '';
+      lines.push(`- [${entry.type}] ${entry.source} @ ${whenIso}${fileHint}${tagHint}`);
+      lines.push(`  ${entry.content}`);
+    }
+  }
+
+  if (args.includeConflicts) {
+    const filePath = args.filePath;
+    if (filePath) {
+      const conflicts = teamManager.getKnowledgeConflicts(teamId, filePath).slice(0, 5);
+      if (conflicts.length > 0) {
+        lines.push('', `Conflict warnings for ${filePath}:`);
+        for (const conflict of conflicts) {
+          const editors = conflict.editors.map((editor) => editor.teammateName).join(', ');
+          lines.push(`- ${new Date(conflict.detectedAt).toISOString()} | editors: ${editors}`);
+        }
+      } else {
+        lines.push('', `Conflict warnings for ${filePath}: none`);
+      }
+    } else {
+      lines.push('', 'Conflict warnings requested: provide filePath for precise conflict lookup.');
+    }
+  }
+
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+  };
+}
+
+// ============================================================
 // Main Factory Function
 // ============================================================
 
@@ -632,6 +813,11 @@ export function getSessionScopedTools(
     // transform_data
     tool('transform_data', TOOL_DESCRIPTIONS.transform_data, transformDataSchema, async (args) => {
       return handleTransformData(sessionId, workspaceRootPath, args);
+    }),
+
+    // TeamKnowledgeQuery (REQ-NEXT-001)
+    tool('TeamKnowledgeQuery', TOOL_DESCRIPTIONS.TeamKnowledgeQuery, teamKnowledgeQuerySchema, async (args) => {
+      return handleTeamKnowledgeQuery(sessionId, workspaceRootPath, args);
     }),
 
   ];

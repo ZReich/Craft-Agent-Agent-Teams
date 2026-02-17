@@ -62,6 +62,11 @@ export async function handleSourceTest(
   let connectionStatus: ConnectionStatus = 'unknown';
   let connectionError: string | undefined;
 
+  // BUG-027 fix: Validate sourceSlug to prevent path traversal
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(sourceSlug) || sourceSlug.includes('..')) {
+    return errorResponse(`Invalid source slug: '${sourceSlug}'. Must be lowercase alphanumeric with hyphens.`);
+  }
+
   // 1. Check source exists
   if (!sourceExists(ctx.workspacePath, sourceSlug)) {
     return errorResponse(`Source '${sourceSlug}' not found in workspace.`);
@@ -287,8 +292,10 @@ function checkCompleteness(
       if (wordCount < 50) {
         lines.push('  ℹ Guide is short - consider adding more context');
       }
-    } catch {
-      lines.push('✓ guide.md exists');
+    } catch (readErr) {
+      // BUG-011 fix: Report the actual read failure instead of claiming success
+      hasWarning = true;
+      lines.push(`⚠ guide.md exists but could not be read: ${readErr instanceof Error ? readErr.message : 'Unknown error'}`);
     }
   }
 
@@ -478,10 +485,29 @@ async function testApiConnectionWithAuth(
         const headerNames = source.api!.headerNames;
         try {
           const headerValues = JSON.parse(token) as Record<string, string>;
+          // BUG-026 fix: Validate that all expected headers are present in the token
+          const missingHeaders = headerNames.filter(h => !headerValues[h]);
+          if (missingHeaders.length > 0) {
+            return {
+              lines: [`⚠ Multi-header auth token is missing values for: ${missingHeaders.join(', ')}`],
+              success: false,
+              hasError: true,
+              error: `Token JSON is missing required headers: ${missingHeaders.join(', ')}. Expected keys: ${headerNames.join(', ')}`,
+              attempted: true,
+            };
+          }
           for (const headerName of headerNames) {
-            if (headerValues[headerName]) {
-              headers[headerName] = headerValues[headerName];
+            const headerValue = headerValues[headerName];
+            if (typeof headerValue !== 'string' || headerValue.length === 0) {
+              return {
+                lines: [`⚠ Multi-header auth token has invalid value for: ${headerName}`],
+                success: false,
+                hasError: true,
+                error: `Header "${headerName}" must be a non-empty string in token JSON`,
+                attempted: true,
+              };
             }
+            headers[headerName] = headerValue;
           }
         } catch {
           // Token is not valid JSON - this is a configuration error for multi-header auth

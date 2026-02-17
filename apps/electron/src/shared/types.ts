@@ -145,6 +145,9 @@ import type {
   YoloState,
   SpecEvolutionProposal,
   TeamPhase,
+  // Heartbeat types (REQ-HB-001)
+  HeartbeatSnapshot,
+  HeartbeatBatchEvent,
 } from '@craft-agent/core/types';
 export type {
   AgentTeam,
@@ -188,6 +191,9 @@ export type {
   YoloState,
   SpecEvolutionProposal,
   TeamPhase,
+  // Heartbeat types (REQ-HB-001)
+  HeartbeatSnapshot,
+  HeartbeatBatchEvent,
 };
 
 
@@ -526,6 +532,8 @@ export interface Session {
   teammateSessionIds?: string[]
   /** Team accent color (hex, e.g., "#7c3aed") */
   teamColor?: string
+  /** Team lifecycle status — set when team events fire */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error'
   /** Whether SDD/spec mode is enabled for this session */
   sddEnabled?: boolean
   /** Currently active spec identifier */
@@ -585,6 +593,8 @@ export interface CreateSessionOptions {
   sddEnabled?: boolean
   /** Active spec identifier for SDD sessions */
   activeSpecId?: string
+  /** Override thinking level for this session (used by agent teams strategy-based thinking) */
+  thinkingLevel?: ThinkingLevel
 }
 
 // Events sent from main to renderer
@@ -1073,6 +1083,13 @@ export const IPC_CHANNELS = {
   AGENT_TEAMS_EVENT: 'agentTeams:event',  // main → renderer broadcast
   AGENT_TEAMS_GET_PROVIDER_KEY: 'agentTeams:getProviderKey',
   AGENT_TEAMS_SET_PROVIDER_KEY: 'agentTeams:setProviderKey',
+  AGENT_TEAMS_TOGGLE_DELEGATE: 'agentTeams:toggleDelegate',
+  AGENT_TEAMS_GET_QUALITY_REPORTS: 'agentTeams:getQualityReports',
+
+  // Design Templates (workspace-scoped)
+  DESIGN_TEMPLATES_LIST: 'designTemplates:list',
+  DESIGN_TEMPLATES_LOAD: 'designTemplates:load',
+  DESIGN_TEMPLATES_DELETE: 'designTemplates:delete',
 
   // YOLO (Autonomous Execution)
   AGENT_TEAMS_YOLO_START: 'agentTeams:yoloStart',
@@ -1508,6 +1525,15 @@ export interface ElectronAPI {
   getTeamSpec(teamId: string): Promise<import('@craft-agent/core/types').Spec | undefined>
   getAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter'): Promise<{ hasKey: boolean; maskedKey?: string }>
   setAgentTeamsProviderKey(provider: 'moonshot' | 'openrouter', key: string): Promise<void>
+  // Implements BUG-1: toggle delegate mode
+  toggleDelegateMode(teamId: string): Promise<boolean>
+  // Implements BUG-7: get quality gate reports
+  getQualityReports(teamId: string): Promise<Record<string, import('@craft-agent/core/types').QualityGateResult>>
+
+  // Design Templates (workspace-scoped)
+  listDesignTemplates(workspaceId: string): Promise<Array<{ id: string; name: string; direction: string; framework: string | null; typescript: boolean; fileCount: number; createdAt: string; compatible: boolean }>>
+  loadDesignTemplate(workspaceId: string, templateId: string): Promise<import('@craft-agent/core/types').DesignTemplate | null>
+  deleteDesignTemplate(workspaceId: string, templateId: string): Promise<void>
 
   // YOLO (Autonomous Execution)
   startYolo(teamId: string, objective: string, config?: Partial<YoloConfig>): Promise<YoloState>
@@ -1516,7 +1542,22 @@ export interface ElectronAPI {
   getYoloState(teamId: string): Promise<YoloState | null>
 
   // Team State Persistence (REQ-002)
-  getPersistedTeamState(leadSessionId: string): Promise<{ messages: TeammateMessage[]; tasks: TeamTask[]; activity: TeamActivityEvent[] } | null>
+  getPersistedTeamState(leadSessionId: string): Promise<{
+    messages: TeammateMessage[]
+    tasks: TeamTask[]
+    activity: TeamActivityEvent[]
+    knowledge?: Array<{
+      id: string
+      type: string
+      content: string
+      source: string
+      filePaths?: string[]
+      tags: string[]
+      timestamp: number
+    }>
+    qualityGates?: Record<string, QualityGateResult>
+    yoloState?: YoloState | null
+  } | null>
 
   // SDD
   getSDDState(sessionId: string): Promise<{ sddEnabled: boolean; activeSpecId?: string; sddComplianceReports: SpecComplianceReport[] }>
@@ -1613,6 +1654,10 @@ export interface WorkspaceSettings {
   agentTeamsEscalationThinking?: boolean
   /** Cost cap in USD for agent teams operations */
   agentTeamsCostCapUsd?: number
+  /** Kill-switch for prompt-time team memory injection (REQ-008) */
+  agentTeamsMemoryInjectionEnabled?: boolean
+  /** Kill-switch for Team Dashboard Knowledge metrics surface (REQ-008) */
+  agentTeamsKnowledgeMetricsUiEnabled?: boolean
   // Quality gate settings (stored in agentTeams.qualityGates)
   qualityGatesEnabled?: boolean
   qualityGatesPassThreshold?: number
@@ -1623,6 +1668,22 @@ export interface WorkspaceSettings {
   qualityGatesKnownFailingTests?: string[]
   /** Test scope for per-task quality gates: 'affected' (vitest --changed), 'full' (entire suite), 'none' (skip tests) */
   qualityGatesTestScope?: 'affected' | 'full' | 'none'
+  /** Run stages 3-6 via a single combined AI call (REQ-NEXT-012) */
+  qualityGatesUseCombinedReview?: boolean
+  /** Enable confidence-based bypass for low-risk AI stages (REQ-NEXT-013) */
+  qualityGatesBypassEnabled?: boolean
+  qualityGatesBypassArchMaxDiffLines?: number
+  qualityGatesBypassArchMaxFilesChanged?: number
+  qualityGatesBypassArchAllowNewFiles?: boolean
+  qualityGatesBypassArchDefaultScore?: number
+  qualityGatesBypassSimplicityMaxDiffLines?: number
+  qualityGatesBypassSimplicityMaxFunctionLines?: number
+  qualityGatesBypassSimplicityDefaultScore?: number
+  qualityGatesBypassErrorsMaxDiffLines?: number
+  qualityGatesBypassErrorsRequirePassingTests?: boolean
+  qualityGatesBypassErrorsMinTestCount?: number
+  qualityGatesBypassErrorsDisallowAsyncAwait?: boolean
+  qualityGatesBypassErrorsDefaultScore?: number
   qualityGatesSyntaxEnabled?: boolean
   qualityGatesTestsEnabled?: boolean
   qualityGatesArchEnabled?: boolean
@@ -1649,6 +1710,15 @@ export interface WorkspaceSettings {
   sddAutoComplianceReports?: boolean
   sddDefaultSpecTemplate?: string
   sddSpecTemplates?: Array<{ id: string; name: string; description?: string }>
+  // Design Flow settings (stored in agentTeams.designFlow)
+  /** Whether design flow (multi-variant UI generation) is enabled */
+  designFlowEnabled?: boolean
+  /** Number of design variants per generation round (2, 4, or 6) */
+  designFlowVariantsPerRound?: 2 | 4 | 6
+  /** Model override for design generation (null = inherit headModel) */
+  designFlowDesignModel?: string | null
+  /** Auto-save selected designs as workspace templates */
+  designFlowAutoSaveTemplates?: boolean
   /** Source slugs to auto-enable for new sessions */
   enabledSourceSlugs?: string[]
 }

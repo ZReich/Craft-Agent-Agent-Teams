@@ -41,6 +41,12 @@ export function cronToHuman(cronExpr: string, timezone?: string): string {
       return n === 1 ? 'Every hour' : `Every ${n} hours`;
     }
 
+    // Hourly at specific minute
+    if (minute!.match(/^\d+$/) && hour === '*' && dayOfMonth === '*' && month === '*' && dayOfWeek === '*') {
+      const m = parseInt(minute!);
+      return m === 0 ? 'Every hour' : `Every hour at :${m.toString().padStart(2, '0')}`;
+    }
+
     // Specific time patterns
     if (minute!.match(/^\d+$/) && hour!.match(/^\d+$/)) {
       const timeStr = formatTime(parseInt(hour!), parseInt(minute!));

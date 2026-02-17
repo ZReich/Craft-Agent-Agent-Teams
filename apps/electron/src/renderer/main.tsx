@@ -29,7 +29,7 @@ const IGNORED_CONSOLE_PATTERNS = [
 // giving Sentry the same rich context visible in DevTools without needing sourcemaps.
 //
 // NOTE: Source map upload is intentionally disabled — see main/index.ts for details.
-const consoleIntegration = captureConsoleIntegration({ levels: ['warn', 'error'] }) as unknown as NonNullable<Parameters<typeof sentryInit>[0]['integrations']>[number]
+const consoleIntegration = captureConsoleIntegration({ levels: ['warn', 'error'] })
 sentryInit(
   {
     integrations: [consoleIntegration],

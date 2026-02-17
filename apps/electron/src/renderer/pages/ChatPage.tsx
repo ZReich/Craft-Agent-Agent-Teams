@@ -7,7 +7,8 @@
 
 import * as React from 'react'
 import { atom, useAtomValue, useSetAtom } from 'jotai'
-import { AlertCircle, Globe, Copy, RefreshCw, Link2Off, Info } from 'lucide-react'
+import { AlertCircle, Globe, Copy, RefreshCw, Link2Off, Info, CheckCircle2 } from 'lucide-react'
+import { formatDistanceToNowStrict } from 'date-fns'
 import { ChatDisplay, type ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
 import { TeamStatusBar } from '@/components/teams/TeamStatusBar'
 import { TeamDashboard } from '@/components/teams/TeamDashboard'
@@ -80,6 +81,9 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onChatMatchInfoChange,
     isFocusModeActive,
     onToggleFocusMode,
+    workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
   } = useAppShellContext()
 
   // Use the unified session options hook for clean access
@@ -233,6 +237,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     }
   }, [setOption, setPermissionMode, sessionOpts.permissionMode, sessionOpts.preYoloPermissionMode])
 
+  // Design Flow toggle handler
+  const handleDesignFlowChange = React.useCallback((enabled: boolean) => {
+    setOption('designFlowEnabled', enabled)
+  }, [setOption])
+
   // Check if session's locked connection has been removed
   const connectionUnavailable = React.useMemo(() =>
     isSessionConnectionUnavailable(session?.llmConnection, llmConnections),
@@ -327,6 +336,14 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const lastTeamRealtimeEventAtRef = React.useRef(0)
   const teamReloadTimerRef = React.useRef<number | null>(null)
 
+  // Implements REQ-UX-004: Auto-minimize dashboard on completion
+  const [teamCompletedMinimized, setTeamCompletedMinimized] = React.useState(false)
+  const teamCompletedSummaryRef = React.useRef<{
+    teammateCount: number
+    taskCount: number
+    elapsed: string
+  } | null>(null)
+
   const specLabel = React.useMemo(() => {
     if (!teamSpec) return undefined
     const title = teamSpec.title?.trim()
@@ -336,14 +353,13 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     return undefined
   }, [teamSpec])
 
-  // Auto-enable dashboard when session is a team lead
+  // Reset dashboard state when switching sessions. Default to the lead
+  // chat view — users can open the dashboard via the TeamStatusBar toggle.
   React.useEffect(() => {
-    if (session?.isTeamLead && session?.teamId) {
-      setShowTeamDashboard(true)
-    } else {
-      setShowTeamDashboard(false)
-    }
-  }, [session?.id, session?.isTeamLead, session?.teamId])
+    setShowTeamDashboard(false)
+    setTeamCompletedMinimized(false)
+    teamCompletedSummaryRef.current = null
+  }, [session?.id])
 
   const teamSessionIds = React.useMemo(() => {
     if (!session?.teamId) return []
@@ -387,19 +403,31 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     const traceability = latestReport?.traceabilityMap ?? []
     const coverage = latestReport?.requirementsCoverage ?? []
 
-    const requirements: SpecRequirementSummary[] = spec?.requirements?.length
+    const requirementsFromSpec: SpecRequirementSummary[] = spec?.requirements?.length
       ? spec.requirements.map((req) => {
         const trace = traceability.find((t) => t.requirementId === req.id)
+        // Implements REQ-SPEC-002: merge compliance report coverage into requirement status
+        const coverageEntry = coverage.find((c) => c.requirementId === req.id)
+        let effectiveStatus = req.status
+        if (effectiveStatus === 'pending' && coverageEntry) {
+          if (coverageEntry.coverage === 'full') effectiveStatus = 'implemented'
+          else if (coverageEntry.coverage === 'partial') effectiveStatus = 'in-progress'
+        }
         return {
           id: req.id,
           description: req.description,
           priority: req.priority,
-          status: req.status,
+          status: effectiveStatus,
           linkedTaskIds: trace?.tasks ?? req.linkedTaskIds,
           linkedTestPatterns: trace?.tests ?? req.linkedTestPatterns,
         }
       })
-      : coverage.map((entry) => {
+      : []
+
+    const specRequirementIds = new Set(requirementsFromSpec.map((req) => req.id))
+    const requirementsOnlyInCoverage: SpecRequirementSummary[] = coverage
+      .filter((entry) => !specRequirementIds.has(entry.requirementId))
+      .map((entry) => {
         const trace = traceability.find((t) => t.requirementId === entry.requirementId)
         const status: SpecRequirementSummary['status'] = entry.coverage === 'full'
           ? 'verified'
@@ -416,15 +444,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         }
       })
 
-    const traceabilityMap = traceability.length > 0
-      ? traceability
-      : (spec?.requirements ?? []).map((req) => ({
-        requirementId: req.id,
-        files: req.linkedFilePatterns ?? [],
-        tests: req.linkedTestPatterns ?? [],
-        tasks: req.linkedTaskIds ?? [],
-        tickets: [],
-      }))
+    const requirements: SpecRequirementSummary[] = [...requirementsFromSpec, ...requirementsOnlyInCoverage]
+
+    // Implements REQ-002: do not synthesize traceability from spec placeholders.
+    // Only render observed traceability reported by main process compliance generation.
+    const traceabilityMap = traceability
 
     setSpecRequirements(requirements)
     setSpecTraceabilityMap(traceabilityMap)
@@ -440,6 +464,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         mailboxMessages,
         activity,
         spec,
+        qReports,
       ] = await Promise.all([
         window.electronAPI.getTeamTasks(session.teamId),
         window.electronAPI.getTeamCost(session.teamId),
@@ -447,6 +472,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         window.electronAPI.getTeamMessages(session.teamId),
         window.electronAPI.getTeamActivity(session.teamId),
         window.electronAPI.getTeamSpec(session.teamId),
+        // Implements BUG-7: fetch quality gate reports
+        window.electronAPI.getQualityReports?.(session.teamId).catch(() => ({})),
       ])
       setTeamTasks(tasks ?? [])
       setTeamCost(cost)
@@ -454,6 +481,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       setTeamMailboxMessages(mailboxMessages ?? [])
       setTeamActivityEvents(activity ?? [])
       setTeamSpec(spec)
+      // Implements BUG-7: convert quality reports to Map
+      if (qReports && typeof qReports === 'object') {
+        setQualityReports(new Map(Object.entries(qReports)))
+      }
       deriveSpecData(spec, session?.sddComplianceReports ?? [])
     } catch (error) {
       console.error('[TeamDashboard] Failed to load team data:', error)
@@ -493,6 +524,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 
       if (event.type === 'team:updated') {
         setTeamStatus(event.payload.team)
+        // Implements REQ-UX-003: Propagate team status to session meta for sidebar display
+        if (event.payload.team?.status) {
+          updateMeta(session.id, { teamStatus: event.payload.team.status })
+        }
       }
       if (event.type === 'cost:updated') {
         setTeamCost(event.payload.summary)
@@ -610,8 +645,17 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
   const handleCleanupTeam = React.useCallback(async () => {
     if (!session?.teamId || !window.electronAPI) return
     try {
+      // Implements REQ-UX-004: Capture summary before cleanup for the minimized bar
+      teamCompletedSummaryRef.current = {
+        teammateCount: teamStatus?.members?.length ?? session.teammateSessionIds?.length ?? 0,
+        taskCount: teamTasks.length,
+        elapsed: session.createdAt
+          ? formatDistanceToNowStrict(new Date(session.createdAt))
+          : '',
+      }
       await window.electronAPI.cleanupAgentTeam(session.teamId)
       setShowTeamDashboard(false)
+      setTeamCompletedMinimized(true)
       await loadTeamData()
       toast.success('Team ended')
     } catch (error) {
@@ -620,7 +664,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         description: error instanceof Error ? error.message : 'Unknown error',
       })
     }
-  }, [session?.teamId, loadTeamData])
+  }, [session?.teamId, session?.teammateSessionIds, session?.createdAt, teamStatus?.members?.length, teamTasks.length, loadTeamData])
 
   const handleShutdownTeammate = React.useCallback(async (teammateId: string) => {
     if (!session?.teamId || !window.electronAPI) return
@@ -649,6 +693,104 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       })
     }
   }, [session?.id, loadTeamData])
+
+  // Implements BUG-1: Toggle delegate mode handler
+  const handleToggleDelegateMode = React.useCallback(async () => {
+    if (!session?.teamId || !window.electronAPI?.toggleDelegateMode) return
+    try {
+      await window.electronAPI.toggleDelegateMode(session.teamId)
+      await loadTeamData()
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to toggle delegate mode:', error)
+      toast.error('Failed to toggle delegate mode', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, loadTeamData])
+
+  // Implements BUG-8: Model swap handler
+  const handleSwapModel = React.useCallback(async (teammateId: string) => {
+    if (!session?.teamId || !window.electronAPI?.swapTeammateModel) return
+    try {
+      // Cycle through common models: current → next in rotation
+      const modelRotation = [
+        { model: 'claude-sonnet-4-5-20250929', provider: 'anthropic' },
+        { model: 'claude-haiku-4-5-20251001', provider: 'anthropic' },
+        { model: 'claude-opus-4-6', provider: 'anthropic' },
+      ]
+      const currentMember = teamStatus?.members.find(m => m.id === teammateId)
+      const currentIdx = modelRotation.findIndex(m => m.model === currentMember?.model)
+      const next = modelRotation[(currentIdx + 1) % modelRotation.length]
+      await window.electronAPI.swapTeammateModel(session.teamId, teammateId, next.model, next.provider)
+      await loadTeamData()
+      toast.success(`Model swapped to ${next.model.split('-').slice(0, 3).join('-')}`)
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to swap model:', error)
+      toast.error('Failed to swap model', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, teamStatus, loadTeamData])
+
+  // Implements BUG-9: Escalate teammate handler (swap to highest-tier model)
+  const handleEscalateTeammate = React.useCallback(async (teammateId: string) => {
+    if (!session?.teamId || !window.electronAPI?.swapTeammateModel) return
+    try {
+      await window.electronAPI.swapTeammateModel(session.teamId, teammateId, 'claude-opus-4-6', 'anthropic')
+      await loadTeamData()
+      toast.success('Teammate escalated to Opus')
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to escalate teammate:', error)
+      toast.error('Failed to escalate teammate', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, loadTeamData])
+
+  // Implements BUG-10: Spec requirement click navigation
+  const handleSpecRequirementClick = React.useCallback((requirementId: string) => {
+    // Find linked tasks for this requirement
+    const linkedTasks = teamTasks.filter(t => (t.requirementIds ?? []).includes(requirementId))
+    if (linkedTasks.length > 0) {
+      toast.info(`${requirementId}: ${linkedTasks.length} linked task(s)`, {
+        description: linkedTasks.map(t => `${t.title} (${t.status})`).join(', '),
+      })
+    } else {
+      toast.info(`${requirementId}: No linked tasks yet`)
+    }
+  }, [teamTasks])
+
+  // Implements BUG-11: Complete team handler with SDD validation
+  const handleCompleteTeam = React.useCallback(async () => {
+    if (!session?.teamId || !window.electronAPI) return
+    try {
+      // Refresh compliance before completing
+      if (session.sddEnabled && window.electronAPI.syncSDDCompliance) {
+        await window.electronAPI.syncSDDCompliance(session.id)
+      }
+      // Implements REQ-UX-004: Capture summary before cleanup for the minimized bar
+      teamCompletedSummaryRef.current = {
+        teammateCount: teamStatus?.members?.length ?? session.teammateSessionIds?.length ?? 0,
+        taskCount: teamTasks.length,
+        elapsed: session.createdAt
+          ? formatDistanceToNowStrict(new Date(session.createdAt))
+          : '',
+      }
+      await window.electronAPI.cleanupAgentTeam(session.teamId)
+      setShowTeamDashboard(false)
+      setTeamCompletedMinimized(true)
+      await loadTeamData()
+      toast.success('Team completed')
+    } catch (error) {
+      console.error('[TeamDashboard] Failed to complete team:', error)
+      toast.error('Failed to complete team', {
+        description: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
+  }, [session?.teamId, session?.id, session?.sddEnabled, session?.teammateSessionIds, session?.createdAt, teamStatus?.members?.length, teamTasks.length, loadTeamData])
+
+  // Implements BUG-7: Quality reports state
+  const [qualityReports, setQualityReports] = React.useState<Map<string, import('@craft-agent/core/types').QualityGateResult>>(new Map())
 
   // Share action handlers
   const handleShare = React.useCallback(async () => {
@@ -864,9 +1006,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 onMatchInfoChange={onChatMatchInfoChange}
                 connectionUnavailable={connectionUnavailable}
                 agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
-                onAgentTeamsChange={handleAgentTeamsChange}
+                onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
                 yoloModeEnabled={sessionOpts.yoloModeEnabled}
-                onYoloModeChange={handleYoloModeChange}
+                onYoloModeChange={workspaceYoloEnabled ? handleYoloModeChange : undefined}
+                designFlowEnabled={sessionOpts.designFlowEnabled}
+                onDesignFlowChange={workspaceDesignFlowEnabled ? handleDesignFlowChange : undefined}
               />
             </div>
           </div>
@@ -902,8 +1046,10 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     <>
       <div className="h-full flex flex-col">
         <PanelHeader  title={displayTitle} titleMenu={titleMenu} actions={shareButton} rightSidebarButton={rightSidebarButton} isRegeneratingTitle={isAsyncOperationOngoing} />
-        {/* Agent Teams status bar */}
-        {session?.teamId && (
+        {/* Agent Teams status bar — show as soon as metadata is available.
+            Implements H1: Works regardless of workspaceAgentTeamsEnabled for
+            historical team sessions. */}
+        {(session?.teamId || sessionMeta?.teamId) && (
           <TeamStatusBar
             session={session}
             isDashboardOpen={showTeamDashboard}
@@ -912,8 +1058,33 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             onToggleFocusMode={onToggleFocusMode}
           />
         )}
+        {/* Implements REQ-UX-004: Compact completion bar shown after dashboard is dismissed */}
+        {teamCompletedMinimized && teamCompletedSummaryRef.current && (
+          <button
+            type="button"
+            onClick={() => {
+              setTeamCompletedMinimized(false)
+              setShowTeamDashboard(true)
+            }}
+            className="mx-3 mb-1 mt-1 flex items-center gap-2 h-8 px-3 bg-success/5 border border-success/20 rounded-lg text-xs text-success-text cursor-pointer hover:bg-success/10 transition-colors"
+          >
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+            <span>
+              Team completed
+              {teamCompletedSummaryRef.current.teammateCount > 0 && (
+                <> · {teamCompletedSummaryRef.current.teammateCount} teammate{teamCompletedSummaryRef.current.teammateCount !== 1 ? 's' : ''}</>
+              )}
+              {teamCompletedSummaryRef.current.taskCount > 0 && (
+                <> · {teamCompletedSummaryRef.current.taskCount} task{teamCompletedSummaryRef.current.taskCount !== 1 ? 's' : ''}</>
+              )}
+              {teamCompletedSummaryRef.current.elapsed && (
+                <> · {teamCompletedSummaryRef.current.elapsed}</>
+              )}
+            </span>
+          </button>
+        )}
         {/* Team Dashboard (replaces chat when active) */}
-        {showTeamDashboard && session?.isTeamLead && session?.teamId ? (
+        {showTeamDashboard && (session?.isTeamLead || sessionMeta?.isTeamLead) && (session?.teamId || sessionMeta?.teamId) ? (
           <div className="flex-1 flex flex-col min-h-0">
             <TeamDashboard
               session={session}
@@ -924,12 +1095,18 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
               messages={teamMessages}
               activityEvents={teamActivityEvents}
               cost={teamCost}
+              qualityReports={qualityReports}
               onSendMessage={handleSendTeamMessage}
               onCleanupTeam={handleCleanupTeam}
+              onToggleDelegateMode={handleToggleDelegateMode}
+              onSwapModel={handleSwapModel}
               onShutdownTeammate={handleShutdownTeammate}
+              onEscalateTeammate={handleEscalateTeammate}
               specRequirements={specRequirements}
               specTraceabilityMap={specTraceabilityMap}
+              onSpecRequirementClick={handleSpecRequirementClick}
               onSpecRequirementStatusChange={handleRequirementStatusChange}
+              onCompleteTeam={handleCompleteTeam}
             />
           </div>
         ) : (
@@ -939,6 +1116,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             session={session}
             onSendMessage={(message, attachments, skillSlugs) => {
               if (session) {
+                // Implements REQ-UX-004: Clear minimized bar when user sends a new message
+                if (teamCompletedMinimized) {
+                  setTeamCompletedMinimized(false)
+                  teamCompletedSummaryRef.current = null
+                }
                 onSendMessage(session.id, message, attachments, skillSlugs)
               }
             }}
@@ -978,9 +1160,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             onMatchInfoChange={onChatMatchInfoChange}
             connectionUnavailable={connectionUnavailable}
             agentTeamsEnabled={sessionOpts.agentTeamsEnabled}
-            onAgentTeamsChange={handleAgentTeamsChange}
+            onAgentTeamsChange={workspaceAgentTeamsEnabled ? handleAgentTeamsChange : undefined}
             yoloModeEnabled={sessionOpts.yoloModeEnabled}
-            onYoloModeChange={handleYoloModeChange}
+            onYoloModeChange={workspaceYoloEnabled ? handleYoloModeChange : undefined}
+            designFlowEnabled={sessionOpts.designFlowEnabled}
+            onDesignFlowChange={workspaceDesignFlowEnabled ? handleDesignFlowChange : undefined}
           />
         </div>
         )}

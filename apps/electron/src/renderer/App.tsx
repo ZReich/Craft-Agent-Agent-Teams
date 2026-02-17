@@ -230,9 +230,12 @@ export default function App() {
   // Notifications enabled state (from app settings)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
 
-  // Workspace-level agent teams enabled (used as default for per-session toggles)
+  // Workspace-level feature flags (used as defaults for per-session toggles)
   // Implements REQ-001: When workspace setting is ON, session toggles default ON
   const [workspaceAgentTeamsEnabled, setWorkspaceAgentTeamsEnabled] = useState(false)
+  // Implements REQ-004: Independent workspace-level flags for YOLO and Design Flow
+  const [workspaceYoloEnabled, setWorkspaceYoloEnabled] = useState(false)
+  const [workspaceDesignFlowEnabled, setWorkspaceDesignFlowEnabled] = useState(false)
 
   // Sources and skills for badge extraction
   const sources = useAtomValue(sourcesAtom)
@@ -388,15 +391,22 @@ export default function App() {
     window.electronAPI.getWorkspaces().then(setWorkspaces)
     window.electronAPI.getNotificationsEnabled().then(setNotificationsEnabled)
     // Load sessions AND workspace settings in parallel, then merge
-    // Implements REQ-001: workspace agentTeamsEnabled drives per-session default
+    // Implements REQ-001, REQ-004: workspace feature flags drive per-session defaults
     Promise.all([
       window.electronAPI.getSessions(),
       windowWorkspaceId
         ? window.electronAPI.getAgentTeamsEnabled(windowWorkspaceId)
         : Promise.resolve(false),
-    ]).then(([loadedSessions, wsAgentTeamsEnabled]) => {
-      // Persist workspace-level setting for use in session creation
+      windowWorkspaceId
+        ? window.electronAPI.getWorkspaceSettings(windowWorkspaceId)
+        : Promise.resolve(null),
+    ]).then(([loadedSessions, wsAgentTeamsEnabled, wsSettings]) => {
+      // Persist workspace-level feature flags for use in session creation
       setWorkspaceAgentTeamsEnabled(wsAgentTeamsEnabled)
+      const wsYoloEnabled = !!wsSettings?.yoloMode && wsSettings.yoloMode !== 'off'
+      const wsDesignFlowEnabled = !!wsSettings?.designFlowEnabled
+      setWorkspaceYoloEnabled(wsYoloEnabled)
+      setWorkspaceDesignFlowEnabled(wsDesignFlowEnabled)
       // Initialize per-session atoms and metadata map
       // NOTE: No sessionsAtom used - sessions are only in per-session atoms
       initializeSessions(loadedSessions)
@@ -406,13 +416,14 @@ export default function App() {
         // Only store non-default options to keep the map lean
         const hasNonDefaultMode = s.permissionMode && s.permissionMode !== 'ask'
         const hasNonDefaultThinking = s.thinkingLevel && s.thinkingLevel !== 'think'
-        if (hasNonDefaultMode || hasNonDefaultThinking || wsAgentTeamsEnabled) {
+        if (hasNonDefaultMode || hasNonDefaultThinking || wsAgentTeamsEnabled || wsYoloEnabled || wsDesignFlowEnabled) {
           optionsMap.set(s.id, {
             ultrathinkEnabled: false, // ultrathink is single-shot, never persisted
             permissionMode: s.permissionMode ?? 'ask',
             thinkingLevel: s.thinkingLevel ?? 'think',
             agentTeamsEnabled: wsAgentTeamsEnabled,
-            yoloModeEnabled: false,
+            yoloModeEnabled: wsYoloEnabled,
+            designFlowEnabled: wsDesignFlowEnabled,
           })
         }
       }
@@ -493,7 +504,7 @@ export default function App() {
           case 'permission_mode_changed': {
             setSessionOptions(prevOpts => {
               const next = new Map(prevOpts)
-              const wsDefault = { ...defaultSessionOptions, agentTeamsEnabled: workspaceAgentTeamsEnabled }
+              const wsDefault = { ...defaultSessionOptions, agentTeamsEnabled: workspaceAgentTeamsEnabled, yoloModeEnabled: workspaceYoloEnabled, designFlowEnabled: workspaceDesignFlowEnabled }
               const current = next.get(effect.sessionId) ?? wsDefault
               next.set(effect.sessionId, { ...current, permissionMode: effect.permissionMode })
               return next
@@ -679,10 +690,10 @@ export default function App() {
     addSession(session)
 
     // Apply session defaults to the unified sessionOptions
-    // Implements REQ-001: workspace agentTeamsEnabled drives per-session default
+    // Implements REQ-001, REQ-004: workspace feature flags drive per-session defaults
     const hasNonDefaultMode = session.permissionMode && session.permissionMode !== 'ask'
     const hasNonDefaultThinking = session.thinkingLevel && session.thinkingLevel !== 'think'
-    if (hasNonDefaultMode || hasNonDefaultThinking || workspaceAgentTeamsEnabled) {
+    if (hasNonDefaultMode || hasNonDefaultThinking || workspaceAgentTeamsEnabled || workspaceYoloEnabled || workspaceDesignFlowEnabled) {
       setSessionOptions(prev => {
         const next = new Map(prev)
         next.set(session.id, {
@@ -690,14 +701,15 @@ export default function App() {
           permissionMode: session.permissionMode ?? 'ask',
           thinkingLevel: session.thinkingLevel ?? 'think',
           agentTeamsEnabled: workspaceAgentTeamsEnabled,
-          yoloModeEnabled: false,
+          yoloModeEnabled: workspaceYoloEnabled,
+          designFlowEnabled: workspaceDesignFlowEnabled,
         })
         return next
       })
     }
 
     return session
-  }, [addSession, workspaceAgentTeamsEnabled])
+  }, [addSession, workspaceAgentTeamsEnabled, workspaceYoloEnabled, workspaceDesignFlowEnabled])
 
   // Deep link navigation is initialized later after handleInputChange is defined
 
@@ -946,7 +958,7 @@ export default function App() {
       if (isUltrathink) {
         setSessionOptions(prev => {
           const next = new Map(prev)
-          const wsDefault = { ...defaultSessionOptions, agentTeamsEnabled: workspaceAgentTeamsEnabled }
+          const wsDefault = { ...defaultSessionOptions, agentTeamsEnabled: workspaceAgentTeamsEnabled, yoloModeEnabled: workspaceYoloEnabled, designFlowEnabled: workspaceDesignFlowEnabled }
           const current = next.get(sessionId) ?? wsDefault
           next.set(sessionId, mergeSessionOptions(current, { ultrathinkEnabled: false }))
           return next
@@ -976,7 +988,7 @@ export default function App() {
   const handleSessionOptionsChange = useCallback((sessionId: string, updates: SessionOptionUpdates) => {
     setSessionOptions(prev => {
       const next = new Map(prev)
-      const wsDefault = { ...defaultSessionOptions, agentTeamsEnabled: workspaceAgentTeamsEnabled }
+      const wsDefault = { ...defaultSessionOptions, agentTeamsEnabled: workspaceAgentTeamsEnabled, yoloModeEnabled: workspaceYoloEnabled, designFlowEnabled: workspaceDesignFlowEnabled }
       const current = next.get(sessionId) ?? wsDefault
       next.set(sessionId, mergeSessionOptions(current, updates))
       return next
@@ -993,6 +1005,14 @@ export default function App() {
     }
     // ultrathinkEnabled is UI-only (single-shot), no backend persistence needed
   }, [workspaceAgentTeamsEnabled])
+
+  // Callback for settings pages to update workspace-level feature flags in real-time
+  // Fixes: toggles in Session Controls not appearing until app restart after settings change
+  const handleWorkspaceFeatureFlagsChange = useCallback((flags: { agentTeamsEnabled?: boolean; yoloEnabled?: boolean; designFlowEnabled?: boolean }) => {
+    if (flags.agentTeamsEnabled !== undefined) setWorkspaceAgentTeamsEnabled(flags.agentTeamsEnabled)
+    if (flags.yoloEnabled !== undefined) setWorkspaceYoloEnabled(flags.yoloEnabled)
+    if (flags.designFlowEnabled !== undefined) setWorkspaceDesignFlowEnabled(flags.designFlowEnabled)
+  }, [])
 
   // Handle input draft changes per session with debounced persistence
   const draftSaveTimeoutRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
@@ -1274,6 +1294,9 @@ export default function App() {
     getDraft,
     sessionOptions,
     workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
+    onWorkspaceFeatureFlagsChange: handleWorkspaceFeatureFlagsChange,
     // Session callbacks
     onCreateSession: handleCreateSession,
     onSendMessage: handleSendMessage,
@@ -1318,6 +1341,9 @@ export default function App() {
     getDraft,
     sessionOptions,
     workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
+    handleWorkspaceFeatureFlagsChange,
     handleCreateSession,
     handleSendMessage,
     handleRenameSession,

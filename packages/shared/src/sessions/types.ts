@@ -49,7 +49,7 @@ export const SESSION_PERSISTENT_FIELDS = [
   // Hierarchy
   'parentSessionId', 'siblingOrder',
   // Agent teams
-  'teamId', 'isTeamLead', 'teammateName', 'teammateRole', 'teammateSessionIds', 'teamColor',
+  'teamId', 'isTeamLead', 'teammateName', 'teammateRole', 'teammateSessionIds', 'teamColor', 'teamStatus', 'qgCycleCount',
 ] as const;
 
 export type SessionPersistentField = typeof SESSION_PERSISTENT_FIELDS[number];
@@ -182,6 +182,10 @@ export interface SessionConfig {
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
   teamColor?: string;
+  /** Team lifecycle status — set to 'completed' on cleanup */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error';
+  /** Persisted QG cycle count — survives app restarts */
+  qgCycleCount?: number;
 }
 
 /**
@@ -286,6 +290,8 @@ export interface SessionHeader {
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
   teamColor?: string;
+  /** Team lifecycle status -- set to 'completed' on cleanup */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error';
   // Pre-computed fields for fast list loading
   /** Number of messages in session */
   messageCount: number;
@@ -379,8 +385,14 @@ export interface SessionMetadata {
   isTeamLead?: boolean;
   /** Display name for teammate sessions */
   teammateName?: string;
+  /** Role label for teammate sessions (e.g., head, worker, reviewer, escalation) */
+  teammateRole?: string;
+  /** Persisted QG cycle count — survives app restarts */
+  qgCycleCount?: number;
   /** IDs of teammate sessions (lead tracks its children) */
   teammateSessionIds?: string[];
   /** Team accent color (hex) */
   teamColor?: string;
+  /** Team lifecycle status -- set to 'completed' on cleanup */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error';
 }

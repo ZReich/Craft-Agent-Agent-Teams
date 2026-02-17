@@ -17,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { Markdown } from '@/components/markdown'
 import { useScrollAnchor } from '@/hooks/useScrollAnchor'
 import type { AgentTeammate, TeammateMessage } from '../../../shared/types'
 import type { ToolActivity } from './ToolActivityIndicator'
@@ -39,6 +40,7 @@ const MODEL_NAMES: Record<string, string> = {
   'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
   'claude-haiku-4-5-20251001': 'Haiku 4.5',
   'kimi-k2.5': 'Kimi K2.5',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
 }
 
 export function TeammateDetailView({
@@ -243,7 +245,9 @@ export function TeammateDetailView({
                             </Badge>
                           )}
                         </div>
-                        <p className={cn('whitespace-pre-wrap', isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>{msg.content}</p>
+                        <div className={cn(isFromTeammate ? 'text-foreground/80' : 'text-background/90')}>
+                          <Markdown mode="full">{msg.content}</Markdown>
+                        </div>
                       </div>
                     </div>
                   )

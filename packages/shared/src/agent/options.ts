@@ -129,9 +129,8 @@ function writeConfigSafe(configPath: string, content: string): void {
         // EBUSY = file in use, EPERM = permission denied (often transient on Windows)
         if (process.platform === 'win32' && (code === 'EBUSY' || code === 'EPERM')) {
             debug(`[options] Write failed with ${code}, retrying after 100ms...`);
-            // Synchronous sleep — acceptable here since this runs once at startup
-            const start = Date.now();
-            while (Date.now() - start < 100) { /* busy wait */ }
+            // BUG-035 fix: Use Atomics.wait for synchronous sleep instead of CPU-burning busy-wait
+            try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); } catch { /* fallback: no-op, retry immediately */ }
             try {
                 writeFileSync(configPath, content, 'utf-8');
                 debug('[options] Retry succeeded');

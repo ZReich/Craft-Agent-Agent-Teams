@@ -1,4 +1,4 @@
-import { app } from 'electron'
+﻿import { app } from 'electron'
 import * as Sentry from '@sentry/electron/main'
 import { basename, join } from 'path'
 import { homedir } from 'os'
@@ -81,14 +81,21 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, type SessionProcessReapOptions, type SessionProcessReapReport, type SessionProcessCandidate, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment } from '@craft-agent/core/types'
+import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, TeamTask, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment, YoloStateChangedEvent, KnowledgeTelemetryEvent } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
-import { mergeQualityGateConfig } from '@craft-agent/shared/agent-teams/quality-gates'
+import { mergeQualityGateConfig, inferTaskType, shouldSkipQualityGates } from '@craft-agent/shared/agent-teams/quality-gates'
+import { IntegrationGate } from '@craft-agent/shared/agent-teams/integration-gate'
 import { DiffCollector, type ReviewDiff } from '@craft-agent/shared/agent-teams/diff-collector'
 import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/agent-teams/health-monitor'
+import { ToolCallThrottle } from '@craft-agent/shared/agent-teams/tool-call-throttle'
+import { HeartbeatAggregator } from '@craft-agent/shared/agent-teams/heartbeat-aggregator'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
-import { resolveTeamModelForRole } from '@craft-agent/shared/agent-teams/model-resolution'
-import { YoloOrchestrator, mergeYoloConfig, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
+import { resolveTeamModelConfig, resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/shared/agent-teams/model-resolution'
+import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
+import { YoloOrchestrator, mergeYoloConfig, decideSpawnStrategy, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
+import { selectArchitectureMode } from '@craft-agent/shared/agent-teams/architecture-selector'
+import { getLearningGuidance, recordKnowledgeTelemetry } from '@craft-agent/shared/agent-teams/learning-store'
+import { ReviewLoopOrchestrator, type ReviewLoopCallbacks, type ReviewLoopConfig } from '@craft-agent/shared/agent-teams/review-loop'
 import type { YoloConfig, YoloState } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
 import type { SummarizeCallback } from '@craft-agent/shared/sources'
@@ -98,11 +105,12 @@ import { listLabels } from '@craft-agent/shared/labels/storage'
 import { extractLabelId } from '@craft-agent/shared/labels'
 import { teamManager } from '@craft-agent/shared/agent/agent-team-manager'
 import { calculateTokenCostUsd, inferProviderFromModel, type UsageProvider } from '@craft-agent/shared/usage'
-import { buildTeammateCodename, buildTeamCodename, teammateMatchesTargetName } from './teammate-codenames'
+import { buildTeammateCodename, buildTeamCodename, isLeadTargetName, teammateMatchesTargetName } from './teammate-codenames'
 import { UsagePersistence, UsageAlertChecker } from '@craft-agent/shared/usage'
 import type { SessionUsage as PersistedSessionUsage, UsageAlert, UsageAlertThresholds } from '@craft-agent/core'
 import type { FSWatcher } from 'fs'
 import { HookSystem, type HookSystemMetadataSnapshot } from '@craft-agent/shared/hooks-simple'
+import { AgentTeamCompletionCoordinator, type AgentTeamCompletionContext, type ReviewerQaVerdict } from './agent-team-completion-coordinator'
 
 // Import and re-export (extracted to avoid Electron dependency in tests)
 import { sanitizeForTitle } from './title-sanitizer'
@@ -110,7 +118,7 @@ export { sanitizeForTitle }
 
 /**
  * Resolve the usage provider from a connection's providerType and model.
- * Replaces repeated nested ternary: openai → 'openai', openai_compat → infer from model, else → 'anthropic'.
+ * Replaces repeated nested ternary: openai -> 'openai', openai_compat -> infer from model, else -> 'anthropic'.
  */
 function resolveUsageProvider(providerType: string | undefined, model: string | undefined): UsageProvider {
   switch (providerType) {
@@ -146,7 +154,7 @@ function getBundledBunPath(): string | undefined {
   if (!app.isPackaged && process.platform === 'win32') {
     const { execSync } = require('child_process')
     try {
-      const result = execSync('where bun.exe', { encoding: 'utf-8', timeout: 5000 }).trim().split('\n')[0]
+      const result = execSync('where bun.exe', { encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }).trim().split('\n')[0]
       if (result && existsSync(result.trim())) {
         sessionLog.info(`Using system bun.exe for dev mode: ${result.trim()}`)
         return result.trim()
@@ -220,12 +228,61 @@ function resolveConnectionForModel(options: {
   return undefined
 }
 
-const VALID_TEAM_ROLES: ReadonlySet<TeamRole> = new Set(['lead', 'head', 'worker', 'reviewer', 'escalation'])
+const VALID_TEAM_ROLES: ReadonlySet<TeamRole> = new Set([
+  'lead',
+  'head',
+  'worker',
+  'reviewer',
+  'escalation',
+  'orchestrator',
+  'team-manager',
+])
+const TEAM_ROLE_HEAD: TeamRole = 'head'
+const TEAM_ROLE_ESCALATION: TeamRole = 'escalation'
+const TEAM_ROLE_WORKER: TeamRole = 'worker'
+const TEAM_ROLE_REVIEWER: TeamRole = 'reviewer'
+const TEAM_ROLE_LEAD: TeamRole = 'lead'
+// Implements REQ-B4: Raised from 6 to 10 to support larger teams.
+// The limit is enforced in createTeammateSession().
+const MAX_TEAMMATES_PER_TEAM = 10
+const MAX_TEAMMATE_MESSAGES = 500
+// Auto-replacement hardening: allow a single automatic worker restart per task fingerprint.
+const MAX_AUTO_REPLACEMENT_ATTEMPTS_PER_TASK = 1
 
-function normalizeTeamRole(rawRole?: string): TeamRole {
-  if (!rawRole) return 'worker'
-  if (VALID_TEAM_ROLES.has(rawRole as TeamRole)) return rawRole as TeamRole
-  return 'worker'
+function toRuntimeTeamRole(role: TeamRole): TeamRole {
+  // Keep runtime/storage canonicalized to legacy values for now, while accepting
+  // new role aliases from UI/prompts/APIs.
+  if (role === 'orchestrator') return TEAM_ROLE_LEAD
+  if (role === 'team-manager') return TEAM_ROLE_HEAD
+  return role
+}
+
+function toValidatedTeamRole(rawRole?: string): TeamRole | null {
+  if (!rawRole) return null
+  const normalized = rawRole.trim().toLowerCase() as TeamRole
+  if (!VALID_TEAM_ROLES.has(normalized)) return null
+  return toRuntimeTeamRole(normalized)
+}
+
+function inferTeamRoleFromName(teammateName?: string): TeamRole | null {
+  if (!teammateName) return null
+  const normalized = teammateName.trim().toLowerCase()
+  // Longest-match first to support prefixes like "team-manager-foo".
+  const inferredPrefix = [
+    'team-manager',
+    'orchestrator',
+    'escalation',
+    'reviewer',
+    'worker',
+    'head',
+    'lead',
+  ].find(prefix => normalized === prefix || normalized.startsWith(`${prefix}-`) || normalized.startsWith(`${prefix}_`))
+  if (!inferredPrefix) return null
+  return toValidatedTeamRole(inferredPrefix)
+}
+
+function normalizeTeamRole(rawRole?: string, teammateName?: string): TeamRole {
+  return toValidatedTeamRole(rawRole) ?? inferTeamRoleFromName(teammateName) ?? TEAM_ROLE_WORKER
 }
 
 // Codename generation functions moved to ./teammate-codenames.ts for testability
@@ -267,7 +324,7 @@ function qualityStageSummaryLines(result: QualityGateResult): string[] {
   for (const stageName of orderedStages) {
     const stage = result.stages[stageName]
     if (!stage) continue
-    const icon = stage.passed ? '✅' : '❌'
+    const icon = stage.passed ? '\u2705' : '\u274c'
     if (stageName === 'tests') {
       const tests = stage as typeof result.stages.tests
       lines.push(
@@ -286,7 +343,7 @@ function buildQualityLeadSummary(
   status: 'passed' | 'failed' | 'escalated',
 ): string {
   const statusLabel = status === 'passed' ? 'PASSED' : status === 'escalated' ? 'ESCALATED' : 'FAILED'
-  const icon = status === 'passed' ? '✅' : status === 'escalated' ? '🚨' : '⚠️'
+  const icon = status === 'passed' ? '\u2705' : status === 'escalated' ? '\ud83d\udea8' : '\u26a0\ufe0f'
   const lines = [
     `### ${icon} Quality Gate ${statusLabel}`,
     `Teammate: ${teammateName}`,
@@ -314,18 +371,126 @@ function buildWorkerQualityFeedback(result: QualityGateResult, maxCycles: number
 }
 
 function formatHealthAlertMessage(issue: HealthIssue): string {
-  const typeLabel = issue.type === 'stall'
-    ? 'STALL'
-    : issue.type === 'error-loop'
-      ? 'ERROR LOOP'
-      : issue.type === 'retry-storm'
-        ? 'RETRY STORM'
-        : 'CONTEXT EXHAUSTION'
+  const TYPE_LABELS: Record<HealthIssue['type'], string> = {
+    'stall': 'STALL',
+    'error-loop': 'ERROR LOOP',
+    'retry-storm': 'RETRY STORM',
+    'retry-storm-throttle': 'RETRY STORM (THROTTLED)',
+    'retry-storm-kill': 'RETRY STORM (KILLING)',
+    'context-exhaustion': 'CONTEXT EXHAUSTION',
+  }
+  const typeLabel = TYPE_LABELS[issue.type] ?? issue.type.toUpperCase()
   return [
-    `### ⚠️ Team Health Alert (${typeLabel})`,
+    `### Ã¢Å¡Â Ã¯Â¸Â Team Health Alert (${typeLabel})`,
     `Teammate: ${issue.teammateName}`,
     `Issue: ${issue.details}`,
   ].join('\n')
+}
+
+function formatHealthAlertSummaryMessage(issues: HealthIssue[]): string {
+  if (issues.length === 0) {
+    return '### Ã¢Å¡Â Ã¯Â¸Â Team Health Summary\nNo active issues.'
+  }
+
+  type GroupKey = string
+  type Group = {
+    teammateName: string
+    type: HealthIssue['type']
+    count: number
+    latestDetails: string
+  }
+
+  const groups = new Map<GroupKey, Group>()
+  for (const issue of issues) {
+    const key = `${issue.teammateId}:${issue.type}`
+    const existing = groups.get(key)
+    if (existing) {
+      existing.count += 1
+      existing.latestDetails = issue.details
+    } else {
+      groups.set(key, {
+        teammateName: issue.teammateName,
+        type: issue.type,
+        count: 1,
+        latestDetails: issue.details,
+      })
+    }
+  }
+
+  const typeLabel = (type: HealthIssue['type']): string => {
+    if (type === 'stall') return 'STALL'
+    if (type === 'error-loop') return 'ERROR LOOP'
+    if (type === 'retry-storm') return 'RETRY STORM'
+    if (type === 'retry-storm-throttle') return 'RETRY STORM (THROTTLED)'
+    if (type === 'retry-storm-kill') return 'RETRY STORM (KILLING)'
+    return 'CONTEXT EXHAUSTION'
+  }
+
+  const lines = Array.from(groups.values()).map(group =>
+    `- ${group.teammateName}: ${typeLabel(group.type)} x${group.count} (latest: ${group.latestDetails})`
+  )
+
+  return [
+    `### Ã¢Å¡Â Ã¯Â¸Â Team Health Summary`,
+    `Window issues: ${issues.length}`,
+    ...lines,
+  ].join('\n')
+}
+
+function buildTeamDeliveryMetadata(options: {
+  outputPresent: boolean
+  receiverId?: string
+}): string {
+  return `<details><summary>Delivery details</summary>\n\nstatus: delivered | output: ${options.outputPresent ? 'present' : 'empty'}\n\n</details>`
+}
+
+export function buildAutoReplacementAttemptKey(options: {
+  taskDescription?: string
+  taskTitle?: string
+  teammateRole?: TeamRole
+  teammateName?: string
+}): string {
+  const raw = options.taskDescription?.trim()
+    || options.taskTitle?.trim()
+    || `${options.teammateRole ?? 'worker'}:${options.teammateName ?? 'unknown'}`
+  return raw.toLowerCase().slice(0, 240)
+}
+
+export function buildAutoReplacementPrompt(options: {
+  originalPrompt: string
+  teammateName: string
+  failureReason: string
+  partialResults: string[]
+  attempt: number
+}): string {
+  const cleanedPrompt = options.originalPrompt.trim()
+  const partial = options.partialResults
+    .map(line => line.replace(/^\s*-\s*/, '').trim())
+    .filter(Boolean)
+    .slice(-5)
+  const sections = [
+    cleanedPrompt,
+    '',
+    '---',
+    '',
+    `System recovery note: Previous teammate "${options.teammateName}" was terminated (${options.failureReason}).`,
+    `This is auto-replacement attempt #${options.attempt}.`,
+    'Avoid repeating identical tool calls; synthesize existing evidence whenever possible.',
+  ]
+  if (partial.length > 0) {
+    sections.push(
+      '',
+      'Recovered partial findings:',
+      ...partial.map(item => `- ${item}`),
+    )
+  }
+  sections.push(
+    '',
+    'Completion requirements:',
+    '- Send a direct completion handoff to team-lead via SendMessage(type="message", recipient="team-lead").',
+    '- Include explicit evidence links and a clear PASS/FAIL recommendation if this is a review task.',
+  )
+  return sections.join('\n')
 }
 
 // teammateMatchesTargetName moved to ./teammate-codenames.ts for testability
@@ -342,7 +507,7 @@ interface RuntimeProcessRow {
 
 function commandPreview(commandLine: string): string {
   const compact = commandLine.replace(/\s+/g, ' ').trim()
-  return compact.length > 220 ? `${compact.slice(0, 220)}…` : compact
+  return compact.length > 220 ? `${compact.slice(0, 220)}...` : compact
 }
 
 function extractSessionIdFromCommand(commandLine: string): string | undefined {
@@ -368,7 +533,7 @@ export const AGENT_FLAGS = {
   defaultModesEnabled: true,
 } as const
 
-/** Predefined team colors — high-contrast, accessible palette. Rotates by active team count. */
+/** Predefined team colors Ã¢â‚¬â€ high-contrast, accessible palette. Rotates by active team count. */
 const TEAM_COLORS = [
   '#7c3aed', // violet
   '#0891b2', // cyan
@@ -420,6 +585,67 @@ function parseStatus(raw?: string): SpecRequirement['status'] {
   }
 }
 
+function normalizeRequirementId(raw: string): string {
+  return raw.trim().toUpperCase()
+}
+
+function parseRequirementLine(
+  line: string,
+  fallbackIndex: number,
+  ownerDRI: string,
+  acceptanceTests: string[],
+): SpecRequirement {
+  const trimmed = line.trim()
+
+  // Primary spec format:
+  // - **REQ-001 (medium, status: implemented):** Description
+  // Also supports non-numeric IDs such as REQ-FIX-004.
+  const boldPattern = /^\s*-\s*\*\*((REQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*(?:\(([^)]*)\))?)\s*:\*\*\s*(.+)$/i
+  const boldMatch = trimmed.match(boldPattern)
+  if (boldMatch) {
+    const metaParts = (boldMatch[3] ?? '')
+      .split(',')
+      .map(part => part.trim())
+      .filter(Boolean)
+    const priorityToken = metaParts.find(part => ['critical', 'high', 'medium', 'low'].includes(part.toLowerCase()))
+    const statusToken = metaParts.find(part => part.toLowerCase().startsWith('status:'))
+    const statusValue = statusToken ? statusToken.split(':').slice(1).join(':').trim() : undefined
+    return {
+      id: normalizeRequirementId(boldMatch[2]),
+      description: boldMatch[4].trim(),
+      priority: parsePriority(priorityToken),
+      acceptanceTests,
+      assignedDRI: ownerDRI,
+      status: parseStatus(statusValue),
+    }
+  }
+
+  // Fallback for plan-style headings:
+  // ### 1. REQ-FIX-001: Dynamic header reading ...
+  const headingPattern = /^\s{0,3}#{1,6}\s*(?:\d+\.?\s*)?(REQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*[:\-]\s*(.+)$/i
+  const headingMatch = trimmed.match(headingPattern)
+  if (headingMatch) {
+    return {
+      id: normalizeRequirementId(headingMatch[1]),
+      description: headingMatch[2].trim(),
+      priority: 'medium',
+      acceptanceTests,
+      assignedDRI: ownerDRI,
+      status: 'pending',
+    }
+  }
+
+  // Generic fallback: preserve legacy behavior.
+  return {
+    id: `REQ-${String(fallbackIndex + 1).padStart(3, '0')}`,
+    description: trimmed.replace(/^[\s*-]+/, ''),
+    priority: 'medium',
+    acceptanceTests,
+    assignedDRI: ownerDRI,
+    status: 'pending',
+  }
+}
+
 export function parseSpecMarkdown(markdown: string, specId: string): Spec {
   const lines = markdown.split(/\r?\n/)
   const titleLine = lines.find(line => line.trim().startsWith('# ')) ?? '# Untitled Spec'
@@ -443,31 +669,26 @@ export function parseSpecMarkdown(markdown: string, specId: string): Spec {
   const requirementLines = extractSectionLines(lines, '## Requirements')
     .map(line => line.trim())
     .filter(line => line.startsWith('-'))
-  const requirements: SpecRequirement[] = requirementLines.map((line, index) => {
-    const match = line.match(/\*\*(REQ-[0-9]+)\s*\(([^)]+)\):\*\*\s*(.+)$/i)
-    if (match) {
-      const metaParts = match[2].split(',').map(part => part.trim()).filter(Boolean)
-      const priorityToken = metaParts.find(part => ['critical', 'high', 'medium', 'low'].includes(part.toLowerCase()))
-      const statusToken = metaParts.find(part => part.toLowerCase().startsWith('status:'))
-      const statusValue = statusToken ? statusToken.split(':').slice(1).join(':').trim() : undefined
-      return {
-        id: match[1].trim(),
-        description: match[3].trim(),
-        priority: parsePriority(priorityToken ?? match[2]),
-        acceptanceTests,
-        assignedDRI: ownerDRI,
-        status: parseStatus(statusValue),
-      }
-    }
-    return {
-      id: `REQ-${String(index + 1).padStart(3, '0')}`,
-      description: line.replace(/^[\s*-]+/, ''),
-      priority: 'medium',
-      acceptanceTests,
-      assignedDRI: ownerDRI,
-      status: 'pending',
-    }
-  })
+  // Fallback for plan docs that don't use "## Requirements", but do include
+  // explicit REQ IDs in headings (e.g., "### 1. REQ-FIX-001: ...").
+  const fallbackRequirementLines = requirementLines.length > 0
+    ? requirementLines
+    : lines
+      .map(line => line.trim())
+      .filter(line => /^(?:#{1,6}\s*(?:\d+\.?\s*)?REQ-|-\s*\*\*REQ-)/i.test(line))
+
+  const parsedRequirements = fallbackRequirementLines
+    .map((line, index) => parseRequirementLine(line, index, ownerDRI, acceptanceTests))
+    .filter((req) => req.description.length > 0)
+
+  // Deduplicate by requirement ID (keep first occurrence).
+  const seenRequirementIds = new Set<string>()
+  const requirements: SpecRequirement[] = []
+  for (const req of parsedRequirements) {
+    if (seenRequirementIds.has(req.id)) continue
+    seenRequirementIds.add(req.id)
+    requirements.push(req)
+  }
 
   const risks: SpecRisk[] = riskLines.map((risk, index) => ({
     id: `RISK-${String(index + 1).padStart(3, '0')}`,
@@ -630,22 +851,57 @@ export function buildSpecMarkdown(options: {
 
 export function buildTeammatePromptWithCompactSpec(
   prompt: string,
-  compactSpecContext?: string | null
+  compactSpecContext?: string | null,
+  toolBudgets?: Record<string, number>,
 ): string {
+  const sections: string[] = [prompt]
+
   if (compactSpecContext && compactSpecContext.trim().length > 0) {
-    return `${prompt}\n\n<compact_spec>\n${compactSpecContext}\n</compact_spec>`
+    sections.push(`<compact_spec>\n${compactSpecContext}\n</compact_spec>`)
   }
-  return prompt
+
+  // Implements REQ-BUDGET-003: Inject tool budgets so agents plan proactively.
+  // Agents that KNOW their budget make better, more targeted tool calls.
+  if (toolBudgets && Object.keys(toolBudgets).length > 0) {
+    const defaultBudget = toolBudgets['_default'] ?? 15
+    const budgetLines = Object.entries(toolBudgets)
+      .filter(([key]) => key !== '_default')
+      .sort(([, a], [, b]) => a - b)
+      .map(([tool, limit]) => `- ${tool}: ${limit} calls`)
+    sections.push([
+      'TOOL BUDGETS (HARD LIMITS)',
+      'You have a limited number of tool calls for this task. Plan carefully and make each call count.',
+      ...budgetLines,
+      `- All other tools: ${defaultBudget} calls`,
+      '',
+      'When a tool budget runs out, it will be permanently blocked.',
+      'At that point, synthesize what you have and send results to team-lead.',
+      'Do NOT waste searches on similar queries — make each one count.',
+    ].join('\n'))
+  }
+
+  // Implements REQ-LIFECYCLE-001:
+  // Enforce teammate completion handshake to prevent silent idle sessions and retry storms.
+  sections.push([
+    'TEAM COMPLETION PROTOCOL (MANDATORY)',
+    '- When you finish your assigned task (or are blocked), immediately send one SendMessage to recipient "team-lead".',
+    '- Include: outcome summary, files changed, tests/checks run, and any blockers/risks.',
+    '- After sending that completion message, stop tool calls and wait for a shutdown_request.',
+    '- Do not continue retrying tools once you have reported completion or a blocker.',
+  ].join('\n'))
+
+  return sections.join('\n\n')
 }
 
 export function resolveQualityGateReviewInput(
-  reviewDiff: Pick<ReviewDiff, 'unifiedDiff'> | null,
-): { reviewInput: string; usesGitDiff: boolean; failureReason?: string } {
+  reviewDiff: ReviewDiff | null,
+): { reviewInput: string; usesGitDiff: boolean; failureReason: string | undefined } {
   const unifiedDiff = reviewDiff?.unifiedDiff?.trim() ?? ''
   if (unifiedDiff.length > 0) {
     return {
       reviewInput: reviewDiff!.unifiedDiff,
       usesGitDiff: true,
+      failureReason: undefined,
     }
   }
 
@@ -947,7 +1203,7 @@ async function setupCodexSessionConfig(
 
 /**
  * Write bridge-config.json and credential cache files for Copilot API sources.
- * Mirrors the bridge setup in setupCodexSessionConfig() but without TOML generation —
+ * Mirrors the bridge setup in setupCodexSessionConfig() but without TOML generation Ã¢â‚¬â€
  * Copilot passes MCP config directly at session creation via buildMcpConfig().
  *
  * Called before setSourceServers() so the bridge MCP server subprocess can read them
@@ -1055,7 +1311,7 @@ function resolveToolDisplayMeta(
       let sourceSlug = serverSlug
 
       // Special case: api-bridge server embeds source slug in tool name as "api_{slug}"
-      // e.g., mcp__api-bridge__api_stripe → sourceSlug = "stripe"
+      // e.g., mcp__api-bridge__api_stripe Ã¢â€ â€™ sourceSlug = "stripe"
       if (sourceSlug === 'api-bridge' && toolSlug.startsWith('api_')) {
         sourceSlug = toolSlug.slice(4)
       }
@@ -1286,8 +1542,38 @@ interface ManagedSession {
   teamId?: string
   isTeamLead?: boolean
   teammateName?: string
+  teammateRole?: TeamRole
   teammateSessionIds?: string[]
   teamColor?: string
+  /** Team lifecycle status — set to 'completed' on cleanup */
+  teamStatus?: 'active' | 'cleaning-up' | 'completed' | 'error'
+  /** Re-entry guard: prevents team-level QG from firing multiple times */
+  teamLevelQgRunning?: boolean
+  /** Persisted QG cycle count — survives app restarts */
+  qgCycleCount?: number
+  /** REQ-NEXT-008: speculative quality artifact captured during active implementation. */
+  speculativeReviewDiff?: ReviewDiff | null
+  /** Fingerprint for speculative artifact validity checks/fallback. */
+  speculativeReviewFingerprint?: string
+  /** Capture timestamp for speculative artifact staleness checks. */
+  speculativeReviewCapturedAt?: number
+  /** Guard: teammate results already relayed to lead — prevents duplicate deliveries */
+  completionRelayed?: boolean
+  /** Guard: "[System] All teammates completed" synthesis prompt already sent to lead */
+  synthesisPromptSent?: boolean
+  /** Reviewer QA verdict parsed from latest reviewer handoff */
+  qaVerdict?: ReviewerQaVerdict
+  /** Guard: QA block warning already sent to lead (avoid spam) */
+  qaGateBlockedNotified?: boolean
+  /** Auto-replacement attempt counts keyed by task fingerprint */
+  autoReplacementAttempts?: Record<string, number>
+  /** Implements REQ-A1: Count of teammate spawns queued but not yet kicked off.
+   *  Prevents lead from emitting 'complete' before all teammates start. */
+  pendingTeammateSpawns?: number
+  /** Implements REQ-A1: Safety timeout handle for pending spawns (5 min max wait) */
+  pendingSpawnsTimeout?: NodeJS.Timeout
+  /** Adaptive tool call throttle for teammate sessions (prevents retry storms) */
+  toolCallThrottle?: ToolCallThrottle
   // SDD fields
   sddEnabled?: boolean
   activeSpecId?: string
@@ -1470,6 +1756,9 @@ export class SessionManager {
   // SDD compliance report watchers - one per session
   private complianceWatchers: Map<string, FSWatcher> = new Map()
   private complianceSyncTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+  // Implements BUG-C fix: debounced source reload to coalesce cascading change events
+  private sourceReloadTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+  private readonly SOURCE_RELOAD_DEBOUNCE_MS = 300
   // Hook systems for workspace event hooks - one per workspace (includes scheduler, diffing, and handlers)
   private hookSystems: Map<string, HookSystem> = new Map()
   // Pending credential request resolvers (keyed by requestId)
@@ -1492,13 +1781,25 @@ export class SessionManager {
   // Quality gate runner (lazy-initialized) and cycle tracking
   private qualityGateRunner: QualityGateRunner | null = null
   private qualityGateCycles: Map<string, number> = new Map()
+  private readonly agentTeamCompletionContext: AgentTeamCompletionContext = this.createAgentTeamCompletionContext()
+  private readonly agentTeamCompletionCoordinator = new AgentTeamCompletionCoordinator(this.agentTeamCompletionContext)
 
-  // Teammate health monitor — detects stalls, error loops, retry storms
+  // Teammate health monitor -> detects stalls, error loops, retry storms
   private healthMonitor = new TeammateHealthMonitor()
+  // Heartbeat aggregator -> observes tool calls, synthesizes periodic heartbeat summaries (REQ-HB-001)
+  private heartbeatAggregator = new HeartbeatAggregator()
   private healthMonitorTeams = new Set<string>() // teams with active monitoring
   private teamStatusIntervals = new Map<string, NodeJS.Timeout>() // periodic status checks
   private teamHealthAlertHandlers = new Map<string, (issue: HealthIssue) => void>()
+  // REQ-HB-001: heartbeat event handler references for cleanup
+  private teamHeartbeatBatchHandlers = new Map<string, (...args: any[]) => void>()
+  private teamHeartbeatLLMHandlers = new Map<string, (...args: any[]) => void>()
+  // Implements REQ-003: aggregate health alerts to prevent retry-storm chat spam
+  private pendingTeamHealthAlerts = new Map<string, HealthIssue[]>()
+  private teamHealthAlertFlushTimers = new Map<string, NodeJS.Timeout>()
+  private readonly teamHealthAlertFlushMs = 90 * 1000
   private teammateKickoffTimers = new Map<string, NodeJS.Timeout>()
+  private speculativeReviewTimers = new Map<string, NodeJS.Timeout>()
   private usagePersistenceByWorkspace: Map<string, UsagePersistence> = new Map()
   private usageAlertCheckerByWorkspace: Map<string, UsageAlertChecker> = new Map()
   private emittedUsageAlertKeys: Set<string> = new Set()
@@ -1531,6 +1832,451 @@ export class SessionManager {
     return this.qualityGateRunner
   }
 
+  private createAgentTeamCompletionContext(): AgentTeamCompletionContext {
+    return {
+      sessions: {
+        getById: (sessionId: string) => this.sessions.get(sessionId),
+      },
+      teammate: {
+        updateTaskStatus: this.updateTeammateTasks.bind(this),
+        autoArchiveCompletedSession: this.autoArchiveCompletedTeammateSession.bind(this),
+        getQualityGateSkipReason: (managed) => this.getQualityGateSkipReason(managed as ManagedSession),
+        disposeAgent: (sessionId: string, reason: string) => {
+          const session = this.sessions.get(sessionId)
+          if (session) this.destroyManagedAgent(session, reason)
+        },
+      },
+      messaging: {
+        sendToSession: this.sendMessage.bind(this),
+        clearLeadTeamState: (lead) => {
+          if (lead.agent instanceof CraftAgent) {
+            lead.agent.clearTeamState()
+          }
+        },
+        buildTeamDeliveryMetadata,
+      },
+      quality: {
+        getRunner: this.getQualityGateRunner.bind(this),
+        cycles: this.qualityGateCycles,
+        resolveReviewInput: resolveQualityGateReviewInput,
+        buildLeadSummary: buildQualityLeadSummary,
+        buildWorkerFeedback: buildWorkerQualityFeedback,
+        formatPercentScore,
+      },
+      team: {
+        resolveTeamId: teamManager.resolveTeamId.bind(teamManager),
+        getTeamSpec: teamManager.getTeamSpec.bind(teamManager),
+        storeQualityResult: teamManager.storeQualityResult.bind(teamManager),
+        logActivity: teamManager.logActivity.bind(teamManager),
+        stopHealthMonitoring: (teamId: string) => {
+          const resolvedId = teamManager.resolveTeamId(teamId)
+          this.stopTeamHealthMonitoring(resolvedId)
+        },
+      },
+    }
+  }
+
+  // ============================================================
+  // Team Knowledge Bus helpers (REQ-NEXT-001)
+  // ============================================================
+
+  private readonly knowledgeDiscoveryTools = new Set(['Read', 'Grep', 'Glob'])
+  private readonly knowledgeMutationTools = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
+  // Implements REQ-NEXT-011: lightweight inline deterministic feedback loop.
+  private readonly inlineFeedbackState = new Map<string, { lastTestTouchAt: number; lastNudgeAt: number }>()
+  private readonly inlineFeedbackCooldownMs = 90_000
+
+  private extractToolFilePaths(input?: Record<string, unknown>): string[] {
+    if (!input) return []
+    const values: string[] = []
+
+    const pushValue = (value: unknown) => {
+      if (typeof value === 'string' && value.trim().length > 0) {
+        values.push(value.trim())
+      }
+    }
+
+    pushValue(input.path)
+    pushValue(input.file_path)
+    pushValue(input.notebook_path)
+    pushValue(input.cwd)
+
+    if (Array.isArray(input.paths)) {
+      for (const item of input.paths) pushValue(item)
+    }
+
+    if (Array.isArray(input.files)) {
+      for (const item of input.files) pushValue(item)
+    }
+
+    return Array.from(new Set(values.map((path) => path.replace(/\\/g, '/'))))
+  }
+
+  private extractExportSymbols(input?: Record<string, unknown>): string[] {
+    if (!input) return []
+    const textCandidates: string[] = []
+    const push = (value: unknown) => {
+      if (typeof value === 'string' && value.trim()) textCandidates.push(value)
+    }
+
+    push(input.content)
+    push(input.text)
+    push(input.new_string)
+    push(input.old_string)
+
+    const symbols = new Set<string>()
+    const exportRegex = /\bexport\s+(?:interface|type|class|function|const|enum)\s+([A-Za-z0-9_]+)/g
+    for (const candidate of textCandidates) {
+      let match: RegExpExecArray | null
+      while ((match = exportRegex.exec(candidate)) !== null) {
+        if (match[1]) symbols.add(match[1])
+      }
+    }
+
+    return Array.from(symbols)
+  }
+
+  private getTeammateTaskId(teamId: string, teammateId: string): string | undefined {
+    return teamManager
+      .getTasks(teamId)
+      .find((task) => task.assignee === teammateId && (task.status === 'in_progress' || task.status === 'in_review'))
+      ?.id
+  }
+
+  private logKnowledgeTelemetry(
+    teamId: string,
+    managed: ManagedSession,
+    payload: Omit<KnowledgeTelemetryEvent, 'channel'>,
+  ): void {
+    const teammateName = managed.teammateName || managed.name || managed.id
+    const telemetry: KnowledgeTelemetryEvent = {
+      channel: 'knowledge',
+      ...payload,
+    }
+    const details = [
+      `[KnowledgeBus][${payload.operation}] ${payload.hit ? 'hit' : 'miss'} entries=${payload.resultCount}`,
+      `scope=${payload.scope}`,
+      payload.suppressed ? 'suppressed=true' : null,
+    ].filter(Boolean).join(' ')
+
+    teamManager.logActivity(
+      teamId,
+      'phase-advanced',
+      details,
+      managed.id,
+      teammateName,
+      undefined,
+      telemetry,
+    )
+
+    try {
+      recordKnowledgeTelemetry(managed.workspace.rootPath, {
+        operation: payload.operation,
+        scope: payload.scope,
+        hit: payload.hit,
+        resultCount: payload.resultCount,
+        suppressed: payload.suppressed,
+      })
+    } catch (err) {
+      sessionLog.warn('[KnowledgeBus] Failed to persist knowledge telemetry:', err)
+    }
+  }
+
+  private handleKnowledgeToolStart(
+    teamId: string,
+    managed: ManagedSession,
+    event: Extract<AgentEvent, { type: 'tool_start' }>,
+  ): void {
+    if (!event.toolName || !this.knowledgeMutationTools.has(event.toolName)) return
+
+    const filePaths = this.extractToolFilePaths(event.input)
+    if (filePaths.length === 0) return
+
+    const teammateName = managed.teammateName || managed.name || managed.id
+    const taskId = this.getTeammateTaskId(teamId, managed.id)
+
+    for (const filePath of filePaths) {
+      const conflict = teamManager.recordKnowledgeFileEdit(teamId, {
+        filePath,
+        teammateId: managed.id,
+        teammateName,
+        taskId,
+      })
+      if (conflict) {
+        void this.notifyKnowledgeConflict(teamId, conflict)
+      }
+    }
+  }
+
+  private handleKnowledgeToolResult(
+    teamId: string,
+    managed: ManagedSession,
+    event: Extract<AgentEvent, { type: 'tool_result' }>,
+  ): void {
+    if (event.isError || !event.toolName) return
+
+    const filePaths = this.extractToolFilePaths(event.input)
+    const teammateName = managed.teammateName || managed.name || managed.id
+
+    if (this.knowledgeDiscoveryTools.has(event.toolName)) {
+      const baseTags = [
+        'episodic',
+        'discovery',
+        `tool:${event.toolName.toLowerCase()}`,
+        ...filePaths.slice(0, 4).map((path) => path.split('/').pop() || path),
+      ]
+      teamManager.publishKnowledge(teamId, {
+        // PostToolUse memory capture (REQ-NEXT-001)
+        type: 'discovery',
+        content: `${teammateName} used ${event.toolName}${filePaths.length ? ` on ${filePaths.join(', ')}` : ''}`,
+        source: managed.id,
+        filePaths,
+        tags: baseTags,
+        ttl: 1000 * 60 * 60 * 24 * 7, // 7 days for episodic traces
+      })
+      return
+    }
+
+    // Heads publishing interface contracts helps sibling heads avoid redundant rediscovery.
+    if (managed.teammateRole === TEAM_ROLE_HEAD && this.knowledgeMutationTools.has(event.toolName)) {
+      const exportsChanged = this.extractExportSymbols(event.input)
+      if (exportsChanged.length === 0) return
+
+      teamManager.publishKnowledge(teamId, {
+        type: 'interface-contract',
+        content: `${teammateName} updated exported interfaces: ${exportsChanged.slice(0, 8).join(', ')}`,
+        source: managed.id,
+        filePaths,
+        tags: ['interface-contract', 'head', ...exportsChanged.map((name) => name.toLowerCase())],
+      })
+      void this.notifyPeerHeadsOfInterfaceContract(teamId, managed, exportsChanged, filePaths)
+    }
+  }
+
+  /**
+   * Implements REQ-NEXT-004: notify sibling Heads about interface contract changes.
+   */
+  private async notifyPeerHeadsOfInterfaceContract(
+    teamId: string,
+    source: ManagedSession,
+    exportsChanged: string[],
+    filePaths: string[],
+  ): Promise<void> {
+    const peers = Array.from(this.sessions.values()).filter((session) =>
+      session.id !== source.id
+      && session.teamId === teamId
+      && session.teammateRole === TEAM_ROLE_HEAD,
+    )
+    if (peers.length === 0) return
+
+    const sourceName = source.teammateName || source.name || source.id
+    const fileLabel = filePaths.length > 0 ? filePaths.slice(0, 3).join(', ') : 'shared interfaces'
+    const message = [
+      `**Peer interface update**`,
+      `${sourceName} changed exported contracts: ${exportsChanged.slice(0, 8).join(', ')}`,
+      `Files: ${fileLabel}`,
+      `Action: validate dependencies against these contracts before integration.`,
+    ].join('\n')
+
+    for (const peer of peers) {
+      try {
+        await this.sendMessage(peer.id, message)
+      } catch (err) {
+        sessionLog.warn(`[PeerChannels] Failed to notify head ${peer.id} about contract update:`, err)
+      }
+    }
+
+    teamManager.logActivity(
+      teamId,
+      'message-sent',
+      `Interface contract alert from ${sourceName} sent to ${peers.length} peer head(s)`,
+      source.id,
+      sourceName,
+    )
+  }
+
+  private async notifyKnowledgeConflict(teamId: string, conflict: {
+    filePath: string
+    editors: Array<{ teammateId: string; teammateName: string }>
+  }): Promise<void> {
+    const names = conflict.editors.map((editor) => editor.teammateName)
+    const warning = [
+      `⚠️ Team Knowledge Bus conflict warning`,
+      `File: ${conflict.filePath}`,
+      `Editors: ${names.join(', ')}`,
+      `Please coordinate ownership to avoid merge collisions.`,
+    ].join('\n')
+
+    for (const editor of conflict.editors) {
+      try {
+        await this.sendMessage(editor.teammateId, warning)
+      } catch (err) {
+        sessionLog.warn(`[KnowledgeBus] Failed to notify ${editor.teammateId} about conflict:`, err)
+      }
+    }
+
+    const lead = this.findLeadSessionForTeam(teamId)
+    if (lead) {
+      try {
+        await this.sendMessage(lead.id, `**Knowledge Bus warning**\n\n${warning}`)
+      } catch (err) {
+        sessionLog.warn(`[KnowledgeBus] Failed to notify lead ${lead.id} about conflict:`, err)
+      }
+    }
+
+    teamManager.logActivity(teamId, 'error', `Knowledge bus conflict detected: ${conflict.filePath} (${names.join(', ')})`)
+  }
+
+  private isTestLikePath(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/').toLowerCase()
+    return /(^|\/)(__tests__|tests)\//.test(normalized) || /\.(test|spec)\.[jt]sx?$/.test(normalized)
+  }
+
+  private collectInlineFeedbackNudges(event: Extract<AgentEvent, { type: 'tool_result' }>, filePaths: string[], lastTestTouchAt: number): string[] {
+    const input = event.input ?? {}
+    const textCandidates = [
+      typeof input.content === 'string' ? input.content : '',
+      typeof input.text === 'string' ? input.text : '',
+      typeof input.new_string === 'string' ? input.new_string : '',
+    ].filter(Boolean)
+
+    const joined = textCandidates.join('\n')
+    const hasSourceEdit = filePaths.some((path) => !this.isTestLikePath(path) && /\.[jt]sx?$/i.test(path))
+    const hasTestEdit = filePaths.some((path) => this.isTestLikePath(path))
+
+    const nudges: string[] = []
+    const now = Date.now()
+    if (hasSourceEdit && !hasTestEdit && now - lastTestTouchAt > 10 * 60 * 1000) {
+      nudges.push('TDD reminder: consider adding/updating tests alongside source changes.')
+    }
+
+    if (/\basync\b|\bawait\b/.test(joined) && !/\btry\s*\{|\bcatch\s*\(/.test(joined)) {
+      nudges.push('Async safety reminder: ensure async boundaries include clear error handling.')
+    }
+
+    if (/\bTODO\b|\bFIXME\b|\bHACK\b/i.test(joined)) {
+      nudges.push('Completeness reminder: avoid leaving TODO/FIXME/HACK markers in final implementation.')
+    }
+
+    if (/ipcMain\.handle\(/.test(joined) && !/IPC_CHANNELS\./.test(joined)) {
+      nudges.push('Wiring reminder: verify new IPC handlers are mirrored in preload/renderer contracts.')
+    }
+
+    return nudges
+  }
+
+  /**
+   * Implements REQ-NEXT-011: cheap inline deterministic nudges after edit/write tool use.
+   */
+  private maybeSendInlineFeedbackNudge(
+    managed: ManagedSession,
+    event: Extract<AgentEvent, { type: 'tool_result' }>,
+  ): void {
+    if (event.isError || !event.toolName || !this.knowledgeMutationTools.has(event.toolName)) return
+
+    const filePaths = this.extractToolFilePaths(event.input)
+    if (filePaths.length === 0) return
+
+    const state = this.inlineFeedbackState.get(managed.id) ?? { lastTestTouchAt: 0, lastNudgeAt: 0 }
+    const now = Date.now()
+    if (filePaths.some((path) => this.isTestLikePath(path))) {
+      state.lastTestTouchAt = now
+    }
+
+    if (now - state.lastNudgeAt < this.inlineFeedbackCooldownMs) {
+      this.inlineFeedbackState.set(managed.id, state)
+      return
+    }
+
+    const nudges = this.collectInlineFeedbackNudges(event, filePaths, state.lastTestTouchAt)
+    if (nudges.length === 0) {
+      this.inlineFeedbackState.set(managed.id, state)
+      return
+    }
+
+    state.lastNudgeAt = now
+    this.inlineFeedbackState.set(managed.id, state)
+
+    const message = [
+      '[Inline feedback loop]',
+      ...nudges.map((nudge) => `- ${nudge}`),
+    ].join('\n')
+
+    void this.sendMessage(managed.id, message).catch((err) => {
+      sessionLog.warn(`[InlineFeedback] Failed to send nudge to ${managed.id}:`, err)
+    })
+  }
+
+  private buildReviewFingerprint(diff: ReviewDiff | null): string {
+    if (!diff) return 'none'
+    const payload = diff.unifiedDiff || ''
+    return `${payload.length}:${payload.slice(0, 120)}:${payload.slice(-120)}`
+  }
+
+  /**
+   * Implements REQ-NEXT-008: speculative quality artifacts captured before completion.
+   */
+  private scheduleSpeculativeReviewCapture(managed: ManagedSession): void {
+    if (!managed.workingDirectory || !managed.parentSessionId) return
+
+    const existing = this.speculativeReviewTimers.get(managed.id)
+    if (existing) {
+      clearTimeout(existing)
+      this.speculativeReviewTimers.delete(managed.id)
+    }
+
+    const timer = setTimeout(async () => {
+      this.speculativeReviewTimers.delete(managed.id)
+      if (!managed.workingDirectory || !managed.parentSessionId) return
+      try {
+        const reviewDiff = await DiffCollector.collectWorkingDiff(managed.workingDirectory)
+        managed.speculativeReviewDiff = reviewDiff
+        managed.speculativeReviewCapturedAt = Date.now()
+        managed.speculativeReviewFingerprint = this.buildReviewFingerprint(reviewDiff)
+      } catch (err) {
+        sessionLog.warn(`[SpeculativeQG] Failed to capture speculative artifact for ${managed.id}:`, err)
+      }
+    }, 1200)
+
+    if (typeof timer.unref === 'function') {
+      timer.unref()
+    }
+    this.speculativeReviewTimers.set(managed.id, timer)
+  }
+
+  /**
+   * Buffer health alerts and flush as a compact summary to avoid alert storms.
+   * Implements REQ-003: reduce noisy repeated health notifications.
+   */
+  private queueTeamHealthAlert(teamId: string, leadSessionId: string, issue: HealthIssue): void {
+    const queue = this.pendingTeamHealthAlerts.get(teamId) ?? []
+    queue.push(issue)
+    if (queue.length > 50) {
+      queue.splice(0, queue.length - 50)
+    }
+    this.pendingTeamHealthAlerts.set(teamId, queue)
+
+    if (this.teamHealthAlertFlushTimers.has(teamId)) return
+
+    const timer = setTimeout(async () => {
+      this.teamHealthAlertFlushTimers.delete(teamId)
+      const buffered = this.pendingTeamHealthAlerts.get(teamId) ?? []
+      this.pendingTeamHealthAlerts.delete(teamId)
+      if (buffered.length === 0) return
+      try {
+        await this.sendMessage(leadSessionId, formatHealthAlertSummaryMessage(buffered))
+      } catch (err) {
+        sessionLog.error('[AgentTeams] Failed to send aggregated health summary to lead:', err)
+      }
+    }, this.teamHealthAlertFlushMs)
+
+    if (typeof timer.unref === 'function') {
+      timer.unref()
+    }
+
+    this.teamHealthAlertFlushTimers.set(teamId, timer)
+  }
+
   /**
    * Start health monitoring for a team.
    * Registers event listeners for health issues and sets up periodic status check-ins.
@@ -1541,21 +2287,88 @@ export class SessionManager {
 
     this.healthMonitor.startMonitoring(teamId)
 
+    // REQ-HB-001: Start heartbeat aggregation for this team
+    this.heartbeatAggregator.startTracking(teamId)
+
+    // UI heartbeat delivery — broadcast batched snapshots to renderer via IPC (zero token cost)
+    const heartbeatBatchHandler = (batch: { teamId: string; heartbeats: import('@craft-agent/shared/agent-teams/heartbeat-aggregator').AgentHeartbeat[]; triggeredBy?: string }) => {
+      if (batch.teamId !== teamId) return
+      if (this.windowManager) {
+        this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, {
+          type: 'heartbeat:batch' as const,
+          teamId,
+          payload: {
+            heartbeats: batch.heartbeats.map(hb => ({
+              teammateId: hb.teammateId,
+              teammateName: hb.teammateName,
+              model: hb.model,
+              provider: hb.provider,
+              timestamp: hb.timestamp,
+              toolCallsSinceFlush: hb.toolCallsSinceFlush,
+              lastToolName: hb.lastToolName,
+              activitySummary: hb.activitySummary,
+              progressHint: hb.progressHint,
+              estimatedProgress: hb.estimatedProgress,
+              contextUsage: hb.contextUsage,
+              appearsStalled: hb.appearsStalled,
+            })),
+            triggeredBy: batch.triggeredBy,
+          },
+          timestamp: new Date().toISOString(),
+        })
+      }
+    }
+    this.heartbeatAggregator.on('heartbeat:batch', heartbeatBatchHandler)
+    this.teamHeartbeatBatchHandlers.set(teamId, heartbeatBatchHandler)
+
+    // LLM summary delivery — send to lead agent every 2 min (costs tokens, gives awareness)
+    const heartbeatLLMHandler = async (summary: { teamId: string; summary: string; heartbeats: import('@craft-agent/shared/agent-teams/heartbeat-aggregator').AgentHeartbeat[] }) => {
+      if (summary.teamId !== teamId) return
+      const lead = this.sessions.get(leadSessionId)
+      if (!lead || !lead.isTeamLead) return
+
+      // Check for teammates that need soft probes (REQ-HB-002)
+      for (const hb of summary.heartbeats) {
+        if (this.heartbeatAggregator.needsSoftProbe(teamId, hb.teammateId)) {
+          this.heartbeatAggregator.markSoftProbeSent(teamId, hb.teammateId)
+          sessionLog.info(`[AgentTeams] Sending soft probe to "${hb.teammateName}" (${hb.teammateId}) — silent for too long`)
+          this.sendMessage(hb.teammateId, [
+            '[System] Progress check — you have been quiet for a while.',
+            'Please briefly report: What are you currently working on? Are you blocked?',
+            'If blocked, send a message to team-lead explaining the issue.',
+          ].join('\n')).catch(err => {
+            sessionLog.warn(`[AgentTeams] Failed to soft-probe ${hb.teammateId}:`, err)
+          })
+        }
+      }
+
+      // Deliver the summary to the lead LLM
+      try {
+        await this.sendMessage(leadSessionId, summary.summary)
+      } catch (err) {
+        sessionLog.error('[AgentTeams] Failed to deliver heartbeat LLM summary:', err)
+      }
+    }
+    this.heartbeatAggregator.on('heartbeat:llm-summary', heartbeatLLMHandler)
+    this.teamHeartbeatLLMHandlers.set(teamId, heartbeatLLMHandler)
+
     // Relay health alerts to the lead session + broadcast to dashboard
+    // Implements BUG-002 fix: Auto-terminate zombie teammates that exceed health thresholds
+    // Implements REQ-ORCH-002: 3-stage stall recovery
+    const STALL_NUDGE_MS = 5 * 60 * 1000       // Stage 1: 5 min → send nudge message
+    const STALL_KILL_MS = 8 * 60 * 1000         // Stage 2: 8 min → force-kill + notify lead to re-assign
+    const STALL_HARD_KILL_MS = 12 * 60 * 1000   // Stage 3: 12 min → force-kill (failsafe)
+    const AUTO_KILL_RETRY_STORM_COUNT = 2 // Second retry-storm detection → force-kill
+    const retryStormCounts = new Map<string, number>()
+    const stallNudged = new Set<string>() // teammates that received a nudge
+
     const alertHandler = (issue: HealthIssue): void => {
       // Only relay alerts for teammates belonging to this team.
       const teammate = this.sessions.get(issue.teammateId)
       if (!teammate) return
       const teammateTeamId = teammate.teamId ? teamManager.resolveTeamId(teammate.teamId) : undefined
       if (teammateTeamId !== teamId) return
-      const alertMessage = formatHealthAlertMessage(issue)
-      setTimeout(async () => {
-        try {
-          await this.sendMessage(leadSessionId, alertMessage)
-        } catch (err) {
-          sessionLog.error('[AgentTeams] Failed to send health alert to lead:', err)
-        }
-      }, 100)
+      this.queueTeamHealthAlert(teamId, leadSessionId, issue)
 
       // Broadcast health issue to the dashboard for inline card badges
       if (this.windowManager) {
@@ -1574,21 +2387,187 @@ export class SessionManager {
         }
         this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, envelope)
       }
+
+      // Auto-terminate zombie teammates that exceed health thresholds.
+      // Shutdown requests via inbox are cooperative and fail when the agent is stuck.
+      // This uses process-level force-abort instead.
+      let shouldAutoKill = false
+      let autoKillReason = ''
+
+      // Implements REQ-ORCH-002: 3-stage stall recovery
+      // Stage 1 (5 min): nudge the teammate with a reminder message
+      // Stage 2 (8 min): force-kill + notify lead to re-assign
+      // Stage 3 (12 min): hard kill failsafe (handled by STALL_HARD_KILL_MS threshold)
+      if (issue.type === 'stall' && issue.duration) {
+        if (issue.duration >= STALL_KILL_MS) {
+          shouldAutoKill = true
+          autoKillReason = `stall exceeded ${Math.round(STALL_KILL_MS / 60000)}min — teammate unresponsive after nudge (actual: ${Math.round(issue.duration / 60000)}min)`
+        } else if (issue.duration >= STALL_NUDGE_MS && !stallNudged.has(issue.teammateId)) {
+          stallNudged.add(issue.teammateId)
+          sessionLog.info(`[AgentTeams] Stage 1 nudge for stalled teammate "${issue.teammateName}" (${issue.teammateId}) at ${Math.round(issue.duration / 60000)}min`)
+          this.sendMessage(issue.teammateId, [
+            'You appear to be stalled. Please continue working on your assigned task.',
+            'If you are blocked, send a message to team-lead explaining what is blocking you.',
+            'If you have completed your work, send your results to team-lead via SendMessage.',
+          ].join('\n')).catch(err => {
+            sessionLog.warn(`[AgentTeams] Failed to nudge stalled teammate ${issue.teammateId}:`, err)
+          })
+        }
+      }
+
+      if (issue.type === 'retry-storm') {
+        const count = (retryStormCounts.get(issue.teammateId) || 0) + 1
+        retryStormCounts.set(issue.teammateId, count)
+        if (count >= AUTO_KILL_RETRY_STORM_COUNT) {
+          shouldAutoKill = true
+          autoKillReason = `retry-storm detected ${count} times`
+        }
+        // REQ-BUDGET-005: The hard per-tool budget cap (Layer 1 in ToolCallThrottle) is the
+        // primary defense against retry storms. This similarity-based detection is a secondary
+        // signal — useful for logging and as a backup nudge, but not the main enforcement.
+        sessionLog.info(`[AgentTeams] Retry-storm WARN (secondary signal) for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
+        this.sendMessage(issue.teammateId, [
+          `**[SYSTEM] You are approaching a retry-storm limit.** You have made ${issue.details}.`,
+          '',
+          'STOP making more search/fetch calls. You have enough data to work with.',
+          'Your next action MUST be one of:',
+          '1. Synthesize and summarize all the results you have gathered so far',
+          '2. Send your findings to team-lead via SendMessage(type="message", recipient="team-lead")',
+          '3. Use a completely different tool if you genuinely need more information',
+          '',
+          'Do NOT make another similar search call or your tool access will be permanently blocked.',
+        ].join('\n')).catch(err => {
+          sessionLog.warn(`[AgentTeams] Failed to send Stage 1 nudge to ${issue.teammateId}:`, err)
+        })
+      }
+
+      // REQ-BUDGET-005: Stage 2 — hard-block offending tool + ultimatum (secondary defense).
+      // The primary defense is the hard per-tool budget cap in ToolCallThrottle.check().
+      // This fires only if the AIMD similarity detection catches a pattern within the budget.
+      if (issue.type === 'retry-storm-throttle') {
+        sessionLog.warn(`[AgentTeams] Retry-storm THROTTLE for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
+        const teammateManaged = this.sessions.get(issue.teammateId)
+        if (teammateManaged?.toolCallThrottle && issue.toolName) {
+          // Hard-block the specific offending tool — no more calls allowed
+          teammateManaged.toolCallThrottle.hardBlockTool(
+            issue.toolName,
+            `"${issue.toolName}" has been permanently blocked due to retry-storm detection. `
+            + 'You MUST synthesize your findings now and send them to team-lead. '
+            + 'Do NOT attempt to search again — use the data you already have.',
+          )
+          sessionLog.info(`[AgentTeams] Hard-blocked "${issue.toolName}" for "${issue.teammateName}" — no further calls allowed`)
+        }
+        // Send ultimatum message
+        this.sendMessage(issue.teammateId, [
+          `**[SYSTEM — FINAL WARNING] "${issue.toolName ?? 'This tool'}" is now BLOCKED.** You cannot make any more calls to it.`,
+          '',
+          'You MUST immediately:',
+          '1. Stop all search/fetch activity',
+          '2. Compile your findings from the data you already have',
+          '3. Send your complete report to team-lead via SendMessage(type="message", recipient="team-lead")',
+          '',
+          'If you do not comply, you will be terminated. This is your final warning.',
+        ].join('\n')).catch(err => {
+          sessionLog.warn(`[AgentTeams] Failed to send Stage 2 ultimatum to ${issue.teammateId}:`, err)
+        })
+      }
+
+      if (issue.type === 'retry-storm-kill') {
+        shouldAutoKill = true
+        autoKillReason = `retry-storm escalated to kill stage: ${issue.details}`
+      }
+
+      if (issue.type === 'context-exhaustion') {
+        shouldAutoKill = true
+        autoKillReason = `context window exhausted`
+      }
+
+      if (shouldAutoKill) {
+        sessionLog.warn(`[AgentTeams] Auto-terminating zombie teammate "${issue.teammateName}" (${issue.teammateId}): ${autoKillReason}`)
+        // Phase 4b: Capture partial results BEFORE terminate — terminateTeammateSession()
+        // calls removeTeammate() which deletes health state. Must snapshot first.
+        const resolvedTeamIdForKill = teamManager.resolveTeamId(teamId)
+        const teammateHealth = this.healthMonitor.getHealth(resolvedTeamIdForKill, issue.teammateId)
+        const partialResults = teammateHealth?.recentToolResults
+          ?.filter(r => !r.isError)
+          ?.slice(-5)  // Last 5 successful results
+          ?.map(r => `- **${r.tool}**: ${r.resultPreview.slice(0, 200)}`)
+          ?? []
+
+        this.terminateTeammateSession(issue.teammateId, `health-auto-kill:${autoKillReason}`).then(async killed => {
+          if (killed) {
+            // Relay termination notice to lead
+            this.updateTeammateTasks(resolvedTeamIdForKill, issue.teammateId, 'failed')
+
+            const replacement = await this.maybeAutoReplaceFailedTeammate({
+              teamId: resolvedTeamIdForKill,
+              leadSessionId,
+              failedTeammateId: issue.teammateId,
+              failureReason: autoKillReason,
+              partialResults,
+            })
+
+            const partialSection = partialResults.length > 0
+              ? [
+                '',
+                '**Partial results recovered:**',
+                ...partialResults,
+                '',
+                'You can use these partial findings to continue the work.',
+              ]
+              : []
+
+            const replacementSection = replacement.replaced
+              ? [
+                '',
+                `Auto-replacement: started **${replacement.replacementName}** (${replacement.replacementSessionId}).`,
+                'The replacement worker is now running the recovered task prompt.',
+              ]
+              : [
+                '',
+                `Auto-replacement: not started (${replacement.reason}).`,
+                'You may re-assign the work manually if needed.',
+              ]
+
+            this.sendMessage(leadSessionId, [
+              `**${issue.teammateName}** was auto-terminated by the health monitor.`,
+              `Reason: ${autoKillReason}`,
+              '',
+              'The teammate was unresponsive to shutdown requests and consuming resources.',
+              'Its task has been marked as failed.',
+              ...replacementSection,
+              ...partialSection,
+            ].join('\n')).catch(sendErr => {
+              // BUG-004 fix: Log instead of silently swallowing
+              sessionLog.error(`[AgentTeams] Failed to notify lead about auto-kill of ${issue.teammateId}:`, sendErr)
+            })
+          }
+        }).catch(err => {
+          sessionLog.error(`[AgentTeams] Auto-kill failed for ${issue.teammateId}:`, err)
+        })
+      }
     }
     this.healthMonitor.on('health:stall', alertHandler)
     this.healthMonitor.on('health:error-loop', alertHandler)
     this.healthMonitor.on('health:retry-storm', alertHandler)
+    this.healthMonitor.on('health:retry-storm-throttle', alertHandler)
+    this.healthMonitor.on('health:retry-storm-kill', alertHandler)
     this.healthMonitor.on('health:context-exhaustion', alertHandler)
     this.teamHealthAlertHandlers.set(teamId, alertHandler)
 
-    // Periodic team status check-in (every 2 minutes)
-    const statusInterval = setInterval(async () => {
+    // Periodic housekeeping (every 2 minutes)
+    // Note: Status check-ins are now handled by the heartbeat aggregator (REQ-HB-001).
+    // The LLM summary handler above delivers structured heartbeats to the lead every 2 min.
+    // This interval only handles liveness checks and review-loop eviction.
+    const statusInterval = setInterval(() => {
+      if (!this.healthMonitorTeams.has(teamId)) return
+
       const health = this.healthMonitor.getTeamHealth(teamId)
       if (health.length === 0) return
 
       const lead = this.sessions.get(leadSessionId)
       if (!lead || !lead.isTeamLead) {
-        // Lead gone — stop periodic checks
+        // Lead gone Ã¢â‚¬â€ stop periodic checks
         clearInterval(statusInterval)
         this.teamStatusIntervals.delete(teamId)
         return
@@ -1606,21 +2585,13 @@ export class SessionManager {
         return
       }
 
-      const lines = liveHealth.map(h => {
-        const elapsed = Date.now() - new Date(h.lastActivityAt).getTime()
-        const elapsedStr = elapsed < 60000 ? `${Math.round(elapsed / 1000)}s ago` : `${Math.round(elapsed / 60000)}m ago`
-        const rawTask = h.currentTaskId ?? ''
-        const taskLabel = rawTask.length > 60 ? rawTask.slice(0, 57) + '...' : rawTask
-        const task = taskLabel ? `working on "${taskLabel}"` : 'idle'
-        const issues = h.issues.length > 0 ? ` [${h.issues.length} issue(s)]` : ''
-        return `- ${h.teammateName}: ${task} (last activity: ${elapsedStr})${issues}`
-      })
-
-      const statusMessage = `### Team Status Check-In\n${lines.join('\n')}`
-      try {
-        await this.sendMessage(leadSessionId, statusMessage)
-      } catch (err) {
-        sessionLog.error('[AgentTeams] Failed to send periodic team status:', err)
+      // Implements H3: Periodically evict stale review states (older than 1 hour)
+      const rl = teamManager.getReviewLoop()
+      if (rl) {
+        const evicted = rl.evictStaleReviews()
+        if (evicted > 0) {
+          sessionLog.info(`[AgentTeams] Evicted ${evicted} stale review states`)
+        }
       }
     }, 2 * 60 * 1000)
 
@@ -1635,6 +2606,7 @@ export class SessionManager {
    */
   private stopTeamHealthMonitoring(teamId: string): void {
     this.healthMonitor.clearTeam(teamId)
+    this.heartbeatAggregator.stopTracking(teamId)
     this.healthMonitorTeams.delete(teamId)
 
     const alertHandler = this.teamHealthAlertHandlers.get(teamId)
@@ -1642,8 +2614,22 @@ export class SessionManager {
       this.healthMonitor.off('health:stall', alertHandler)
       this.healthMonitor.off('health:error-loop', alertHandler)
       this.healthMonitor.off('health:retry-storm', alertHandler)
+      this.healthMonitor.off('health:retry-storm-throttle', alertHandler)
+      this.healthMonitor.off('health:retry-storm-kill', alertHandler)
       this.healthMonitor.off('health:context-exhaustion', alertHandler)
       this.teamHealthAlertHandlers.delete(teamId)
+    }
+
+    // REQ-HB-001: Clean up heartbeat event listeners
+    const heartbeatBatchHandler = this.teamHeartbeatBatchHandlers.get(teamId)
+    if (heartbeatBatchHandler) {
+      this.heartbeatAggregator.off('heartbeat:batch', heartbeatBatchHandler)
+      this.teamHeartbeatBatchHandlers.delete(teamId)
+    }
+    const heartbeatLLMHandler = this.teamHeartbeatLLMHandlers.get(teamId)
+    if (heartbeatLLMHandler) {
+      this.heartbeatAggregator.off('heartbeat:llm-summary', heartbeatLLMHandler)
+      this.teamHeartbeatLLMHandlers.delete(teamId)
     }
 
     const statusInterval = this.teamStatusIntervals.get(teamId)
@@ -1651,6 +2637,13 @@ export class SessionManager {
       clearInterval(statusInterval)
       this.teamStatusIntervals.delete(teamId)
     }
+
+    const flushTimer = this.teamHealthAlertFlushTimers.get(teamId)
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      this.teamHealthAlertFlushTimers.delete(teamId)
+    }
+    this.pendingTeamHealthAlerts.delete(teamId)
   }
 
   /**
@@ -1689,28 +2682,22 @@ export class SessionManager {
   }
 
   /**
-   * Remove a teammate from lead tracking and health monitoring.
-   * Safe to call repeatedly.
+   * Stop runtime monitoring for a teammate without modifying team metadata.
+   * Implements REQ-001: Used during termination/completion to clean up runtime state
+   * while preserving team identity for sidebar grouping.
    */
-  private detachTeammateTracking(teammate: ManagedSession): void {
-    const parentSessionId = teammate.parentSessionId
-    if (parentSessionId) {
-      const lead = this.sessions.get(parentSessionId)
-      if (lead?.teammateSessionIds?.length) {
-        const next = lead.teammateSessionIds.filter(id => id !== teammate.id)
-        lead.teammateSessionIds = next.length > 0 ? next : undefined
-        this.persistSession(lead)
-      }
-    }
-
+  private detachTeammateRuntimeTracking(teammate: ManagedSession): void {
     const resolvedTeamId = teammate.teamId
       ? teamManager.resolveTeamId(teammate.teamId)
       : undefined
     if (resolvedTeamId) {
       this.healthMonitor.removeTeammate(resolvedTeamId, teammate.id)
+      // REQ-HB-001: Signal completion so heartbeat aggregator does an immediate UI flush
+      this.heartbeatAggregator.signalAgentCompleted(resolvedTeamId, teammate.id)
       const hasLiveTeammates = Array.from(this.sessions.values()).some(s => {
         if (s.id === teammate.id) return false
         if (!s.parentSessionId || !s.teamId) return false
+        if (!s.isProcessing) return false
         return teamManager.resolveTeamId(s.teamId) === resolvedTeamId
       })
       if (!hasLiveTeammates) {
@@ -1718,6 +2705,7 @@ export class SessionManager {
       }
     }
   }
+
 
   /**
    * Deterministically terminate a teammate session runtime and detach all team tracking.
@@ -1742,14 +2730,118 @@ export class SessionManager {
 
     this.destroyManagedAgent(teammate, reason)
     this.stopComplianceWatcher(teammateId)
-    this.detachTeammateTracking(teammate)
+    // Implements REQ-001: Preserve team metadata on termination for sidebar grouping
+    // Only clean up runtime tracking (health monitor), NOT persisted team identity
+    this.detachTeammateRuntimeTracking(teammate)
 
-    teammate.teamId = undefined
-    teammate.parentSessionId = undefined
-    teammate.teammateName = undefined
     teammate.isProcessing = false
     this.persistSession(teammate)
     return true
+  }
+
+  private findLatestTaskForAssignee(teamId: string, assigneeId: string): TeamTask | undefined {
+    const tasks = teamManager.getTasks(teamId)
+      .filter(task => task.assignee === assigneeId)
+      .sort((a, b) => {
+        const aTs = Date.parse(a.createdAt || '') || 0
+        const bTs = Date.parse(b.createdAt || '') || 0
+        return bTs - aTs
+      })
+    return tasks[0]
+  }
+
+  private async maybeAutoReplaceFailedTeammate(params: {
+    teamId: string
+    leadSessionId: string
+    failedTeammateId: string
+    failureReason: string
+    partialResults: string[]
+  }): Promise<{ replaced: boolean; reason: string; replacementName?: string; replacementSessionId?: string }> {
+    // Implements REQ-RECOVERY-001: automatic worker replacement after health-monitor kill/failure.
+    const failed = this.sessions.get(params.failedTeammateId)
+    if (!failed) {
+      return { replaced: false, reason: 'failed teammate session not found' }
+    }
+
+    if (failed.teammateRole !== TEAM_ROLE_WORKER) {
+      return { replaced: false, reason: `auto-replacement is restricted to worker role (got "${failed.teammateRole ?? 'unknown'}")` }
+    }
+
+    const lead = this.sessions.get(params.leadSessionId)
+    if (!lead || !lead.isTeamLead) {
+      return { replaced: false, reason: 'team lead session not available' }
+    }
+
+    const task = this.findLatestTaskForAssignee(params.teamId, params.failedTeammateId)
+    const promptFromTask = task?.description?.trim()
+    const promptFromHistory = [...failed.messages]
+      .reverse()
+      .find(m => m.role === 'user' && !m.isIntermediate)?.content?.trim()
+    const originalPrompt = promptFromTask || promptFromHistory
+
+    if (!originalPrompt) {
+      return { replaced: false, reason: 'could not recover original task prompt for replacement' }
+    }
+
+    const attemptKey = buildAutoReplacementAttemptKey({
+      taskDescription: task?.description,
+      taskTitle: task?.title,
+      teammateRole: failed.teammateRole,
+      teammateName: failed.teammateName,
+    })
+    const attempts = lead.autoReplacementAttempts ?? {}
+    const previousAttempts = attempts[attemptKey] ?? 0
+    if (previousAttempts >= MAX_AUTO_REPLACEMENT_ATTEMPTS_PER_TASK) {
+      return {
+        replaced: false,
+        reason: `replacement attempt cap reached (${previousAttempts}/${MAX_AUTO_REPLACEMENT_ATTEMPTS_PER_TASK}) for task fingerprint`,
+      }
+    }
+
+    const nextAttempt = previousAttempts + 1
+    attempts[attemptKey] = nextAttempt
+    lead.autoReplacementAttempts = attempts
+    this.persistSession(lead)
+
+    try {
+      const baseName = failed.teammateName?.trim() || 'worker'
+      const replacementName = `${baseName}-retry-${nextAttempt}`
+      const prompt = buildAutoReplacementPrompt({
+        originalPrompt,
+        teammateName: failed.teammateName || failed.id,
+        failureReason: params.failureReason,
+        partialResults: params.partialResults,
+        attempt: nextAttempt,
+      })
+
+      const replacement = await this.createTeammateSession({
+        parentSessionId: lead.id,
+        workspaceId: lead.workspace.id,
+        teamId: lead.teamId ?? failed.teamId ?? params.teamId,
+        teammateName: replacementName,
+        prompt,
+        llmConnection: lead.llmConnection,
+        role: failed.teammateRole ?? TEAM_ROLE_WORKER,
+      })
+
+      return {
+        replaced: true,
+        reason: `spawned auto-replacement "${replacementName}"`,
+        replacementName,
+        replacementSessionId: replacement.id,
+      }
+    } catch (err) {
+      // Roll back attempt count when spawn itself fails.
+      if (previousAttempts <= 0) {
+        delete attempts[attemptKey]
+      } else {
+        attempts[attemptKey] = previousAttempts
+      }
+      lead.autoReplacementAttempts = attempts
+      this.persistSession(lead)
+      const message = err instanceof Error ? err.message : String(err)
+      return { replaced: false, reason: `replacement spawn failed: ${message}` }
+    }
   }
 
   private formatLeadToTeammateMessage(content: string): string {
@@ -1780,7 +2872,7 @@ export class SessionManager {
       .map(stage => {
         const stageResult = result.stages[stage]
         if (!stageResult) return null
-        const status = stageResult.passed ? '✅' : '❌'
+        const status = stageResult.passed ? '\u2705' : '\u274c'
         return `- ${status} **${labelFor(stage)}:** ${Math.round(stageResult.score)}%`
       })
       .filter((line): line is string => Boolean(line))
@@ -1788,7 +2880,7 @@ export class SessionManager {
     return [
       `### Quality Gate`,
       ``,
-      `**Overall:** ${result.passed ? '✅ PASS' : '❌ FAIL'} · **Score:** ${Math.round(result.aggregateScore)}% · **Cycle:** ${result.cycleCount ?? 1}/${result.maxCycles ?? 1}`,
+      `**Overall:** ${result.passed ? '\u2705 PASS' : '\u274c FAIL'} | **Score:** ${Math.round(result.aggregateScore)}% | **Cycle:** ${result.cycleCount ?? 1}/${result.maxCycles ?? 1}`,
       ``,
       ...stageLines,
     ].join('\n')
@@ -1808,7 +2900,7 @@ export class SessionManager {
 
     const reviewLoop = teamManager.getReviewLoop()
     if (!reviewLoop) {
-      sessionLog.warn('[YOLO] Cannot start YOLO — no review loop attached')
+      sessionLog.warn('[YOLO] Cannot start YOLO Ã¢â‚¬â€ no review loop attached')
       return null
     }
 
@@ -1817,7 +2909,7 @@ export class SessionManager {
         // Instruct the lead to generate a spec by sending a structured message
         await this.sendMessage(leadSessionId,
           `[YOLO] Generate a specification for the following objective. Output a structured spec with requirements, risks, and acceptance tests.\n\nObjective: ${objective}`)
-        // Poll for the spec — the lead processes the message asynchronously
+        // Poll for the spec Ã¢â‚¬â€ the lead processes the message asynchronously
         const MAX_SPEC_WAIT_MS = 5 * 60 * 1000 // 5 minutes
         const SPEC_POLL_MS = 2000
         const specStart = Date.now()
@@ -1829,56 +2921,129 @@ export class SessionManager {
         throw new Error('Lead did not generate a spec within the timeout')
       },
 
+      // Implements REQ-B3: Smart task decomposition with dependency inference,
+      // domain grouping, and parallel identification.
       decomposeIntoTasks: async (_teamId: string, spec) => {
-        return spec.requirements.map((req, idx) => ({
-          title: `Implement ${req.id}: ${req.description.slice(0, 60)}`,
-          description: req.description,
-          requirementIds: [req.id],
-          phase: req.priority === 'critical' ? 'foundation' : req.priority === 'high' ? 'core' : 'polish',
-          phaseOrder: req.priority === 'critical' ? 0 : req.priority === 'high' ? 1 : 2,
-        }))
+        const reqMap = new Map(spec.requirements.map(r => [r.id, r]))
+
+        // Build dependency graph: if requirement B references A's ID in its description,
+        // B depends on A.
+        const dependencyMap = new Map<string, string[]>()
+        for (const req of spec.requirements) {
+          const deps: string[] = []
+          for (const other of spec.requirements) {
+            if (other.id === req.id) continue
+            // Check if this requirement references another requirement's ID
+            if (req.description.includes(other.id)) {
+              deps.push(other.id)
+            }
+          }
+          dependencyMap.set(req.id, deps)
+        }
+
+        return spec.requirements.map((req) => {
+          const phase = req.priority === 'critical' ? 'foundation' : req.priority === 'high' ? 'core' : 'polish'
+          const phaseOrder = req.priority === 'critical' ? 0 : req.priority === 'high' ? 1 : 2
+
+          // Infer task type from requirement description
+          const { inferTaskType } = require('@craft-agent/shared/agent-teams/quality-gates')
+          const taskType = inferTaskType(req.description) ?? 'feature'
+
+          // Build dependency list: task IDs that must complete first
+          const reqDeps = dependencyMap.get(req.id) ?? []
+          // Map requirement IDs to task IDs (task-{reqId})
+          const taskDeps = reqDeps.map(depReqId => `task-${depReqId}`)
+
+          return {
+            id: `task-${req.id}`,
+            title: `Implement ${req.id}: ${req.description.slice(0, 60)}`,
+            description: req.description,
+            requirementIds: [req.id],
+            phase,
+            phaseOrder,
+            taskType,
+            dependencies: taskDeps.length > 0 ? taskDeps : undefined,
+          }
+        })
       },
 
       spawnAndAssign: async (_teamId: string, taskIds: string[]) => {
-        const tasks = teamManager.getTasks(_teamId)
-        // Resolve the worker model from presets instead of using the lead's model
-        const workerAssignment = resolveTeamModelForRole(wsConfig, 'worker', undefined, lead.model)
-        const workerModel = workerAssignment.model !== 'unknown' ? workerAssignment.model : lead.model
-        for (const taskId of taskIds) {
-          const task = tasks.find(t => t.id === taskId)
-          if (!task) continue
-          try {
-            const teammateSession = await this.createTeammateSession({
-              parentSessionId: leadSessionId,
-              workspaceId: lead.workspace.id,
-              teamId: _teamId,
-              teammateName: `worker-${taskId.slice(-6)}`,
-              prompt: task.description || task.title,
-              model: workerModel,
-            })
-            // Assign the task to the spawned teammate
-            const team = teamManager.getTeam(_teamId)
-            const teammate = team?.members.find(m => m.sessionId === teammateSession.id)
-            if (teammate) {
-              teamManager.assignTask(_teamId, taskId, teammate.id)
-            }
-          } catch (err) {
-            sessionLog.error(`[YOLO] Failed to spawn teammate for task ${taskId}:`, err)
-          }
+        const allTasks = teamManager.getTasks(_teamId)
+        const relevantTasks = taskIds
+          .map(id => allTasks.find(t => t.id === id))
+          .filter((t): t is NonNullable<typeof t> => t != null)
+
+        // Implements REQ-NEXT-002/006: task-aware architecture selector + learning-guided routing.
+        const learningGuidance = getLearningGuidance(lead.workspace.rootPath)
+        const architectureDecision = selectArchitectureMode(relevantTasks, {
+          learningHint: {
+            preferManaged: learningGuidance.preferManaged,
+            rationale: learningGuidance.rationale.join('; '),
+          },
+        })
+        const strategy = decideSpawnStrategy(relevantTasks, {
+          learningHint: {
+            preferManaged: learningGuidance.preferManaged,
+            rationale: learningGuidance.rationale.join('; '),
+          },
+        })
+        teamManager.logActivity(
+          _teamId,
+          'phase-advanced',
+          `Architecture selector chose ${architectureDecision.mode} (confidence=${Math.round(architectureDecision.confidence * 100)}%). ` +
+            `Rationale: ${architectureDecision.rationale.join(' | ')}. ` +
+            `Features: domains=${architectureDecision.features.meaningfulDomains.join(',') || 'none'}, ` +
+            `tasks=${architectureDecision.features.taskCount}, deps=${architectureDecision.features.dependencyRatio}. ` +
+            `Learning: ${learningGuidance.rationale.join('; ')}`,
+        )
+
+        if (strategy.mode === 'flat') {
+          await this.spawnWorkersDirectly({
+            teamId: _teamId,
+            leadSessionId,
+            workspaceId: lead.workspace.id,
+            fallbackModel: lead.model || 'claude-opus-4-6',
+            wsConfig,
+            taskIds,
+          })
+        } else {
+          await this.spawnYoloHeadsByPhase({
+            teamId: _teamId,
+            leadSessionId,
+            workspaceId: lead.workspace.id,
+            fallbackModel: lead.model || 'claude-opus-4-6',
+            wsConfig,
+            taskIds,
+          })
         }
       },
 
       runIntegrationCheck: async (_teamId: string) => {
         try {
-          const runner = this.getQualityGateRunner()
-          const syntaxResult = await runner.runSyntaxCheck(workingDirectory)
-          const testResult = await runner.runTestExecution(workingDirectory)
+          const gate = new IntegrationGate({
+            workingDirectory: workingDirectory,
+            typeCheckTimeoutMs: 60000,
+            testSuiteTimeoutMs: 180000,
+            skipTests: false,
+          })
+          const result = await gate.runCheck()
           const issues: string[] = [
-            ...syntaxResult.issues,
-            ...testResult.issues,
+            ...result.typeCheck.errors,
+            ...result.testSuite.failedTests,
           ]
+          if (result.conflicts.hasConflicts) {
+            issues.push(`Git merge conflicts in: ${result.conflicts.conflictFiles.join(', ')}`)
+          }
+          // Wiring verification: warn about new files not connected to the project
+          if (result.wiring && !result.wiring.passed) {
+            issues.push(
+              `WIRING WARNING: ${result.wiring.unwiredFiles.length} new file(s) are not imported anywhere in the project:`,
+              ...result.wiring.unwiredFiles.map(f => `  - ${f} (not imported by any existing code)`),
+              'These files may be built correctly but are not connected to the application.',
+            )
+          }
           return {
-            passed: syntaxResult.passed && testResult.passed,
+            passed: result.passed,
             issues,
           }
         } catch (err) {
@@ -1906,7 +3071,7 @@ export class SessionManager {
         // Also broadcast as a team event for the dashboard hook
         if (this.windowManager) {
           const phases = teamManager.getTeamPhases(_teamId)
-          const envelope: import('@craft-agent/core/types').YoloStateChangedEvent = {
+          const envelope: YoloStateChangedEvent = {
             type: 'yolo:state_changed',
             teamId: _teamId,
             payload: { state, phases: phases.length > 0 ? phases : undefined },
@@ -1922,6 +3087,264 @@ export class SessionManager {
 
     sessionLog.info(`[YOLO] Orchestrator created for team ${teamId} (mode: ${yoloConfig.mode})`)
     return orchestrator
+  }
+
+  private resolveRoleModel(
+    wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined,
+    role: TeamRole,
+    fallbackModel: string,
+    options?: { qgEnabled?: boolean },
+  ): string {
+    const effectiveQgEnabled = options?.qgEnabled ?? mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates).enabled
+    const assignment = resolveTeamModelForRole(
+      wsConfig,
+      role,
+      undefined,
+      fallbackModel,
+      { qgEnabled: effectiveQgEnabled },
+    )
+    return assignment.model !== 'unknown' ? assignment.model : fallbackModel
+  }
+
+  private groupTasksByPhase(tasks: TeamTask[], taskIds: string[]): Map<string, string[]> {
+    const taskMap = new Map(tasks.map(task => [task.id, task]))
+    const grouped = new Map<string, string[]>()
+
+    for (const taskId of taskIds) {
+      const task = taskMap.get(taskId)
+      if (!task) continue
+      const phase = task.phase || 'default'
+      const ids = grouped.get(phase) ?? []
+      ids.push(taskId)
+      grouped.set(phase, ids)
+    }
+    return grouped
+  }
+
+  private buildPhaseTaskSelection(tasks: TeamTask[], taskIds: string[]): TeamTask[] {
+    const taskById = new Map(tasks.map(task => [task.id, task]))
+    return taskIds.map(taskId => taskById.get(taskId)).filter((task): task is TeamTask => Boolean(task))
+  }
+
+  private buildHeadSpecSection(teamSpec: Spec | undefined, phaseTasks: TeamTask[]): string {
+    if (!teamSpec) return ''
+
+    const reqIds = new Set<string>()
+    for (const task of phaseTasks) {
+      for (const reqId of task.requirementIds ?? []) reqIds.add(reqId)
+    }
+
+    const relevantReqs = teamSpec.requirements.filter(req => reqIds.has(req.id))
+    if (relevantReqs.length === 0) return ''
+
+    const requirementLines = relevantReqs.map(req => {
+      const acceptance = req.acceptanceTests.length
+        ? req.acceptanceTests.map(test => `- ${test}`).join('\n')
+        : '- (no acceptance criteria defined)'
+      const definitionOfDone = req.acceptanceTests.length
+        ? req.acceptanceTests.map(test => `- [ ] ${test}`).join('\n')
+        : '- [ ] Define concrete deliverables for this requirement'
+
+      return [
+        `Requirement ${req.id} [${req.priority}]: ${req.description}`,
+        'Acceptance criteria:',
+        acceptance,
+        'Definition of done:',
+        definitionOfDone,
+      ].join('\n')
+    }).join('\n\n')
+
+    return [
+      '',
+      'SPEC REQUIREMENTS ASSIGNED TO YOU',
+      requirementLines,
+      '',
+      'GUARD ROLE: verify every Definition of Done checkbox before marking a requirement as done.',
+      'Include REQUIREMENT COVERAGE and Definition of Done verification in your final message to the lead.',
+    ].join('\n')
+  }
+
+  private buildHeadPrompt(params: {
+    workerModel: string
+    reviewerModel: string
+    phaseTasks: TeamTask[]
+    specSection: string
+  }): string {
+    const { workerModel, reviewerModel, phaseTasks, specSection } = params
+    const taskLines = phaseTasks.map(task => `- ${task.title}: ${task.description || ''}`).join('\n')
+
+    // Implements REQ-B5: Calculate explicit worker budget based on task count.
+    // Simple heuristic: 1 worker per task for complex tasks, batch 2-3 simple tasks per worker.
+    const taskCount = phaseTasks.length
+    const workerBudget = Math.max(1, Math.min(taskCount, MAX_TEAMMATES_PER_TEAM - 2)) // Reserve slots for head + reviewer
+
+    return [
+      `You are a Head agent. Coordinate these tasks using Worker subagents (model="${workerModel}") and Reviewer subagents (model="${reviewerModel}").`,
+      '',
+      'TASKS ASSIGNED',
+      taskLines || '- No tasks provided',
+      specSection,
+      '',
+      // Implements REQ-B5: Explicit worker count guidance
+      'RESOURCE BUDGET',
+      `- You have budget for ${workerBudget} Worker subagents (based on ${taskCount} tasks).`,
+      '- Spawn 1 Worker per task for complex tasks, or 1 Worker for 2-3 related simple tasks.',
+      '- Each Worker should complete within 10 minutes.',
+      '- If a Worker exceeds 3 retries on quality gate, escalate — do not retry further.',
+      '',
+      'SPAWNING RULES',
+      '- Spawn Workers as subagents (Task without team_name).',
+      '- Spawn Reviewers as subagents (Task without team_name).',
+      '- Workers must follow TDD: tests first, implementation second, then run tests.',
+      '- Pass acceptance criteria and Definition of Done items to each Worker.',
+      '- Verify every Definition of Done item before review.',
+      '- After Worker completion, run Reviewer quality scoring.',
+      '- If any review stage is below 90, rerun the Worker with feedback (max 3 retries).',
+      '- Send final results with requirement coverage and Definition of Done verification to team-lead.',
+    ].join('\n')
+  }
+
+  private async spawnYoloHeadsByPhase(params: {
+    teamId: string
+    leadSessionId: string
+    workspaceId: string
+    fallbackModel: string
+    wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined
+    taskIds: string[]
+  }): Promise<void> {
+    const { teamId, leadSessionId, workspaceId, fallbackModel, wsConfig, taskIds } = params
+    const tasks = teamManager.getTasks(teamId)
+    const teamSpec = teamManager.getTeamSpec(teamId)
+    const tasksByPhase = this.groupTasksByPhase(tasks, taskIds)
+    const qgEnabled = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates).enabled
+
+    const headModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_HEAD, fallbackModel, { qgEnabled })
+    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel, { qgEnabled })
+    const reviewerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_REVIEWER, fallbackModel, { qgEnabled })
+
+    const phasePlans = [...tasksByPhase.entries()].map(([phase, phaseTaskIds]) => {
+      const phaseTasks = this.buildPhaseTaskSelection(tasks, phaseTaskIds)
+      const specSection = this.buildHeadSpecSection(teamSpec, phaseTasks)
+      const prompt = this.buildHeadPrompt({ workerModel, reviewerModel, phaseTasks, specSection })
+      return { phase, phaseTaskIds, prompt }
+    })
+
+    for (const phasePlan of phasePlans) {
+      try {
+        const headSession = await this.createHeadForPhase({
+          parentSessionId: leadSessionId,
+          workspaceId,
+          teamId,
+          phase: phasePlan.phase,
+          model: headModel,
+          prompt: phasePlan.prompt,
+        })
+
+        this.assignTasksToSessionMember(teamId, headSession.id, phasePlan.phaseTaskIds)
+      } catch (err) {
+        sessionLog.error(`[YOLO] Failed to spawn head for phase ${phasePlan.phase}:`, err)
+      }
+    }
+  }
+
+  /**
+   * Implements REQ-P1: Flat mode — spawn workers directly without Head intermediary.
+   * Used when tasks are single-domain and ≤5, avoiding the token overhead of a Head agent.
+   */
+  private async spawnWorkersDirectly(params: {
+    teamId: string
+    leadSessionId: string
+    workspaceId: string
+    fallbackModel: string
+    wsConfig: ReturnType<typeof loadWorkspaceConfig> | undefined
+    taskIds: string[]
+  }): Promise<void> {
+    const { teamId, leadSessionId, workspaceId, fallbackModel, wsConfig, taskIds } = params
+    const tasks = teamManager.getTasks(teamId)
+    const teamSpec = teamManager.getTeamSpec(teamId)
+    const qgEnabled = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates).enabled
+    const workerModel = this.resolveRoleModel(wsConfig, TEAM_ROLE_WORKER, fallbackModel, { qgEnabled })
+
+    for (const taskId of taskIds) {
+      const task = tasks.find(t => t.id === taskId)
+      if (!task) continue
+
+      try {
+        const specContext = teamSpec
+          ? `\n\nSpec Context:\n${task.requirementIds?.map(id => `- ${id}`).join('\n') ?? 'No linked requirements'}`
+          : ''
+
+        const domainRouting = decideTeammateRouting({
+          prompt: `${task.title}\n${task.description ?? ''}`,
+          requestedRole: TEAM_ROLE_WORKER,
+        })
+        // REQ-NEXT-010: Explicitly inject domain skill packs when flat mode bypasses Heads.
+        const domainSkillMentions = domainRouting.skillSlugs.length > 0
+          ? domainRouting.skillSlugs.map(slug => `[skill:${slug}]`).join(' ')
+          : ''
+
+        const workerPromptBody = [
+          `## Task: ${task.title}`,
+          '',
+          task.description ?? 'No additional description.',
+          specContext,
+          '',
+          'Complete this task thoroughly. Follow TDD where applicable: tests first, implementation second, then verify tests pass.',
+          task.dependencies?.length
+            ? `\nDependencies (already completed): ${task.dependencies.join(', ')}`
+            : '',
+        ].filter(Boolean).join('\n')
+        const workerPrompt = domainSkillMentions
+          ? `${domainSkillMentions}\n\n${workerPromptBody}`
+          : workerPromptBody
+
+        const workerSession = await this.createTeammateSession({
+          parentSessionId: leadSessionId,
+          workspaceId,
+          teamId,
+          teammateName: undefined,
+          role: TEAM_ROLE_WORKER,
+          model: workerModel,
+          prompt: workerPrompt,
+        })
+
+        this.assignTasksToSessionMember(teamId, workerSession.id, [taskId])
+      } catch (err) {
+        sessionLog.error(`[YOLO] Failed to spawn worker for task ${taskId}:`, err)
+      }
+    }
+  }
+
+  private async createHeadForPhase(params: {
+    parentSessionId: string
+    workspaceId: string
+    teamId: string
+    phase: string
+    model: string
+    prompt: string
+  }): Promise<import('../shared/types').Session> {
+    return this.createTeammateSession({
+      parentSessionId: params.parentSessionId,
+      workspaceId: params.workspaceId,
+      teamId: params.teamId,
+      teammateName: undefined,
+      role: TEAM_ROLE_HEAD,
+      model: params.model,
+      prompt: params.prompt,
+    })
+  }
+
+  private assignTasksToSessionMember(teamId: string, sessionId: string, taskIds: string[]): void {
+    const team = teamManager.getTeam(teamId)
+    const member = team?.members.find(entry => entry.sessionId === sessionId)
+    if (!member) {
+      sessionLog.warn(`[AgentTeams] Could not assign ${taskIds.length} task(s): member for session ${sessionId} not found in team ${teamId}`)
+      return
+    }
+
+    for (const taskId of taskIds) {
+      teamManager.assignTask(teamId, taskId, member.id)
+    }
   }
 
   private deriveYoloObjectiveFromLead(managed: ManagedSession, fallbackTeamName?: string): string {
@@ -2043,8 +3466,9 @@ export class SessionManager {
     const persistence = this.getUsagePersistence(managed.workspace.id)
     const weekIdentifier = persistence.getWeekIdentifier(now)
     const startedAtMs = managed.createdAt ?? managed.lastMessageAt ?? now.getTime()
+    // BUG-034 fix: Use structuredClone instead of JSON round-trip for deep cloning
     const base = managed.usageSummary
-      ? JSON.parse(JSON.stringify(managed.usageSummary)) as PersistedSessionUsage
+      ? structuredClone(managed.usageSummary)
       : createEmptySessionUsage(managed.id, startedAtMs)
 
     base.weekIdentifier = weekIdentifier
@@ -2219,43 +3643,15 @@ export class SessionManager {
     const callbacks: ConfigWatcherCallbacks = {
       onSourcesListChange: async (sources: LoadedSource[]) => {
         sessionLog.info(`Sources list changed in ${workspaceRootPath} (${sources.length} sources)`)
-        // Broadcast to UI
-        this.broadcastSourcesChanged(sources)
-        // Reload sources for all sessions in this workspace
-        // Skip sessions that are currently processing to avoid interrupting tool calls
-        for (const [_, managed] of this.sessions) {
-          if (managed.workspace.rootPath === workspaceRootPath) {
-            if (managed.isProcessing) {
-              sessionLog.info(`Skipping source reload for session ${managed.id} (processing)`)
-              continue
-            }
-            await this.reloadSessionSources(managed)
-          }
-        }
+        this.debouncedSourceReload(workspaceRootPath)
       },
       onSourceChange: async (slug: string, source: LoadedSource | null) => {
         sessionLog.info(`Source '${slug}' changed:`, source ? 'updated' : 'deleted')
-        // Broadcast updated list to UI
-        const sources = loadWorkspaceSources(workspaceRootPath)
-        this.broadcastSourcesChanged(sources)
-        // Reload sources for all sessions in this workspace
-        // Skip sessions that are currently processing to avoid interrupting tool calls
-        for (const [_, managed] of this.sessions) {
-          if (managed.workspace.rootPath === workspaceRootPath) {
-            if (managed.isProcessing) {
-              sessionLog.info(`Skipping source reload for session ${managed.id} (processing)`)
-              continue
-            }
-            await this.reloadSessionSources(managed)
-          }
-        }
+        this.debouncedSourceReload(workspaceRootPath)
       },
       onSourceGuideChange: (sourceSlug: string) => {
         sessionLog.info(`Source guide changed: ${sourceSlug}`)
-        // Broadcast the updated sources list so sidebar picks up guide changes
-        // Note: Guide changes don't require session source reload (no server changes)
-        const sources = loadWorkspaceSources(workspaceRootPath)
-        this.broadcastSourcesChanged(sources)
+        this.debouncedSourceReload(workspaceRootPath)
       },
       onStatusConfigChange: () => {
         sessionLog.info(`Status config changed in ${workspaceId}`)
@@ -2316,7 +3712,7 @@ export class SessionManager {
         const managed = this.sessions.get(sessionId)
         if (!managed) return
 
-        // Skip if session is currently processing — in-memory state is authoritative during streaming
+        // Skip if session is currently processing Ã¢â‚¬â€ in-memory state is authoritative during streaming
         if (managed.isProcessing) return
 
         let changed = false
@@ -2413,6 +3809,31 @@ export class SessionManager {
       this.hookSystems.set(workspaceRootPath, hookSystem)
       sessionLog.info(`Initialized HookSystem for workspace ${workspaceId}`)
     }
+  }
+
+  /**
+   * Debounced source reload — coalesces rapid cascading events (config change +
+   * icon download + dir change) into a single broadcast + session reload cycle.
+   * Implements BUG-C fix: reduces 3 broadcasts + 3N session reloads to 1 + N.
+   */
+  private debouncedSourceReload(workspaceRootPath: string): void {
+    const existing = this.sourceReloadTimers.get(workspaceRootPath)
+    if (existing) clearTimeout(existing)
+
+    const timer = setTimeout(async () => {
+      this.sourceReloadTimers.delete(workspaceRootPath)
+      const sources = loadWorkspaceSources(workspaceRootPath)
+      this.broadcastSourcesChanged(sources)
+      for (const [_, managed] of this.sessions) {
+        if (managed.workspace.rootPath !== workspaceRootPath) continue
+        if (managed.isProcessing) {
+          sessionLog.info(`Skipping source reload for session ${managed.id} (processing)`)
+          continue
+        }
+        await this.reloadSessionSources(managed)
+      }
+    }, this.SOURCE_RELOAD_DEBOUNCE_MS)
+    this.sourceReloadTimers.set(workspaceRootPath, timer)
   }
 
   /**
@@ -2521,7 +3942,7 @@ export class SessionManager {
    * SECURITY NOTE: These env vars are propagated to the SDK subprocess via options.ts.
    * Bun's automatic .env loading is disabled in the subprocess (--env-file=/dev/null)
    * to prevent a user's project .env from injecting ANTHROPIC_API_KEY and overriding
-   * OAuth auth — Claude Code prioritizes API key over OAuth token when both are set.
+   * OAuth auth Ã¢â‚¬â€ Claude Code prioritizes API key over OAuth token when both are set.
    * See: https://github.com/lukilabs/craft-agents-oss/issues/39
    */
   /**
@@ -2640,7 +4061,7 @@ export class SessionManager {
       this.copilotCliPath = copilotPath
       sessionLog.info('Resolved Copilot CLI path:', copilotPath)
     } else {
-      sessionLog.warn('Copilot CLI not found — Copilot sessions will try SDK default resolution')
+      sessionLog.warn('Copilot CLI not found Ã¢â‚¬â€ Copilot sessions will try SDK default resolution')
     }
 
     // Set path to fetch interceptor for SDK subprocess
@@ -2665,7 +4086,7 @@ export class SessionManager {
     // Use bundled Bun binary (packaged app) or system bun.exe (dev mode)
     // Resolve Copilot network interceptor (loaded via NODE_OPTIONS="--require ..." into Copilot CLI subprocess)
     // Must be bundled CJS since it runs under Electron's Node.js, not Bun
-    // Built by `bun run build:copilot-interceptor` → apps/electron/dist/copilot-interceptor.cjs
+    // Built by `bun run build:copilot-interceptor` Ã¢â€ â€™ apps/electron/dist/copilot-interceptor.cjs
     // In dev: basePath is monorepo root, so add apps/electron/ prefix
     // In packaged: basePath is the app dir, dist/ is directly inside
     let copilotInterceptorPath = join(basePath, 'dist', 'copilot-interceptor.cjs')
@@ -2676,7 +4097,7 @@ export class SessionManager {
       this.copilotInterceptorPath = copilotInterceptorPath
       sessionLog.info('Resolved Copilot interceptor path:', copilotInterceptorPath)
     } else {
-      sessionLog.warn('Copilot network interceptor not found — run `bun run build:copilot-interceptor` in apps/electron/')
+      sessionLog.warn('Copilot network interceptor not found Ã¢â‚¬â€ run `bun run build:copilot-interceptor` in apps/electron/')
     }
 
     // In packaged app: use bundled Bun binary
@@ -2772,8 +4193,11 @@ export class SessionManager {
             isTeamLead: meta.isTeamLead,
             parentSessionId: meta.parentSessionId,
             teammateName: meta.teammateName,
+            teammateRole: meta.teammateRole as TeamRole | undefined,
+            qgCycleCount: typeof meta.qgCycleCount === 'number' ? meta.qgCycleCount : undefined,
             teammateSessionIds: meta.teammateSessionIds,
             teamColor: meta.teamColor,
+            teamStatus: meta.teamStatus as ManagedSession['teamStatus'],
             sddEnabled: meta.sddEnabled,
             activeSpecId: meta.activeSpecId,
             sddComplianceReports: meta.sddComplianceReports,
@@ -2815,6 +4239,12 @@ export class SessionManager {
       // metadata persistence (e.g., missing teammateSessionIds on lead sessions).
       this.repairTeamSessionLinks()
 
+      // Implements REQ-002: Restore team state stores for existing team leads.
+      // initStateStore() is normally only called in createTeam(), so after a
+      // reload these stores are missing — making team data (tasks, messages,
+      // activity) invisible even though the JSONL files exist on disk.
+      this.restoreTeamStateStores()
+
       sessionLog.info(`Loaded ${totalSessions} sessions from disk (metadata only)`)
     } catch (error) {
       sessionLog.error('Failed to load sessions from disk:', error)
@@ -2824,11 +4254,71 @@ export class SessionManager {
   /**
    * Best-effort repair for team metadata consistency after loading sessions.
    * This keeps team grouping stable in the sidebar after crashes/restarts.
+   *
+   * Runs three passes:
+   *   Pass 0 — Recover orphaned teammates whose parentSessionId was stripped
+   *            by matching teamColor + same-day creation (YYMMDD prefix).
+   *   Pass 1 — Fill missing parentSessionId from teamId when lead is known.
+   *   Pass 2 — Rebuild lead → teammate mapping from parentSessionId refs and
+   *            propagate lead metadata down to teammates.
    */
   private repairTeamSessionLinks(): void {
     let repairedLeads = 0
     let repairedTeammates = 0
 
+    // ── Pass 0: Heuristic recovery for historically stripped teammates ──
+    // Older code stripped parentSessionId/teamId/teammateName on completion.
+    // The only surviving signal is teamColor. Match orphans to leads by
+    // teamColor + same-day session-ID prefix (YYMMDD).
+    const leadsByColorAndDay = new Map<string, ManagedSession[]>()
+    for (const session of this.sessions.values()) {
+      if (session.isTeamLead && session.teamId && session.teamColor) {
+        const datePrefix = session.id.slice(0, 6) // YYMMDD
+        const key = `${session.teamColor}:${datePrefix}`
+        const arr = leadsByColorAndDay.get(key) ?? []
+        arr.push(session)
+        leadsByColorAndDay.set(key, arr)
+      }
+    }
+
+    for (const session of this.sessions.values()) {
+      // Orphan: has teamColor but lost parentSessionId and teamId, not a lead
+      if (session.teamColor && !session.parentSessionId && !session.teamId && !session.isTeamLead) {
+        const datePrefix = session.id.slice(0, 6)
+        const key = `${session.teamColor}:${datePrefix}`
+        const candidates = leadsByColorAndDay.get(key)
+        if (candidates && candidates.length > 0) {
+          // Implements REQ-A2: When multiple leads share the same color+day,
+          // pick the one whose creation time is closest to (but before) the orphan's.
+          // This handles the case where a user creates multiple teams on the same day.
+          let bestLead: ManagedSession | null = null
+          if (candidates.length === 1) {
+            bestLead = candidates[0]!
+          } else {
+            const orphanCreatedAt = session.createdAt ?? session.lastMessageAt ?? 0
+            // Sort leads by creation time descending, pick the most recent one
+            // that was created before or at the same time as the orphan.
+            const sorted = [...candidates].sort((a, b) =>
+              (b.createdAt ?? b.lastMessageAt ?? 0) - (a.createdAt ?? a.lastMessageAt ?? 0)
+            )
+            bestLead = sorted.find(l =>
+              (l.createdAt ?? l.lastMessageAt ?? 0) <= orphanCreatedAt
+            ) ?? sorted[sorted.length - 1]!  // Fallback: oldest lead
+          }
+
+          if (bestLead) {
+            session.parentSessionId = bestLead.id
+            session.teamId = bestLead.teamId
+            session.teamColor = bestLead.teamColor
+            repairedTeammates++
+            this.persistSession(session)
+            sessionLog.info(`[AgentTeams] Recovered orphaned teammate ${session.id} → lead ${bestLead.id} (teamColor match, ${candidates.length} candidates)`)
+          }
+        }
+      }
+    }
+
+    // ── Pass 1: Fill missing parentSessionId from teamId ──
     const leadsByTeamId = new Map<string, ManagedSession>()
     for (const session of this.sessions.values()) {
       if (session.isTeamLead && session.teamId) {
@@ -2836,7 +4326,6 @@ export class SessionManager {
       }
     }
 
-    // Fill missing parent/team metadata on teammate sessions when we can infer it
     for (const teammate of this.sessions.values()) {
       if (teammate.isTeamLead) continue
 
@@ -2851,7 +4340,7 @@ export class SessionManager {
       }
     }
 
-    // Rebuild lead -> teammate mapping from child parentSessionId references
+    // ── Pass 2: Rebuild lead → teammate mapping ──
     const teammateIdsByLead = new Map<string, string[]>()
     for (const teammate of this.sessions.values()) {
       if (!teammate.parentSessionId) continue
@@ -2902,9 +4391,82 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Restore team state stores for existing team leads after app reload.
+   * Implements REQ-002: persist team state across close/reopen.
+   *
+   * Without this, initStateStore() is only called during createTeam(),
+   * so after a reload the team manager has empty Maps and all team data
+   * (tasks, messages, activity) is invisible even though team-state.jsonl
+   * files exist on disk.
+   */
+  private restoreTeamStateStores(): void {
+    // Implements C5: Clear stale in-memory Maps before restoring fresh state.
+    // Without this, long-lived Electron processes accumulate orphaned team data.
+    teamManager.evictAllTeamData()
+
+    let restored = 0
+    const { join: joinPath } = require('path')
+
+    for (const session of this.sessions.values()) {
+      if (!session.isTeamLead || !session.teamId) continue
+
+      const workspaceRootPath = session.workspace.rootPath
+      const sessionDir = joinPath(workspaceRootPath, 'sessions', session.id)
+
+      try {
+        // Initialize the state store so loadPersistedState() will work
+        teamManager.initStateStore(session.teamId, sessionDir)
+
+        // Load the persisted state into the team manager's in-memory Maps
+        const state = teamManager.loadPersistedState(session.teamId)
+        if (state) {
+          // Hydrate in-memory Maps from persisted JSONL data
+          if (state.tasks.length > 0) {
+            for (const task of state.tasks) {
+              teamManager.hydrateTask(session.teamId, task)
+            }
+          }
+          if (state.messages.length > 0) {
+            for (const msg of state.messages) {
+              teamManager.hydrateMessage(session.teamId, msg)
+            }
+          }
+          if (state.activity.length > 0) {
+            for (const event of state.activity) {
+              teamManager.hydrateActivity(session.teamId, event)
+            }
+          }
+          if (state.knowledge.length > 0) {
+            for (const entry of state.knowledge) {
+              teamManager.hydrateKnowledgeEntry(session.teamId, entry)
+            }
+          }
+          restored++
+          sessionLog.info(
+            `[AgentTeams] Restored state store for team ${session.teamId} ` +
+            `(lead: ${session.id}, ${state.tasks.length} tasks, ${state.messages.length} messages, ` +
+            `${state.activity.length} activity events, ${state.knowledge.length} knowledge entries)`,
+          )
+        }
+      } catch (err) {
+        sessionLog.warn(`[AgentTeams] Failed to restore state store for team ${session.teamId}:`, err)
+      }
+    }
+
+    if (restored > 0) {
+      sessionLog.info(`[AgentTeams] Restored ${restored} team state stores from disk`)
+    }
+  }
+
   // Persist a session to disk (async with debouncing)
   private persistSession(managed: ManagedSession): void {
     try {
+      // Cap message history for teammate sessions to prevent unbounded memory growth
+      if (managed.parentSessionId && managed.messages.length > MAX_TEAMMATE_MESSAGES) {
+        managed.messages = managed.messages.slice(-MAX_TEAMMATE_MESSAGES)
+      }
+
       // Filter out transient status messages (progress indicators like "Compacting...")
       // Error messages are now persisted with rich fields for diagnostics
       const persistableMessages = managed.messages.filter(m =>
@@ -2940,8 +4502,11 @@ export class SessionManager {
         isTeamLead: managed.isTeamLead,
         parentSessionId: managed.parentSessionId,
         teammateName: managed.teammateName,
+        teammateRole: managed.teammateRole,
+        qgCycleCount: managed.qgCycleCount,
         teammateSessionIds: managed.teammateSessionIds,
         teamColor: managed.teamColor,
+        teamStatus: managed.teamStatus,
         sddEnabled: managed.sddEnabled,
         activeSpecId: managed.activeSpecId,
         sddComplianceReports: managed.sddComplianceReports,
@@ -3266,29 +4831,32 @@ export class SessionManager {
     }
 
     return sessions
-      .map(m => ({
-        // Persistent fields (auto-included via pickSessionFields)
-        ...pickSessionFields(m),
-        // Pre-computed fields from header
-        preview: m.preview,
-        lastMessageRole: m.lastMessageRole,
-        tokenUsage: m.tokenUsage,
-        messageCount: m.messageCount,
-        lastFinalMessageId: m.lastFinalMessageId,
-        hidden: m.hidden,
-        // Agent team fields
-        teamId: m.teamId,
-        isTeamLead: m.isTeamLead,
-        parentSessionId: m.parentSessionId,
-        teammateName: m.teammateName,
-        teammateSessionIds: m.teammateSessionIds,
-        teamColor: m.teamColor,
-        // Runtime-only fields
-        workspaceId: m.workspace.id,
-        workspaceName: m.workspace.name,
-        messages: [],  // Never send all messages - use getSession(id) for specific session
-        isProcessing: m.isProcessing,
-      }) as Session)
+      .map(m => {
+        return {
+          // Persistent fields (auto-included via pickSessionFields)
+          ...pickSessionFields(m),
+          // Pre-computed fields from header
+          preview: m.preview,
+          lastMessageRole: m.lastMessageRole,
+          tokenUsage: m.tokenUsage,
+          messageCount: m.messageCount,
+          lastFinalMessageId: m.lastFinalMessageId,
+          hidden: m.hidden,
+          // Agent team fields
+          teamId: m.teamId,
+          isTeamLead: m.isTeamLead,
+          parentSessionId: m.parentSessionId,
+          teammateName: m.teammateName,
+          teammateSessionIds: m.teammateSessionIds,
+          teamColor: m.teamColor,
+          teamStatus: m.teamStatus,
+          // Runtime-only fields
+          workspaceId: m.workspace.id,
+          workspaceName: m.workspace.name,
+          messages: [],  // Never send all messages - use getSession(id) for specific session
+          isProcessing: m.isProcessing,
+        } as Session
+      })
       .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))
   }
 
@@ -3518,6 +5086,42 @@ export class SessionManager {
     let refreshed = 0
     let skipped = 0
 
+    // Implements BUG-001 fix: When agent teams are toggled OFF, force-terminate all
+    // active teammate sessions instead of skipping them. Without this, running teammates
+    // survive the settings change and continue operating as zombies.
+    const isAgentTeamsDisable = reason.includes('agentTeamsEnabled=false')
+
+    if (isAgentTeamsDisable) {
+      const terminatedIds: string[] = []
+      for (const managed of this.sessions.values()) {
+        if (managed.workspace.id !== workspaceId) continue
+        if (managed.parentSessionId && managed.teammateName) {
+          // This is a teammate session — force-terminate it regardless of isProcessing
+          this.terminateTeammateSession(managed.id, 'agent-teams-disabled').catch(err => {
+            sessionLog.warn(`[AgentTeams] Failed to terminate teammate ${managed.id} during kill switch:`, err)
+          })
+          terminatedIds.push(managed.id)
+        } else if (managed.agent) {
+          // Lead or non-teammate session — clear team state immediately so the
+          // agent stops acting as a team lead.
+          if (managed.isTeamLead && managed.agent instanceof CraftAgent) {
+            managed.agent.clearTeamState()
+          }
+          // Only destroy the agent if it's NOT actively processing a response.
+          // If it IS processing, let the current turn finish — the agent will
+          // pick up the new workspace config on the next turn.
+          if (!managed.isProcessing) {
+            this.destroyManagedAgent(managed, `refreshWorkspaceAgentRuntime:${reason}`)
+            refreshed++
+          } else {
+            skipped++
+          }
+        }
+      }
+      sessionLog.info(`[AgentTeams] Kill switch activated for workspace ${workspaceId}: terminated=${terminatedIds.length} refreshed=${refreshed} skipped_processing=${skipped}`)
+      return
+    }
+
     for (const managed of this.sessions.values()) {
       if (managed.workspace.id !== workspaceId) continue
       if (managed.isProcessing) {
@@ -3561,6 +5165,7 @@ export class SessionManager {
       teammateName: m.teammateName,
       teammateSessionIds: m.teammateSessionIds,
       teamColor: m.teamColor,
+      teamStatus: m.teamStatus,
       // Runtime-only fields
       workspaceId: m.workspace.id,
       workspaceName: m.workspace.name,
@@ -3733,7 +5338,7 @@ export class SessionManager {
     const defaultModel = wsConfig?.defaults?.model
     // Get default SDD mode from workspace config
     const defaultSddEnabled = options?.sddEnabled ?? wsConfig?.sdd?.sddEnabled ?? false
-    const defaultSpecId = options?.activeSpecId
+    const defaultSpecId = options?.activeSpecId ?? wsConfig?.sdd?.activeSpecId
     // Get default enabled sources from workspace config
     const defaultEnabledSourceSlugs = options?.enabledSourceSlugs ?? wsConfig?.defaults?.enabledSourceSlugs
 
@@ -3764,6 +5369,7 @@ export class SessionManager {
       isTeamLead: options?.isTeamLead,
       parentSessionId: options?.parentSessionId,
       teammateName: options?.teammateName,
+      teammateRole: options?.teammateRole,
       teamColor: options?.teamColor,
     })
 
@@ -3799,7 +5405,7 @@ export class SessionManager {
 
     // Log mini agent session creation
     if (options?.systemPromptPreset === 'mini' || options?.model) {
-      sessionLog.info(`🤖 Creating mini agent session: model=${resolvedModel}, systemPromptPreset=${options?.systemPromptPreset}`)
+      sessionLog.info(`Creating mini agent session: model=${resolvedModel}, systemPromptPreset=${options?.systemPromptPreset}`)
     }
 
     const managed: ManagedSession = {
@@ -3823,7 +5429,7 @@ export class SessionManager {
       // LLM connection - initially undefined, will be set when model is selected
       // This allows the connection to be locked after first message
       llmConnection: options?.llmConnection,
-      thinkingLevel: defaultThinkingLevel,
+      thinkingLevel: options?.thinkingLevel ?? defaultThinkingLevel,
       // System prompt preset for mini agents
       systemPromptPreset: options?.systemPromptPreset,
       messageQueue: [],
@@ -3836,6 +5442,7 @@ export class SessionManager {
       isTeamLead: options?.isTeamLead,
       parentSessionId: options?.parentSessionId,
       teammateName: options?.teammateName,
+      teammateRole: options?.teammateRole as TeamRole | undefined,
       teamColor: options?.teamColor,
       sddEnabled: defaultSddEnabled,
       activeSpecId: defaultSpecId,
@@ -3883,7 +5490,7 @@ export class SessionManager {
       enabledSourceSlugs: defaultEnabledSourceSlugs,
       model: managed.model,
       llmProvider: managed.llmProvider,
-      thinkingLevel: defaultThinkingLevel,
+      thinkingLevel: options?.thinkingLevel ?? defaultThinkingLevel,
       sessionFolderPath: getSessionStoragePath(workspaceRootPath, storedSession.id),
       hidden: options?.hidden,
       // Agent team fields
@@ -3903,8 +5510,11 @@ export class SessionManager {
    * Returns the session with isTeamLead=true and matching teamId, or null if not found.
    */
   findLeadSessionForTeam(teamId: string): { id: string; workspaceId: string } | null {
+    const resolvedTargetTeamId = teamManager.resolveTeamId(teamId)
     for (const [, session] of this.sessions) {
-      if (session.isTeamLead && session.teamId === teamId) {
+      if (!session.isTeamLead || !session.teamId) continue
+      const resolvedSessionTeamId = teamManager.resolveTeamId(session.teamId)
+      if (resolvedSessionTeamId === resolvedTargetTeamId) {
         return { id: session.id, workspaceId: session.workspace.id }
       }
     }
@@ -3931,6 +5541,76 @@ export class SessionManager {
       throw new Error(`Parent session ${params.parentSessionId} not found`)
     }
 
+    // KILL SWITCH: Refuse to spawn teammates if agent teams are disabled
+    if (!isAgentTeamsEnabled(parent.workspace.rootPath)) {
+      throw new Error('Agent teams are disabled for this workspace. Enable agent teams in workspace settings to spawn teammates.')
+    }
+
+    // CONCURRENCY LIMIT: Prevent resource explosion from too many teammates
+    const currentTeammateCount = parent.teammateSessionIds?.length ?? 0
+    if (currentTeammateCount >= MAX_TEAMMATES_PER_TEAM) {
+      throw new Error(`Team has reached the maximum of ${MAX_TEAMMATES_PER_TEAM} teammates. Complete or terminate existing teammates before spawning new ones.`)
+    }
+
+    // Implements REQ-ORCH-004: Prevent duplicate teammate spawns
+    // If a teammate with the same explicit name already exists and is still active, reject the spawn.
+    if (params.teammateName && parent.teammateSessionIds?.length) {
+      const normalizedName = params.teammateName.trim().toLowerCase()
+      for (const existingId of parent.teammateSessionIds) {
+        const existing = this.sessions.get(existingId)
+        if (
+          existing &&
+          existing.teammateName?.trim().toLowerCase() === normalizedName &&
+          (existing.agent !== null || existing.isProcessing)
+        ) {
+          sessionLog.warn(
+            `[AgentTeams] Duplicate spawn blocked: teammate "${params.teammateName}" already exists as active session ${existingId}`
+          )
+          throw new Error(
+            `A teammate named "${params.teammateName}" is already active in this team (session ${existingId}). ` +
+            `Wait for it to complete or terminate it before spawning a replacement.`
+          )
+        }
+      }
+    }
+
+    const workspaceConfig = loadWorkspaceConfig(parent.workspace.rootPath)
+
+    // Implements REQ-003/REQ-004: canonicalize team identity for Task-driven spawns
+    // and bootstrap TeamManager state when no explicit TeamCreate was called.
+    const requestedTeamRef = params.teamId.trim()
+    const parentTeamRef = parent.teamId?.trim()
+    const resolvedParentTeamId = parentTeamRef ? teamManager.resolveTeamId(parentTeamRef) : undefined
+    const resolvedRequestedTeamId = requestedTeamRef ? teamManager.resolveTeamId(requestedTeamRef) : undefined
+
+    let resolvedTeamId = resolvedParentTeamId ?? resolvedRequestedTeamId ?? requestedTeamRef
+    let teamRecord = teamManager.getTeam(resolvedTeamId)
+
+    if (!teamRecord) {
+      const resolvedConfig = resolveTeamModelConfig(workspaceConfig)
+      teamRecord = teamManager.createTeam({
+        name: requestedTeamRef || parent.name || `team-${parent.id.slice(-6)}`,
+        leadSessionId: parent.id,
+        modelConfig: resolvedConfig.modelConfig,
+        modelPreset: resolvedConfig.presetId,
+        workspaceRootPath: parent.workspace.rootPath,
+      })
+      resolvedTeamId = teamRecord.id
+      sessionLog.info(
+        `[AgentTeams] Bootstrapped missing team state for lead ${parent.id}: ` +
+        `requested="${requestedTeamRef}" canonical="${resolvedTeamId}"`,
+      )
+    }
+
+    // Ensure persistent state storage is always wired for this team.
+    teamManager.initStateStore(resolvedTeamId, join(parent.workspace.rootPath, 'sessions', parent.id))
+    this.ensureYoloWiredForTeam(resolvedTeamId, parent.id)
+
+    // Keep lead metadata canonical so dashboard + persistence read/write the same bucket.
+    parent.teamId = resolvedTeamId
+    parent.isTeamLead = true
+    const teamIdForCodename = requestedTeamRef || resolvedTeamId
+
     // Pick team color: count existing teams to rotate through the palette
     let teamColor = parent.teamColor
     if (!teamColor) {
@@ -3941,11 +5621,9 @@ export class SessionManager {
       teamColor = TEAM_COLORS[activeTeamIds.size % TEAM_COLORS.length]
       // Set the color on the parent/lead session too
       parent.teamColor = teamColor
-      parent.teamId = params.teamId
-      parent.isTeamLead = true
 
       // Upgrade lead session model to the preset's lead model
-      const wsConfigForLead = loadWorkspaceConfig(parent.workspace.rootPath)
+      const wsConfigForLead = workspaceConfig
       const leadAssignment = resolveTeamModelForRole(wsConfigForLead, 'lead')
       const leadModel = leadAssignment.model
       if (leadModel && leadModel !== 'unknown' && leadModel !== parent.model) {
@@ -3972,10 +5650,66 @@ export class SessionManager {
           this.sendEvent({ type: 'session_model_changed', sessionId: parent.id, model: parent.model }, parent.workspace.id)
         }
       }
+
+    }
+
+    // Implements AUDIT-FIX-1: Wire ReviewLoopOrchestrator so quality gates actually run.
+    // This must run even when team color already exists (e.g., restored teams after restart).
+    const qgConfig = mergeQualityGateConfig(workspaceConfig?.agentTeams?.qualityGates)
+    if (qgConfig.enabled && !teamManager.getReviewLoop()) {
+      const workingDir = parent.workingDirectory || parent.workspace.rootPath
+      const reviewCallbacks: ReviewLoopCallbacks = {
+        collectDiff: async (_teamId: string, _taskId: string, wd: string) => {
+          const reviewDiff = await DiffCollector.collectWorkingDiff(wd)
+          return reviewDiff.unifiedDiff
+        },
+        runQualityGates: async (diff, taskDescription, wd, config, cycleCount, spec) => {
+          const runner = this.getQualityGateRunner()
+          const taskContext: TaskContext = {
+            taskDescription,
+            workingDirectory: wd,
+            cycleCount,
+            spec,
+          }
+          return runner.runPipeline(diff, taskContext, config)
+        },
+        sendFeedback: async (_teamId: string, teammateId: string, feedback: string) => {
+          await this.sendMessage(teammateId, feedback)
+        },
+        updateTaskStatus: (teamId: string, taskId: string, status: string, assignee?: string, options?: { bypassReviewLoop?: boolean }) => {
+          teamManager.updateTaskStatus(teamId, taskId, status as import('@craft-agent/core/types').TeamTaskStatus, assignee, options)
+        },
+        escalate: async (result, diff, taskDescription, config) => {
+          const runner = this.getQualityGateRunner()
+          const taskContext: TaskContext = { taskDescription, workingDirectory: workingDir }
+          return runner.escalate(result, diff, taskContext, config)
+        },
+      }
+      const reviewLoopConfig: ReviewLoopConfig = {
+        qualityGates: qgConfig,
+        workingDirectory: workingDir,
+        autoReview: true,
+      }
+      const reviewLoop = new ReviewLoopOrchestrator(reviewCallbacks, reviewLoopConfig)
+      teamManager.setReviewLoop(reviewLoop)
+
+      // Forward review events as team activity
+      reviewLoop.on('review:passed', (data: { teamId: string; taskId: string }) => {
+        teamManager.logActivity(data.teamId, 'quality-gate-passed', `Task ${data.taskId} passed quality gates`, undefined, undefined)
+      })
+      reviewLoop.on('review:failed', (data: { teamId: string; taskId: string; report: string }) => {
+        teamManager.logActivity(data.teamId, 'quality-gate-failed', `Task ${data.taskId} failed quality gates`, undefined, undefined)
+      })
+      reviewLoop.on('review:escalated', (data: { teamId: string; taskId: string }) => {
+        teamManager.logActivity(data.teamId, 'escalation', `Task ${data.taskId} escalated after max review cycles`, undefined, undefined)
+      })
+
+      sessionLog.info(`[AgentTeams] ReviewLoopOrchestrator wired for team "${resolvedTeamId}" (QG enabled, threshold: ${qgConfig.passThreshold})`)
+    } else if (!qgConfig.enabled) {
+      sessionLog.info('[AgentTeams] Quality gates disabled for team — ReviewLoop not attached')
     }
 
     // Create the teammate session
-    const workspaceConfig = loadWorkspaceConfig(parent.workspace.rootPath)
     // Implements REQ-003: ensure an active spec when SDD is enabled
     if (parent.sddEnabled && !parent.activeSpecId) {
       await this.ensureSessionActiveSpec(parent.id)
@@ -3983,16 +5717,42 @@ export class SessionManager {
     if (parent.sddEnabled && !parent.activeSpecId) {
       throw new Error('SDD is enabled for this session. Set an active spec before spawning teammates.')
     }
-    const teammateRole = normalizeTeamRole(params.role)
+    // Implements REQ-004/REQ-005/REQ-006: classify + route teammate work and enforce UX/Design policy
+    const routing = decideTeammateRouting({
+      prompt: params.prompt,
+      requestedRole: params.role,
+      requestedModel: params.model,
+    })
+
+    const teammateRole = normalizeTeamRole(routing.role, params.teammateName)
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
-    const teammateCodename = buildTeammateCodename(teammateRole, teammateOrdinal - 1)
+    const teammateCodename = buildTeammateCodename(teammateRole, teamIdForCodename, teammateOrdinal - 1)
     // Implements REQ-002: Use witty codename as primary name, honor explicit custom names
     const customName = params.teammateName?.trim()
     const teammateDisplayName = customName || teammateCodename
     const isAutoGenerated = !customName
 
-    if (params.role && params.role !== teammateRole) {
+    if (params.role && params.role !== teammateRole && !routing.roleEnforced) {
       sessionLog.warn(`[AgentTeams] Unknown teammate role "${params.role}" requested; defaulting to "${teammateRole}"`)
+    }
+
+    // Implements REQ-005: surface UX/Design enforcement explicitly in logs
+    if (routing.roleEnforced) {
+      sessionLog.info(`[AgentTeams] Routing policy enforced role: requested="${params.role}" → routed="${teammateRole}" (${routing.reason})`)
+    }
+    // Warn when no role was provided - indicates the Lead may be skipping the Head layer
+    if (!params.role && !routing.roleEnforced) {
+      sessionLog.warn(
+        `[AgentTeams] Teammate "${params.teammateName || '(auto)'}" spawned without explicit role - defaulted to "worker". ` +
+        `The Lead should specify role="head" for coordinators or role="escalation" for escalation agents.`
+      )
+    }
+    // Warn when a worker is explicitly spawned as a teammate - workers should be subagents inside Heads
+    if (teammateRole === TEAM_ROLE_WORKER && params.role === TEAM_ROLE_WORKER) {
+      sessionLog.info(
+        `[AgentTeams] Worker "${params.teammateName || '(auto)'}" spawned directly as teammate. ` +
+        `Workers should normally be subagents inside a Head's context, not separate teammates.`
+      )
     }
     if (isAutoGenerated) {
       sessionLog.info(`[AgentTeams] No teammate name provided; generated codename: ${teammateCodename}`)
@@ -4002,7 +5762,14 @@ export class SessionManager {
     const normalizedRequestedModel = requestedModel && requestedModel !== 'auto'
       ? requestedModel
       : undefined
-    const resolvedAssignment = resolveTeamModelForRole(workspaceConfig, teammateRole, undefined, parent.model)
+    const qgEnabled = mergeQualityGateConfig(workspaceConfig?.agentTeams?.qualityGates).enabled
+    const resolvedAssignment = resolveTeamModelForRole(
+      workspaceConfig,
+      teammateRole,
+      undefined,
+      parent.model,
+      { qgEnabled },
+    )
     const configuredModel = resolvedAssignment.model && resolvedAssignment.model !== 'unknown'
       ? resolvedAssignment.model
       : undefined
@@ -4013,8 +5780,9 @@ export class SessionManager {
       )
     }
 
-    // Implements REQ-001: honor workspace role model defaults for teammates
-    const teammateModel = configuredModel ?? normalizedRequestedModel ?? parent.model ?? workspaceConfig?.defaults?.model ?? DEFAULT_MODEL
+    // Implements REQ-001/REQ-005: honor workspace role model defaults, but allow hard policy overrides.
+    // UX/Design is always Opus (hard-enforced) regardless of preset/override.
+    const teammateModel = routing.modelOverride ?? configuredModel ?? normalizedRequestedModel ?? parent.model ?? workspaceConfig?.defaults?.model ?? DEFAULT_MODEL
 
     if (!teammateModel) {
       throw new Error(
@@ -4022,7 +5790,17 @@ export class SessionManager {
       )
     }
 
-    sessionLog.info(`[AgentTeams] Resolved teammate spawn: name=${teammateDisplayName}${isAutoGenerated ? ' (auto-generated)' : ''} role=${teammateRole} model=${teammateModel}`)
+    if (routing.modelOverride && configuredModel && routing.modelOverride !== configuredModel) {
+      sessionLog.info(
+        `[AgentTeams] Routing policy enforced model override for domain=${routing.domain}: ` +
+        `"${configuredModel}" → "${routing.modelOverride}" (${routing.reason})`
+      )
+    }
+
+    sessionLog.info(
+      `[AgentTeams] Resolved teammate spawn: name=${teammateDisplayName}${isAutoGenerated ? ' (auto-generated)' : ''} ` +
+      `role=${teammateRole} model=${teammateModel} (${routing.reason})`
+    )
 
     // Implements REQ-004: choose a provider/connection compatible with the resolved model
     const teammateConnectionSlug = resolveConnectionForModel({
@@ -4050,9 +5828,17 @@ export class SessionManager {
 
     sessionLog.info(`[AgentTeams] Using connection "${teammateConnection}" (${resolvedConnection.providerType}) for teammate "${teammateDisplayName}"`)
 
+    // Implements REQ-P3: Resolve thinking level based on strategy + role
+    // Smart: Lead/Reviewer/Escalation get thinking. Codex: only Reviewer. Budget: all off.
+    const presetId = (workspaceConfig as any)?.settings?.agentTeamsModelPreset as string | undefined
+    const customThinkingOverride = presetId === 'custom'
+      ? (workspaceConfig as any)?.settings?.[`agentTeams${teammateRole.charAt(0).toUpperCase() + teammateRole.slice(1)}Thinking`] as boolean | undefined
+      : undefined
+    const shouldEnableThinking = resolveThinkingForRole(presetId, teammateRole, customThinkingOverride)
+    const teammateThinkingLevel: ThinkingLevel = shouldEnableThinking ? 'think' : DEFAULT_THINKING_LEVEL
 
     const teammateSession = await this.createSession(params.workspaceId, {
-      teamId: params.teamId,
+      teamId: resolvedTeamId,
       parentSessionId: params.parentSessionId,
       teammateName: teammateDisplayName,
       teammateRole,
@@ -4063,6 +5849,7 @@ export class SessionManager {
       llmConnection: teammateConnection,
       sddEnabled: parent.sddEnabled,
       activeSpecId: parent.activeSpecId,
+      thinkingLevel: teammateThinkingLevel,
     })
     await this.renameSession(teammateSession.id, teammateDisplayName)
 
@@ -4081,16 +5868,15 @@ export class SessionManager {
       sessionId: params.parentSessionId,
       teammateSessionId: teammateSession.id,
       teammateName: teammateDisplayName,
-      teamId: params.teamId,
+      teamId: resolvedTeamId,
       teamColor,
     }, parent.workspace.id)
 
     // Implements REQ-001: emit team activity for spawn tracing
-    const resolvedTeamId = teamManager.resolveTeamId(params.teamId)
     teamManager.logActivity(
       resolvedTeamId,
       'teammate-spawned',
-      `${teammateDisplayName} spawned`,
+      `${teammateDisplayName} spawned (${routing.reason})`,
       teammateSession.id,
       teammateDisplayName
     )
@@ -4101,6 +5887,22 @@ export class SessionManager {
       type: 'task_update',
       taskId: params.prompt?.slice(0, 80) ?? 'unknown',
     })
+    // REQ-HB-001: Register teammate with heartbeat aggregator for activity tracking
+    this.heartbeatAggregator.registerTeammate(
+      resolvedTeamId,
+      teammateSession.id,
+      teammateDisplayName,
+      teammateModel,
+      resolvedConnection.providerType,
+    )
+
+    // Implements REQ-BUDGET-001: Create throttle with hard per-tool budgets (primary defense)
+    // + AIMD congestion control (secondary defense). Workspace-level overrides honored via REQ-BUDGET-007.
+    const managedTeammate = this.sessions.get(teammateSession.id)
+    if (managedTeammate) {
+      const throttleOverrides = this.healthMonitor.getThrottleConfig()
+      managedTeammate.toolCallThrottle = new ToolCallThrottle(throttleOverrides)
+    }
 
     // Build compact spec context + task metadata for teammates when SDD is enabled
     let compactSpecContext: string | null = null
@@ -4116,15 +5918,21 @@ export class SessionManager {
     }
 
     if (parent.sddEnabled && parsedSpec) {
-      const requirementIds = parsedSpec.requirements.map(req => req.id)
+      const specRequirementIds = new Set(parsedSpec.requirements.map(req => req.id.toUpperCase()))
+      const requirementIds = [...new Set(
+        Array.from(params.prompt.matchAll(/\bREQ-[A-Z0-9_-]+\b/gi))
+          .map(match => match[0].toUpperCase())
+          .filter(reqId => specRequirementIds.has(reqId))
+      )]
       const task = teamManager.createTask(
         resolvedTeamId,
         `${teammateDisplayName} task`,
         params.prompt,
         parent.id,
         {
-          requirementIds,
+          requirementIds: requirementIds.length > 0 ? requirementIds : undefined,
           driOwner: parsedSpec.ownerDRI,
+          driReviewer: parsedSpec.ownerDRI,
           assignee: teammateSession.id,
         }
       )
@@ -4132,7 +5940,76 @@ export class SessionManager {
       teamManager.updateTaskStatus(resolvedTeamId, task.id, 'in_progress', teammateSession.id)
     }
 
-    const teammatePrompt = buildTeammatePromptWithCompactSpec(params.prompt, compactSpecContext)
+    // Implements REQ-006: auto-attach skill packs via explicit skill mentions.
+    // Skills are resolved from workspace + project `.agents/skills/` (see BaseAgent.extractSkillContent).
+    const skillMentions = routing.skillSlugs.length > 0
+      ? routing.skillSlugs.map(slug => `[skill:${slug}]`).join(' ')
+      : ''
+    const promptWithSkills = skillMentions
+      ? `${skillMentions}\n\n${params.prompt}`
+      : params.prompt
+
+    // Implements REQ-NEXT-001 + REQ-008: Inject compact shared team memory with kill-switch support.
+    const memoryInjectionEnabled = workspaceConfig?.agentTeams?.memory?.injectionEnabled !== false
+    const sharedKnowledgeContext = memoryInjectionEnabled
+      ? teamManager.buildKnowledgeContext(resolvedTeamId, params.prompt, {
+        maxChars: 1_800, // ~<=500-token budget target
+        maxEntries: 8,
+        maxTokens: 500,
+      })
+      : ''
+    const injectedKnowledgeEntries = sharedKnowledgeContext
+      ? sharedKnowledgeContext.split('\n').filter((line) => line.trim().startsWith('- [')).length
+      : 0
+    const telemetryManagedSession = managedTeammate ?? this.sessions.get(teammateSession.id)
+    if (telemetryManagedSession) {
+      this.logKnowledgeTelemetry(resolvedTeamId, telemetryManagedSession, {
+        operation: 'query',
+        scope: 'prompt-context',
+        hit: injectedKnowledgeEntries > 0,
+        resultCount: injectedKnowledgeEntries,
+        suppressed: !memoryInjectionEnabled,
+      })
+      this.logKnowledgeTelemetry(resolvedTeamId, telemetryManagedSession, {
+        operation: 'inject',
+        scope: 'prompt-context',
+        hit: injectedKnowledgeEntries > 0,
+        resultCount: injectedKnowledgeEntries,
+        suppressed: !memoryInjectionEnabled,
+      })
+    }
+    const promptWithKnowledge = sharedKnowledgeContext
+      ? `${sharedKnowledgeContext}\n\n${promptWithSkills}`
+      : promptWithSkills
+
+    // Implements REQ-BUDGET-003: Pass resolved budgets so agents see their limits in the prompt
+    const resolvedBudgets = managedTeammate?.toolCallThrottle?.getResolvedBudgets()
+    const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithKnowledge, compactSpecContext, resolvedBudgets)
+
+    // Implements REQ-A1: Track pending teammate spawns on the lead session
+    // so shouldDelayCompletionForAgentTeam() can block premature 'complete'.
+    const leadSession = this.sessions.get(params.parentSessionId)
+    if (leadSession) {
+      leadSession.pendingTeammateSpawns = (leadSession.pendingTeammateSpawns ?? 0) + 1
+      // Implements REQ-A1: Safety timeout so a stuck spawn cannot block lead completion forever.
+      if (!leadSession.pendingSpawnsTimeout) {
+        leadSession.pendingSpawnsTimeout = setTimeout(() => {
+          const trackedLead = this.sessions.get(params.parentSessionId)
+          if (!trackedLead) return
+          if ((trackedLead.pendingTeammateSpawns ?? 0) <= 0) {
+            trackedLead.pendingSpawnsTimeout = undefined
+            return
+          }
+          sessionLog.warn(
+            `[AgentTeams] Pending teammate spawn timeout hit for lead ${trackedLead.id}; ` +
+            `forcing pending count from ${trackedLead.pendingTeammateSpawns} to 0`
+          )
+          trackedLead.pendingTeammateSpawns = 0
+          trackedLead.pendingSpawnsTimeout = undefined
+          this.checkLeadTeamCompletion(trackedLead.id)
+        }, 5 * 60 * 1000)
+      }
+    }
 
     // Kick off the teammate by sending the prompt
     // Use setTimeout to avoid blocking the caller, but track timer so cleanup can cancel it.
@@ -4142,6 +6019,15 @@ export class SessionManager {
         await this.sendMessage(teammateSession.id, teammatePrompt)
       } catch (err) {
         sessionLog.error(`Failed to start teammate ${teammateDisplayName}:`, err)
+      } finally {
+        // Implements REQ-A1: Decrement pending count and check if lead can complete
+        if (leadSession) {
+          leadSession.pendingTeammateSpawns = Math.max(0, (leadSession.pendingTeammateSpawns ?? 1) - 1)
+          // If lead was waiting for spawns, re-check completion now
+          if (leadSession.pendingTeammateSpawns === 0 && !leadSession.isProcessing) {
+            this.checkLeadTeamCompletion(params.parentSessionId)
+          }
+        }
       }
     }, 100)
     this.teammateKickoffTimers.set(teammateSession.id, kickoffTimer)
@@ -4150,7 +6036,7 @@ export class SessionManager {
   }
 
   /**
-   * Clean up an agent team — interrupt all running teammates and clear team state.
+   * Clean up an agent team Ã¢â‚¬â€ interrupt all running teammates and clear team state.
    */
   async cleanupTeam(leadSessionId: string): Promise<void> {
     const lead = this.sessions.get(leadSessionId)
@@ -4170,12 +6056,16 @@ export class SessionManager {
       await teamManager.cleanupTeam(resolvedTeamId)
     }
 
-    // Clear team state on lead
-    lead.teamId = undefined
-    lead.isTeamLead = undefined
-    lead.teammateSessionIds = undefined
-    lead.teamColor = undefined
-    this.persistSession(lead)
+    // Implements REQ-001: Preserve team metadata on lead for sidebar grouping
+    // Runtime agents are terminated above, but team identity is kept for display
+
+    // Implements REQ-UX-003: Set team status to completed on lead session
+    lead.teamStatus = 'completed'
+    if (lead.workspace?.rootPath) {
+      updateSessionMetadata(lead.workspace.rootPath, leadSessionId, {
+        teamStatus: 'completed',
+      })
+    }
   }
 
   /**
@@ -4209,7 +6099,7 @@ export class SessionManager {
       ?? globalDefaults.workspaceDefaults.permissionMode
     const defaultThinkingLevel = wsConfig?.defaults?.thinkingLevel ?? globalDefaults.workspaceDefaults.thinkingLevel
     const defaultSddEnabled = options?.sddEnabled ?? wsConfig?.sdd?.sddEnabled ?? false
-    const defaultSpecId = options?.activeSpecId
+    const defaultSpecId = options?.activeSpecId ?? wsConfig?.sdd?.activeSpecId
 
     const managed: ManagedSession = {
       id: storedSession.id,
@@ -4356,8 +6246,20 @@ export class SessionManager {
 
     // Remove from in-memory state
     this.sessions.delete(sessionId)
+    this.inlineFeedbackState.delete(sessionId)
+    const parentTimer = this.speculativeReviewTimers.get(sessionId)
+    if (parentTimer) {
+      clearTimeout(parentTimer)
+      this.speculativeReviewTimers.delete(sessionId)
+    }
     for (const child of children) {
       this.sessions.delete(child.id)
+      this.inlineFeedbackState.delete(child.id)
+      const childTimer = this.speculativeReviewTimers.get(child.id)
+      if (childTimer) {
+        clearTimeout(childTimer)
+        this.speculativeReviewTimers.delete(child.id)
+      }
     }
 
     // Notify all windows
@@ -4495,7 +6397,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              role: (params.role as TeamRole | undefined) ?? 'worker',
+              role: (params.role as TeamRole | undefined) ?? TEAM_ROLE_WORKER,
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -4520,6 +6422,23 @@ export class SessionManager {
               return { delivered: delivered > 0, error: delivered === 0 ? 'No teammates found' : undefined }
             }
 
+            // Implements REQ-001/REQ-002: normalize lead recipient aliases so worker -> lead
+            // delivery succeeds without spawning inbox workaround sessions.
+            if (
+              managed.parentSessionId &&
+              isLeadTargetName(params.targetName || '', managed.teamId)
+            ) {
+              try {
+                await this.sendMessage(managed.parentSessionId, `**${managed.teammateName || 'Teammate'}** completed:\n\n---\n\n${params.content}`)
+                // Mark that this teammate already sent results to the lead via DM.
+                // The completion coordinator will skip its redundant relay.
+                managed.completionRelayed = true
+                return { delivered: true }
+              } catch (err) {
+                return { delivered: false, error: String(err) }
+              }
+            }
+
             for (const tid of teammateIds) {
               const teammate = this.sessions.get(tid)
               if (teammateMatchesTargetName(teammate?.teammateName, teammate?.name, params.targetName)) {
@@ -4535,7 +6454,10 @@ export class SessionManager {
                 }
               }
             }
-            return { delivered: false, error: `Teammate "${params.targetName}" not found` }
+            const fallbackHint = managed.parentSessionId
+              ? `Teammate "${params.targetName}" not found. Use "team-lead" to reach the lead.`
+              : `Teammate "${params.targetName}" not found`
+            return { delivered: false, error: fallbackHint }
           } : undefined,
           // Critical: Immediately persist SDK session ID when captured to prevent loss on crash.
           onSdkSessionIdUpdate: (sdkSessionId: string) => {
@@ -4600,8 +6522,8 @@ export class SessionManager {
         const codexAuthType = connection?.authType || authType
 
         // Determine auth method based on connection authType
-        // - 'oauth' → ChatGPT Plus OAuth tokens
-        // - 'api_key' or 'api_key_with_endpoint' → OpenAI API key
+        // - 'oauth' Ã¢â€ â€™ ChatGPT Plus OAuth tokens
+        // - 'api_key' or 'api_key_with_endpoint' Ã¢â€ â€™ OpenAI API key
         const useApiKey = codexAuthType === 'api_key' || codexAuthType === 'api_key_with_endpoint'
 
         if (useApiKey) {
@@ -4615,7 +6537,7 @@ export class SessionManager {
             this.sendEvent({
               type: 'info',
               sessionId: managed.id,
-              message: 'No OpenAI API key available. Please configure your API key in Settings → AI.',
+              message: 'No OpenAI API key available. Please configure your API key in Settings Ã¢â€ â€™ AI.',
               level: 'error',
             }, managed.workspace.id)
           }
@@ -4643,7 +6565,7 @@ export class SessionManager {
             this.sendEvent({
               type: 'info',
               sessionId: managed.id,
-              message: 'No ChatGPT tokens available. Please check your Codex login in Settings → AI.',
+              message: 'No ChatGPT tokens available. Please check your Codex login in Settings Ã¢â€ â€™ AI.',
               level: 'error',
             }, managed.workspace.id)
           }
@@ -4779,6 +6701,8 @@ export class SessionManager {
           isHeadless: !AGENT_FLAGS.defaultModesEnabled,
           // Pass the workspace-level HookSystem so agents reuse the shared instance
           hookSystem: this.hookSystems.get(managed.workspace.rootPath),
+          // Adaptive throttle for teammate sessions (undefined for non-teammates)
+          toolCallThrottle: managed.toolCallThrottle,
           // System prompt preset for mini agents (focused prompts for quick edits)
           systemPromptPreset: managed.systemPromptPreset,
           // Always pass session object - id is required for plan mode callbacks
@@ -4844,7 +6768,7 @@ export class SessionManager {
               teammateName: params.teammateName,
               prompt: params.prompt,
               model: params.model,
-              role: (params.role as TeamRole | undefined) ?? 'worker',
+              role: (params.role as TeamRole | undefined) ?? TEAM_ROLE_WORKER,
             })
             return { sessionId: teammateSession.id, agentId: teammateSession.id }
           } : undefined,
@@ -4870,6 +6794,23 @@ export class SessionManager {
               return { delivered: delivered > 0, error: delivered === 0 ? 'No teammates found' : undefined }
             }
 
+            // Implements REQ-001/REQ-002: normalize lead recipient aliases so worker -> lead
+            // delivery succeeds without spawning inbox workaround sessions.
+            if (
+              managed.parentSessionId &&
+              isLeadTargetName(params.targetName || '', managed.teamId)
+            ) {
+              try {
+                await this.sendMessage(managed.parentSessionId, `**${managed.teammateName || 'Teammate'}** completed:\n\n---\n\n${params.content}`)
+                // Mark that this teammate already sent results to the lead via DM.
+                // The completion coordinator will skip its redundant relay.
+                managed.completionRelayed = true
+                return { delivered: true }
+              } catch (err) {
+                return { delivered: false, error: String(err) }
+              }
+            }
+
             // Direct message: find teammate by name
             for (const tid of teammateIds) {
               const teammate = this.sessions.get(tid)
@@ -4887,7 +6828,10 @@ export class SessionManager {
                 }
               }
             }
-            return { delivered: false, error: `Teammate "${params.targetName}" not found` }
+            const fallbackHint = managed.parentSessionId
+              ? `Teammate "${params.targetName}" not found. Use "team-lead" to reach the lead.`
+              : `Teammate "${params.targetName}" not found`
+            return { delivered: false, error: fallbackHint }
           } : undefined,
         })
         sessionLog.info(`Created Claude agent for session ${managed.id}${managed.sdkSessionId ? ' (resuming)' : ''}`)
@@ -4949,6 +6893,23 @@ export class SessionManager {
                 sessionId: managed.id,
                 report: interimReport,
               }, managed.workspace.id)
+            }
+          }
+
+          // Implements AUDIT-FIX-2: Bridge SubmitPlan → Spec Registration.
+          // Previously, submitted plans were never registered as specs with the teamManager,
+          // so the dashboard's spec coverage and traceability panels had no data.
+          if (managed.teamId) {
+            try {
+              const parsedPlanSpec = parseSpecMarkdown(planContent, planPath)
+              if (parsedPlanSpec && parsedPlanSpec.requirements.length > 0) {
+                const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+                teamManager.setTeamSpec(resolvedTeamId, parsedPlanSpec)
+                sessionLog.info(`[AgentTeams] Registered plan as team spec for "${resolvedTeamId}" (${parsedPlanSpec.requirements.length} requirements)`)
+              }
+            } catch (specParseErr) {
+              // Plan may not be in spec format — that's OK, not all plans are specs
+              sessionLog.debug(`[AgentTeams] Plan could not be parsed as spec (non-fatal):`, specParseErr)
             }
           }
 
@@ -5253,10 +7214,9 @@ export class SessionManager {
       this.destroyManagedAgent(managed, 'autoArchiveCompletedTeammateSession')
     }
 
-    this.detachTeammateTracking(managed)
-    managed.teamId = undefined
-    managed.parentSessionId = undefined
-    managed.teammateName = undefined
+    // Implements REQ-001: Preserve team metadata on completion for sidebar grouping
+    // Only clean up runtime tracking (health monitor), NOT persisted team identity
+    this.detachTeammateRuntimeTracking(managed)
 
     let changed = false
     if (managed.todoState !== 'done') {
@@ -5895,7 +7855,8 @@ export class SessionManager {
     return managed.sddComplianceReports ?? []
   }
 
-  private startComplianceWatcher(sessionId: string): void {
+  // Implements BUG-B fix: await mkdir before watch() to prevent ENOENT on nonexistent dir
+  private async startComplianceWatcher(sessionId: string): Promise<void> {
     if (this.complianceWatchers.has(sessionId)) return
     const managed = this.sessions.get(sessionId)
     if (!managed || !managed.sddEnabled) return
@@ -5903,7 +7864,7 @@ export class SessionManager {
     const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
     const reportsDir = join(sessionPath, 'reports')
     if (!existsSync(reportsDir)) {
-      void mkdir(reportsDir, { recursive: true })
+      await mkdir(reportsDir, { recursive: true })
     }
 
     try {
@@ -6137,7 +8098,7 @@ export class SessionManager {
         sessionLog.info(`Refreshed title for session ${sessionId}: "${title}"`)
         return { success: true, title }
       }
-      // AI title generation failed — fall back to extractive title from user messages
+      // AI title generation failed Ã¢â‚¬â€ fall back to extractive title from user messages
       sessionLog.info(`refreshTitle: AI title generation returned null, using extractive fallback`)
       const lastUserMsg = userMessages[userMessages.length - 1] || ''
       const cleanMsg = lastUserMsg.replace(/[\n\r]+/g, ' ').replace(/\s+/g, ' ').trim()
@@ -6158,7 +8119,7 @@ export class SessionManager {
         sessionLog.info(`Refreshed title for session ${sessionId} (fallback): "${fallbackTitle}"`)
         return { success: true, title: fallbackTitle }
       }
-      // No usable content — clear regenerating state
+      // No usable content Ã¢â‚¬â€ clear regenerating state
       this.sendEvent({ type: 'title_regenerating', sessionId, isRegenerating: false }, managed.workspace.id)
       return { success: false, error: 'Failed to generate title' }
     } catch (error) {
@@ -6292,6 +8253,29 @@ export class SessionManager {
     // Ensure team resources are released before deleting a lead session.
     if (managed.isTeamLead && managed.teammateSessionIds?.length) {
       await this.cleanupTeam(sessionId)
+      // Implements REQ-A4: Preserve teamId and teamColor on teammates even when
+      // lead is deleted, so orphan recovery (Pass 1) can re-adopt them on restart.
+      // Only clear parentSessionId since it points to a now-deleted session.
+      for (const tid of managed.teammateSessionIds ?? []) {
+        const teammate = this.sessions.get(tid)
+        if (teammate) {
+          teammate.parentSessionId = undefined
+          // Keep teamId, teammateName, teamColor intact for orphan recovery
+          this.persistSession(teammate)
+        }
+      }
+    }
+
+    // If this is a teammate, remove it from the lead's teammateSessionIds
+    if (managed.parentSessionId) {
+      const lead = this.sessions.get(managed.parentSessionId)
+      if (lead?.teammateSessionIds?.length) {
+        lead.teammateSessionIds = lead.teammateSessionIds.filter(id => id !== sessionId)
+        if (lead.teammateSessionIds.length === 0) {
+          lead.teammateSessionIds = undefined
+        }
+        this.persistSession(lead)
+      }
     }
 
     // Get workspace slug before deleting
@@ -6330,6 +8314,12 @@ export class SessionManager {
     this.stopComplianceWatcher(sessionId)
 
     this.sessions.delete(sessionId)
+    this.inlineFeedbackState.delete(sessionId)
+    const speculativeTimer = this.speculativeReviewTimers.get(sessionId)
+    if (speculativeTimer) {
+      clearTimeout(speculativeTimer)
+      this.speculativeReviewTimers.delete(sessionId)
+    }
 
     // Clean up session metadata in HookSystem (prevents memory leak)
     const hookSystem = this.hookSystems.get(workspaceRootPath)
@@ -6377,7 +8367,7 @@ export class SessionManager {
 
     // If currently processing, queue the message and interrupt via forceAbort.
     // The abort throws an AbortError (caught in the catch block) which calls
-    // onProcessingStopped → processNextQueuedMessage to drain the queue.
+    // onProcessingStopped Ã¢â€ â€™ processNextQueuedMessage to drain the queue.
     if (managed.isProcessing) {
       sessionLog.info(`Session ${sessionId} is processing, queueing message and interrupting`)
 
@@ -6407,7 +8397,7 @@ export class SessionManager {
       }, managed.workspace.id)
 
       // Force-abort via Query.close() - immediately stops processing.
-      // The for-await loop will complete, triggering onProcessingStopped → queue drain.
+      // The for-await loop will complete, triggering onProcessingStopped Ã¢â€ â€™ queue drain.
       managed.agent?.forceAbort(AbortReason.Redirect)
 
       return
@@ -6462,7 +8452,7 @@ export class SessionManager {
         }
         // Sanitize: strip any remaining bracket mentions, XML blocks, tags
         const sanitized = sanitizeForTitle(titleSource)
-        const initialTitle = sanitized.slice(0, 50) + (sanitized.length > 50 ? '…' : '')
+        const initialTitle = sanitized.slice(0, 50) + (sanitized.length > 50 ? '...' : '')
         managed.name = initialTitle
         this.persistSession(managed)
         // Flush immediately so disk is authoritative before notifying renderer
@@ -6651,7 +8641,17 @@ export class SessionManager {
             this.healthMonitor.recordActivity(hmTeamId, managed.id, managed.teammateName, {
               type: 'tool_call',
               toolName: event.toolName,
+              // Implements Phase 1a: Pass toolInput so health monitor can distinguish different queries
+              toolInput: event.input ? JSON.stringify(event.input).slice(0, 200) : '',
             })
+            this.handleKnowledgeToolStart(hmTeamId, managed, event)
+            // REQ-HB-001: Feed tool call to heartbeat aggregator for activity tracking
+            this.heartbeatAggregator.recordToolCall(
+              hmTeamId,
+              managed.id,
+              event.toolName,
+              event.input ? JSON.stringify(event.input).slice(0, 200) : '',
+            )
             // Forward tool activity to dashboard for live visibility
             this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
               toolName: event.toolName,
@@ -6666,7 +8666,28 @@ export class SessionManager {
               type: 'tool_result',
               toolName: event.toolName,
               error: event.isError,
+              // Phase 4a: Capture result preview for partial work recovery on kill
+              resultPreview: event.result ? String(event.result).slice(0, 500) : undefined,
             })
+            this.handleKnowledgeToolResult(hmTeamId, managed, event)
+            this.maybeSendInlineFeedbackNudge(managed, event)
+            if (event.toolName && this.knowledgeMutationTools.has(event.toolName) && !event.isError) {
+              this.scheduleSpeculativeReviewCapture(managed)
+            }
+            // Phase 1b fix: Don't blindly reset retry-storm stage on every success.
+            // Most storm calls succeed (they return results, just useless ones), so resetting
+            // on success defeats the escalation. Instead, the health monitor's checkRetryStorm()
+            // handles escalation based on actual similarity patterns, and resetRetryStormStage()
+            // is called only when the agent demonstrably changes approach (see health-monitor.ts).
+            // Phase 2c: Record success/failure in adaptive throttle so budget grows/shrinks.
+            if (managed.toolCallThrottle && event.toolName) {
+              const inputPrefix = event.input ? JSON.stringify(event.input).slice(0, 100) : '';
+              if (event.isError) {
+                managed.toolCallThrottle.recordFailure(event.toolName);
+              } else {
+                managed.toolCallThrottle.recordSuccess(event.toolName, inputPrefix);
+              }
+            }
             // Forward tool completion to dashboard
             this.emitTeammateToolActivity(hmTeamId, managed.id, managed.teammateName, {
               toolName: event.toolName || 'unknown',
@@ -6917,8 +8938,100 @@ export class SessionManager {
   }
 
   /**
-   * Build a lightweight compliance report from team task linkage.
-   * Falls back to task-derived requirements when no full spec is cached.
+   * Scan the codebase for requirement ID references (e.g., REQ-001).
+   * Implements BUG-3/BUG-4: populate referencedInFiles/referencedInTests with real data.
+   */
+  private scanCodebaseForRequirements(
+    workingDir: string,
+    requirementIds: string[],
+  ): Map<string, { files: string[]; tests: string[] }> {
+    const results = new Map<string, { files: string[]; tests: string[] }>()
+    for (const id of requirementIds) {
+      results.set(id, { files: [], tests: [] })
+    }
+    if (!requirementIds.length || !workingDir || !existsSync(workingDir)) return results
+
+    // Build a combined pattern matching all requirement IDs
+    const pattern = requirementIds.map(id => id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+
+    try {
+      const isWin = process.platform === 'win32'
+      let stdout = ''
+
+      if (isWin) {
+        // Windows: use findstr recursively with explicit /C tokens.
+        // NOTE: findstr /R does not support regex alternation with "|" reliably,
+        // which caused REQ scans to miss all matches on Windows.
+        const { execSync } = require('child_process') as typeof import('child_process')
+        const findstrNeedles = requirementIds
+          .map(id => `/C:"${id.replace(/"/g, '""')}"`)
+          .join(' ')
+        try {
+          stdout = execSync(
+            `findstr /S /N /I ${findstrNeedles} *.ts *.tsx *.js *.jsx *.py *.rs *.go`,
+            { cwd: workingDir, timeout: 10000, encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }
+          )
+        } catch (e: any) {
+          // findstr returns exit code 1 when no matches found
+          if (e.stdout) stdout = e.stdout
+        }
+      } else {
+        // Unix: use grep recursively
+        const { execSync } = require('child_process') as typeof import('child_process')
+        try {
+          stdout = execSync(
+            `grep -rn --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' --include='*.py' --include='*.rs' --include='*.go' -E "${pattern}" .`,
+            { cwd: workingDir, timeout: 10000, encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }
+          )
+        } catch (e: any) {
+          // grep returns exit code 1 when no matches found
+          if (e.stdout) stdout = e.stdout
+        }
+      }
+
+      if (!stdout) return results
+
+      const lines = stdout.split('\n').filter(Boolean)
+      const testFilePattern = /[./\\](test|spec|__tests__|__test__|e2e|integration)[./\\]|\.(?:test|spec)\.[^.]+$/i
+
+      for (const line of lines) {
+        // Extract file path (format: "filepath:lineNumber:content" or on Windows "filepath:lineNumber: content")
+        const colonIdx = line.indexOf(':')
+        if (colonIdx < 0) continue
+        let filePath = line.substring(0, colonIdx)
+        // Skip node_modules, dist, build, .git, spec templates, config/docs that
+        // produce false positives (the codebase's own spec system references REQ-001 etc.)
+        if (/node_modules|[/\\]dist[/\\]|[/\\]build[/\\]|[/\\]\.git[/\\]|[/\\]specs[/\\]|[/\\]\.craft-agent[/\\]|prd\.json$|vitest[^/\\]*\.(?:config|base\.config|results[^/\\]*)\.(?:json|ts)$/i.test(filePath)) continue
+
+        // Normalize path separators
+        filePath = filePath.replace(/\\/g, '/')
+        if (filePath.startsWith('./')) filePath = filePath.substring(2)
+
+        const isTest = testFilePattern.test(filePath)
+
+        // Match which requirement IDs this line references
+        for (const reqId of requirementIds) {
+          if (line.includes(reqId)) {
+            const entry = results.get(reqId)!
+            if (isTest) {
+              if (!entry.tests.includes(filePath)) entry.tests.push(filePath)
+            } else {
+              if (!entry.files.includes(filePath)) entry.files.push(filePath)
+            }
+          }
+        }
+      }
+    } catch (err) {
+      sessionLog.warn('[SDD] Codebase scan failed (non-fatal):', err)
+    }
+
+    return results
+  }
+
+  /**
+   * Build a compliance report from team task linkage AND codebase scanning.
+   * Implements BUG-3: populate referencedInFiles/referencedInTests with real data.
+   * Implements BUG-4: build real traceability maps from code references.
    */
   private generateSpecComplianceReport(managed: ManagedSession): SpecComplianceReport | undefined {
     if (!managed.activeSpecId) return undefined
@@ -6927,44 +9040,75 @@ export class SessionManager {
     const tasks = teamId ? teamManager.getTasks(teamId) : []
     const spec = teamId ? teamManager.getTeamSpec(teamId) : undefined
 
-    const requirementIds = spec?.requirements.map(r => r.id)
-      ?? [...new Set(tasks.flatMap(task => task.requirementIds ?? []))]
+    const specRequirementIds = spec?.requirements.map(r => r.id) ?? []
+    const taskRequirementIds = tasks.flatMap(task => task.requirementIds ?? [])
+    const requirementIds = [...new Set([...specRequirementIds, ...taskRequirementIds])]
+
+    // Implements BUG-3/BUG-4: scan codebase for actual requirement references
+    const workingDir = managed.workingDirectory || managed.sdkCwd || ''
+    const codebaseRefs = this.scanCodebaseForRequirements(workingDir, requirementIds)
 
     const requirementsCoverage = requirementIds.map(requirementId => {
       const linkedTasks = tasks.filter(task => (task.requirementIds ?? []).includes(requirementId))
-      const coverage: 'full' | 'partial' | 'none' = linkedTasks.length > 0 ? 'full' : 'none'
+      const scannedRefs = codebaseRefs.get(requirementId) ?? { files: [], tests: [] }
+
+      // Implements REQ-002: only treat code/test references as real compliance evidence
+      // when the requirement is actually linked to team tasks in this run.
+      // This prevents repo-wide REQ-* comments from inflating coverage.
+      const refs = linkedTasks.length > 0 ? scannedRefs : { files: [], tests: [] }
+
+      const hasTasks = linkedTasks.length > 0
+      const hasFiles = refs.files.length > 0
+      const hasTests = refs.tests.length > 0
+      // Coverage: no tasks => none, tasks + files/tests => full, tasks-only => partial.
+      const coverage: 'full' | 'partial' | 'none' =
+        !hasTasks ? 'none'
+          : (hasFiles || hasTests) ? 'full'
+            : 'partial'
+
+      const noteParts: string[] = []
+      if (hasTasks) noteParts.push(`${linkedTasks.length} task(s)`)
+      if (hasFiles) noteParts.push(`${refs.files.length} file(s)`)
+      if (hasTests) noteParts.push(`${refs.tests.length} test(s)`)
+
       return {
         requirementId,
         coverage,
-        referencedInFiles: [],
-        referencedInTests: [],
-        notes: linkedTasks.length > 0
-          ? `${linkedTasks.length} linked task(s)`
-          : 'No linked tasks',
+        referencedInFiles: refs.files,
+        referencedInTests: refs.tests,
+        notes: noteParts.length > 0 ? noteParts.join(', ') : 'No references found',
       }
     })
 
     const fullCount = requirementsCoverage.filter(r => r.coverage === 'full').length
+    const partialCount = requirementsCoverage.filter(r => r.coverage === 'partial').length
     const overallCoverage = requirementsCoverage.length > 0
-      ? Math.round((fullCount / requirementsCoverage.length) * 100)
+      ? Math.round(((fullCount + partialCount * 0.5) / requirementsCoverage.length) * 100)
       : 100
 
     const unreferencedRequirements = requirementsCoverage
       .filter(r => r.coverage === 'none')
       .map(r => r.requirementId)
 
-    const traceabilityMap = requirementsCoverage.map(r => ({
-      requirementId: r.requirementId,
-      files: [],
-      tests: [],
-      tasks: tasks
+    // Implements BUG-4: build traceability map with real file/test data
+    const traceabilityMap = requirementsCoverage.map(r => {
+      const requirementTasks = tasks
         .filter(task => (task.requirementIds ?? []).includes(r.requirementId))
-        .map(task => task.id),
-      tickets: tasks
-        .flatMap(task => task.ticketLinks ?? [])
-        .filter(ticket => (ticket.requirementIds ?? []).includes(r.requirementId))
-        .map(ticket => ticket.ticketId),
-    }))
+        .map(task => task.id)
+      const refs = requirementTasks.length > 0
+        ? (codebaseRefs.get(r.requirementId) ?? { files: [], tests: [] })
+        : { files: [], tests: [] }
+      return {
+        requirementId: r.requirementId,
+        files: refs.files,
+        tests: refs.tests,
+        tasks: requirementTasks,
+        tickets: tasks
+          .flatMap(task => task.ticketLinks ?? [])
+          .filter(ticket => (ticket.requirementIds ?? []).includes(r.requirementId))
+          .map(ticket => ticket.ticketId),
+      }
+    })
 
     const hasRollbackPlan = !!spec?.rollbackPlan || tasks.some(t => /rollback/i.test(t.title))
     const hasMonitoring = !!spec?.observabilityPlan || tasks.some(t => /monitor/i.test(t.title))
@@ -6997,6 +9141,33 @@ export class SessionManager {
    * @param sessionId - The session that stopped processing
    * @param reason - Why processing stopped ('complete' | 'interrupted' | 'error')
    */
+  private getQualityGateSkipReason(managed: ManagedSession): string | null {
+    if (managed.teammateRole === TEAM_ROLE_HEAD || managed.teammateRole === TEAM_ROLE_ESCALATION) {
+      return `role=${managed.teammateRole} (team-level quality gate will run after all teammates complete)`
+    }
+
+    const inferredTaskType = inferTaskType(managed.name || '')
+    if (shouldSkipQualityGates(inferredTaskType)) {
+      return `taskType=${inferredTaskType} (non-code task)`
+    }
+
+    return null
+  }
+  private async handleAgentTeamCompletionOnStop(
+    managed: ManagedSession,
+    sessionId: string,
+    reason: 'complete' | 'interrupted' | 'error' | 'timeout'
+  ): Promise<void> {
+    await this.agentTeamCompletionCoordinator.handleAgentTeamCompletionOnStop(managed, sessionId, reason)
+
+    // Implements REQ-A1: When a teammate finishes, check if its lead can now emit
+    // the deferred 'complete' event (all spawns resolved + no active teammates).
+    if (managed.parentSessionId) {
+      this.checkLeadTeamCompletion(managed.parentSessionId)
+    }
+  }
+
+
   private async onProcessingStopped(
     sessionId: string,
     reason: 'complete' | 'interrupted' | 'error' | 'timeout'
@@ -7084,285 +9255,7 @@ export class SessionManager {
       await this.setTodoState(sessionId, 'done')
     }
 
-    // 4. Agent Teams: When a teammate session completes, run quality gates then relay results
-    //    This MUST happen before step 5 (queue/complete) so the lead gets the message
-    //    while it's still alive and listening.
-    if (reason === 'complete' && managed.parentSessionId && managed.teammateName) {
-      const lead = this.sessions.get(managed.parentSessionId)
-        if (lead && lead.isTeamLead) {
-          const lastAssistantMsg = [...managed.messages].reverse().find(m =>
-            m.role === 'assistant' && !m.isIntermediate
-          )
-          const resultContent = lastAssistantMsg?.content || '(No output produced)'
-          const teammateName = managed.teammateName
-          const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId)
-
-          // Load quality gate config from workspace
-          const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
-          const qgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
-          const clearLeadTeamState = (): void => {
-            if (lead.agent instanceof CraftAgent) {
-              lead.agent.clearTeamState()
-            }
-          }
-
-        // Run quality gate pipeline if enabled
-        if (qgConfig.enabled) {
-          sessionLog.info(`[AgentTeams] Running quality gate pipeline for teammate "${teammateName}"`)
-
-          const cycleKey = `${sessionId}-qg`
-          const currentCycle = (this.qualityGateCycles.get(cycleKey) || 0) + 1
-          this.qualityGateCycles.set(cycleKey, currentCycle)
-
-          const runner = this.getQualityGateRunner()
-          const taskContext: TaskContext = {
-            taskDescription: managed.name || 'Teammate task',
-            workingDirectory: managed.workingDirectory,
-          }
-
-          try {
-            const spec = managed.teamId ? teamManager.getTeamSpec(teamManager.resolveTeamId(managed.teamId)) : undefined
-            const reviewDiff = managed.workingDirectory
-              ? await DiffCollector.collectWorkingDiff(managed.workingDirectory)
-              : null
-            const reviewInput = resolveQualityGateReviewInput(reviewDiff)
-
-            if (!reviewInput.usesGitDiff) {
-              sessionLog.warn(`[AgentTeams] Quality gate blocked for "${teammateName}" due to missing diff evidence`)
-              if (currentCycle >= qgConfig.maxReviewCycles) {
-                this.qualityGateCycles.delete(cycleKey)
-                setTimeout(async () => {
-                  try {
-                    const relayMessage = [
-                      `## Team Result - ${teammateName}`,
-                      '',
-                      '### Quality Gate Escalated',
-                      `Cycle: ${currentCycle}/${qgConfig.maxReviewCycles}`,
-                      `Reason: ${reviewInput.failureReason}`,
-                      '',
-                      'Action required: ensure teammate changes are present in the git working tree before re-running quality gates.',
-                      '',
-                      '---',
-                      '',
-                      resultContent,
-                    ].join('\n')
-                    await this.sendMessage(managed.parentSessionId!, relayMessage)
-                    await this.autoArchiveCompletedTeammateSession(sessionId)
-                  } catch (err) {
-                    sessionLog.error(`[AgentTeams] Failed to relay missing-diff escalation from ${teammateName}:`, err)
-                  }
-                }, 200)
-              } else {
-                setTimeout(async () => {
-                  try {
-                    const feedbackMessage = [
-                      '## Quality Gate Feedback',
-                      `Cycle ${currentCycle}/${qgConfig.maxReviewCycles}`,
-                      '',
-                      'Your work did not pass quality checks.',
-                      '',
-                      `Blocking issue: ${reviewInput.failureReason}`,
-                      '',
-                      'Please make sure implementation changes are written to files in the working directory, then try again.',
-                    ].join('\n')
-                    await this.sendMessage(sessionId, feedbackMessage)
-                  } catch (err) {
-                    sessionLog.error(`[AgentTeams] Failed to send missing-diff feedback to ${teammateName}:`, err)
-                  }
-                }, 200)
-              }
-            }
-
-            if (reviewInput.usesGitDiff) {
-              const result = await runner.runProgressive(reviewInput.reviewInput, taskContext, qgConfig, spec)
-            result.cycleCount = currentCycle
-            result.maxCycles = qgConfig.maxReviewCycles
-
-            if (result.passed) {
-              // PASSED — relay to lead with quality report
-              sessionLog.info(`[AgentTeams] Quality gate PASSED for "${teammateName}" (score: ${result.aggregateScore})`)
-              this.qualityGateCycles.delete(cycleKey) // Reset cycle counter
-
-              const successReport = formatSuccessReport(result)
-              const leadQualitySummary = buildQualityLeadSummary(teammateName, result, 'passed')
-              teamManager.logActivity(
-                resolvedTeamId,
-                'quality-gate-passed',
-                `Quality gate passed at ${formatPercentScore(result.aggregateScore)}`,
-                managed.id,
-                teammateName,
-              )
-              this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
-
-              setTimeout(async () => {
-                try {
-                  const relayMessage = [
-                    `## Team Result - ${teammateName}`,
-                    '',
-                    leadQualitySummary,
-                    '',
-                    successReport,
-                    '',
-                    '---',
-                    '',
-                    resultContent,
-                  ].join('\n')
-                  await this.sendMessage(managed.parentSessionId!, relayMessage)
-                  await this.autoArchiveCompletedTeammateSession(sessionId)
-
-                  // Check if ALL teammates are now done
-                  const allDone = (lead.teammateSessionIds || []).every(tid => {
-                    const t = this.sessions.get(tid)
-                    return t && !t.isProcessing
-                  })
-                  if (allDone) {
-                    sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
-                    clearLeadTeamState()
-                    setTimeout(async () => {
-                      try {
-                        await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
-                      } catch (err) {
-                        sessionLog.error('[AgentTeams] Failed to send synthesis prompt:', err)
-                      }
-                    }, 500)
-                  }
-                } catch (err) {
-                  sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, err)
-                }
-              }, 200)
-
-            } else if (currentCycle >= qgConfig.maxReviewCycles) {
-              // MAX CYCLES REACHED — escalate and relay with warning
-              sessionLog.warn(`[AgentTeams] Quality gate max cycles (${qgConfig.maxReviewCycles}) reached for "${teammateName}", escalating`)
-              this.qualityGateCycles.delete(cycleKey)
-
-              let escalationNote = ''
-              try {
-                escalationNote = await runner.escalate(result, resultContent, taskContext, qgConfig)
-                result.escalatedTo = qgConfig.escalationModel
-              } catch (err) {
-                sessionLog.error('[AgentTeams] Escalation failed:', err)
-                escalationNote = 'Escalation failed — manual review required.'
-              }
-
-              const failureReport = formatFailureReport(result, qgConfig)
-              const leadQualitySummary = buildQualityLeadSummary(teammateName, result, 'escalated')
-              teamManager.logActivity(
-                resolvedTeamId,
-                'escalation',
-                `Quality gate escalated at ${formatPercentScore(result.aggregateScore)} after ${currentCycle} cycles`,
-                managed.id,
-                teammateName,
-              )
-
-              setTimeout(async () => {
-                try {
-                  const relayMessage = [
-                    `## Team Result - ${teammateName}`,
-                    '',
-                    leadQualitySummary,
-                    '',
-                    failureReport,
-                    '',
-                    '**Escalation Diagnosis:**',
-                    escalationNote,
-                    '',
-                    '---',
-                    '',
-                    resultContent,
-                  ].join('\n')
-                  await this.sendMessage(managed.parentSessionId!, relayMessage)
-                  await this.autoArchiveCompletedTeammateSession(sessionId)
-                } catch (err) {
-                  sessionLog.error(`[AgentTeams] Failed to relay escalated results from ${teammateName}:`, err)
-                }
-              }, 200)
-
-            } else {
-              // FAILED — auto-cycle: send feedback back to teammate for fixes
-              sessionLog.info(`[AgentTeams] Quality gate FAILED for "${teammateName}" (score: ${result.aggregateScore}, cycle ${currentCycle}/${qgConfig.maxReviewCycles})`)
-
-              const failureReport = formatFailureReport(result, qgConfig)
-              const workerFeedbackSummary = buildWorkerQualityFeedback(result, qgConfig.maxReviewCycles)
-              teamManager.logActivity(
-                resolvedTeamId,
-                'quality-gate-failed',
-                `Quality gate failed at ${formatPercentScore(result.aggregateScore)} (cycle ${currentCycle}/${qgConfig.maxReviewCycles})`,
-                managed.id,
-                teammateName,
-              )
-
-              setTimeout(async () => {
-                try {
-                  const feedbackMessage = [
-                    workerFeedbackSummary,
-                    '',
-                    failureReport,
-                  ].join('\n')
-                  await this.sendMessage(sessionId, feedbackMessage)
-                  teamManager.logActivity(
-                    resolvedTeamId,
-                    'review-feedback-sent',
-                    `Quality feedback sent (cycle ${currentCycle}/${qgConfig.maxReviewCycles})`,
-                    managed.id,
-                    teammateName,
-                  )
-                } catch (err) {
-                  sessionLog.error(`[AgentTeams] Failed to send quality gate feedback to ${teammateName}:`, err)
-                }
-              }, 200)
-            }
-            }
-          } catch (err) {
-            // Quality gate pipeline itself errored — don't block relay, just warn
-            sessionLog.error(`[AgentTeams] Quality gate pipeline error for "${teammateName}":`, err)
-            this.qualityGateCycles.delete(cycleKey)
-
-            // Fallback: relay without quality report
-            setTimeout(async () => {
-              try {
-                const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work (quality gate skipped due to error):\n\n${resultContent}`
-                await this.sendMessage(managed.parentSessionId!, relayMessage)
-                await this.autoArchiveCompletedTeammateSession(sessionId)
-              } catch (relayErr) {
-                sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, relayErr)
-              }
-            }, 200)
-          }
-        } else {
-          // Quality gates disabled — original behavior
-          sessionLog.info(`[AgentTeams] Relaying results from teammate "${teammateName}" back to lead ${managed.parentSessionId}`)
-          const resolvedTeamId = teamManager.resolveTeamId(managed.teamId ?? managed.parentSessionId!)
-          this.updateTeammateTasks(resolvedTeamId, managed.id, 'completed')
-
-          setTimeout(async () => {
-            try {
-              const relayMessage = `[Team Result] Teammate "${teammateName}" has completed their work:\n\n${resultContent}`
-              await this.sendMessage(managed.parentSessionId!, relayMessage)
-              await this.autoArchiveCompletedTeammateSession(sessionId)
-
-              const allDone = (lead.teammateSessionIds || []).every(tid => {
-                const t = this.sessions.get(tid)
-                return t && !t.isProcessing
-              })
-               if (allDone) {
-                 sessionLog.info(`[AgentTeams] All teammates complete for lead ${managed.parentSessionId}, prompting synthesis`)
-                 clearLeadTeamState()
-                 setTimeout(async () => {
-                  try {
-                    await this.sendMessage(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
-                  } catch (err) {
-                    sessionLog.error('[AgentTeams] Failed to send synthesis prompt:', err)
-                  }
-                }, 500)
-              }
-            } catch (err) {
-              sessionLog.error(`[AgentTeams] Failed to relay results from ${teammateName}:`, err)
-            }
-          }, 200)
-        }
-      }
-    }
+    await this.handleAgentTeamCompletionOnStop(managed, sessionId, reason)
 
     const keepAliveForTeam = this.shouldDelayCompletionForAgentTeam(managed)
 
@@ -7389,7 +9282,18 @@ export class SessionManager {
 
   private shouldDelayCompletionForAgentTeam(managed: ManagedSession): boolean {
     // Check if this session is a team lead with active teammate sessions
-    if (!managed.isTeamLead || !managed.teammateSessionIds?.length) {
+    if (!managed.isTeamLead) {
+      return false
+    }
+
+    // Implements REQ-A1: Block completion while teammate spawns are still pending.
+    // This closes the race where the lead emits 'complete' before setTimeout
+    // fires to kick off teammates.
+    if ((managed.pendingTeammateSpawns ?? 0) > 0) {
+      return true
+    }
+
+    if (!managed.teammateSessionIds?.length) {
       return false
     }
 
@@ -7403,6 +9307,68 @@ export class SessionManager {
   }
 
   /**
+   * Implements REQ-A1 + REQ-B6: Re-check whether a lead session can now complete.
+   * Called when a pending teammate spawn resolves, or when a teammate finishes.
+   * If all spawns resolved and no teammates active, emit deferred 'complete'.
+   *
+   * Note: The actual synthesis prompt is handled by the AgentTeamCompletionCoordinator's
+   * maybePromptLeadSynthesis(), which sends a system message to the lead asking it to
+   * synthesize results. This method handles the UI-level completion event.
+   */
+  private checkLeadTeamCompletion(leadSessionId: string): void {
+    const managed = this.sessions.get(leadSessionId)
+    if (!managed) return
+    // If the lead is currently processing (e.g., synthesis prompt triggered it),
+    // don't emit complete yet — let onProcessingStopped handle it naturally.
+    if (managed.isProcessing) return
+    if (this.shouldDelayCompletionForAgentTeam(managed)) return
+
+    sessionLog.info(`[AgentTeams] All teammates finished for lead ${leadSessionId}, emitting deferred complete`)
+
+    // Clear the safety timeout if set
+    if (managed.pendingSpawnsTimeout) {
+      clearTimeout(managed.pendingSpawnsTimeout)
+      managed.pendingSpawnsTimeout = undefined
+    }
+
+    // Stop health monitoring + status check-in polling — all teammates are done
+    if (managed.teamId) {
+      this.stopTeamHealthMonitoring(teamManager.resolveTeamId(managed.teamId))
+    }
+
+    // REQ-UX-001: Transition team status to 'completed' when all teammates are done
+    if (managed.teamId) {
+      const resolvedTeamId = teamManager.resolveTeamId(managed.teamId)
+      const team = teamManager.getTeam(resolvedTeamId)
+      if (team && team.status === 'active') {
+        teamManager.updateTeamStatus(resolvedTeamId, 'completed')
+        const tasks = teamManager.getTasks(resolvedTeamId)
+        const cost = teamManager.getCostSummary(resolvedTeamId)
+        // Notify the renderer so the dashboard can show the completion banner
+        if (this.windowManager) {
+          this.windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, {
+            type: 'team:completed' as const,
+            teamId: resolvedTeamId,
+            payload: {
+              finalCost: cost.totalCostUsd,
+              tasksCompleted: tasks.filter(t => t.status === 'completed').length,
+            },
+            timestamp: new Date().toISOString(),
+          })
+        }
+      }
+    }
+
+    this.sendEvent({
+      type: 'complete',
+      sessionId: leadSessionId,
+      tokenUsage: managed.tokenUsage,
+      hasUnread: managed.hasUnread,
+    }, managed.workspace.id)
+    this.persistSession(managed)
+  }
+
+  /**
    * Process the next message in the queue.
    * Called by onProcessingStopped when queue has messages.
    */
@@ -7413,7 +9379,7 @@ export class SessionManager {
     const next = managed.messageQueue.shift()!
     sessionLog.info(`Processing queued message for session ${sessionId}`)
 
-    // Update UI: queued → processing
+    // Update UI: queued Ã¢â€ â€™ processing
     if (next.messageId) {
       const existingMessage = managed.messages.find(m => m.id === next.messageId)
       if (existingMessage) {
@@ -7442,7 +9408,7 @@ export class SessionManager {
         next.messageId
       ).catch(err => {
         sessionLog.error('Error processing queued message:', err)
-        // Report queued message failures to Sentry — these indicate SDK/chat pipeline errors
+        // Report queued message failures to Sentry Ã¢â‚¬â€ these indicate SDK/chat pipeline errors
         Sentry.captureException(err, {
           tags: { errorSource: 'chat-queue', sessionId },
         })
@@ -7744,7 +9710,7 @@ export class SessionManager {
     } catch (error) {
       sessionLog.error(`Failed to generate title for session ${managed.id}:`, error)
 
-      // Surface quota/auth errors to the user — these indicate the main chat call will also fail
+      // Surface quota/auth errors to the user Ã¢â‚¬â€ these indicate the main chat call will also fail
       const errorMsg = error instanceof Error ? error.message : String(error)
       if (errorMsg.includes('quota') || errorMsg.includes('429') || errorMsg.includes('401') || errorMsg.includes('insufficient')) {
         this.sendEvent({
@@ -7967,7 +9933,7 @@ export class SessionManager {
         const existingStartMsg = managed.messages.find(m => m.toolUseId === event.toolUseId)
         const isDuplicateEvent = !!existingStartMsg
 
-        // Use parentToolUseId directly from the event — CraftAgent resolves this
+        // Use parentToolUseId directly from the event Ã¢â‚¬â€ CraftAgent resolves this
         // from SDK's parent_tool_use_id (authoritative, handles parallel Tasks correctly).
         // No stack or map needed; the event carries the correct parent from the start.
         const parentToolUseId = event.parentToolUseId
@@ -8070,7 +10036,7 @@ export class SessionManager {
             existingToolMsg.parentToolUseId = event.parentToolUseId
           }
         } else {
-          // No matching tool_start found — create message from result.
+          // No matching tool_start found Ã¢â‚¬â€ create message from result.
           // This is normal for background subagent child tools where tool_result arrives
           // without a prior tool_start. If tool_start arrives later, findToolMessage will
           // locate this message by toolUseId and update it with input/intent/displayMeta.
@@ -8398,7 +10364,7 @@ export class SessionManager {
             } catch (retryError) {
               managed.authRetryInProgress = false
               sessionLog.error(`[auth-retry] Failed to retry after auth refresh for session ${sessionId}:`, retryError)
-              // Report auth retry failures to Sentry — indicates credential/SDK issues
+              // Report auth retry failures to Sentry Ã¢â‚¬â€ indicates credential/SDK issues
               Sentry.captureException(retryError, {
                 tags: { errorSource: 'auth-retry', sessionId },
               })
@@ -8518,6 +10484,22 @@ export class SessionManager {
               this.updateLeadTeamUsageFromTeammate(managed)
               this.persistSession(lead)
             }
+
+            // Implements BUG-5: sync usage to teamManager so dashboard cost display works
+            const resolvedTeamId = managed.teamId
+              ? teamManager.resolveTeamId(managed.teamId)
+              : managed.parentSessionId
+                ? this.sessions.get(managed.parentSessionId)?.teamId
+                  ? teamManager.resolveTeamId(this.sessions.get(managed.parentSessionId)!.teamId!)
+                  : undefined
+                : undefined
+            if (resolvedTeamId) {
+              teamManager.updateTeammateUsage(resolvedTeamId, managed.id, {
+                inputTokens: event.usage.inputTokens,
+                outputTokens: event.usage.outputTokens,
+                costUsd: applied.costUsd,
+              })
+            }
           }
 
           // Initialize tokenUsage if not set
@@ -8607,6 +10589,69 @@ export class SessionManager {
     tasks
       .filter(task => task.assignee === teammateId && task.status === 'in_progress')
       .forEach(task => teamManager.updateTaskStatus(teamId, task.id, status))
+
+    // Implements REQ-SPEC-001: auto-update linked requirement statuses on task completion
+    if (status === 'completed') {
+      const leadSessionId = this.sessions.get(teammateId)?.parentSessionId
+      if (leadSessionId) {
+        const completedTasks = tasks.filter(task => task.assignee === teammateId && (task.requirementIds?.length ?? 0) > 0)
+        for (const task of completedTasks) {
+          for (const reqId of task.requirementIds!) {
+            this.updateSpecRequirementStatus(leadSessionId, reqId, 'implemented').catch(err => {
+              sessionLog.warn(`[AgentTeams] Failed to update spec requirement ${reqId}:`, err)
+            })
+          }
+        }
+      }
+    }
+
+    // Implements BUG-004 fix: Also update the Claude Code SDK's .claude/tasks/ files on disk.
+    // The SDK maintains its own task files at ~/.claude/tasks/{teamId}/*.json which are
+    // separate from our teamManager state. Without this, task files remain "in_progress" forever.
+    this.syncSdkTaskFiles(teamId, teammateId, status).catch(err => {
+      sessionLog.warn(`[AgentTeams] Failed to sync SDK task files for team ${teamId}:`, err)
+    })
+  }
+
+  /**
+   * Sync Claude Code SDK task files on disk with our team manager's state.
+   * The SDK stores tasks at ~/.claude/tasks/{teamId}/{id}.json.
+   * When we mark a task completed/failed via teamManager, also update the disk file.
+   */
+  private async syncSdkTaskFiles(
+    teamId: string,
+    teammateId: string,
+    status: 'completed' | 'failed'
+  ): Promise<void> {
+    const tasksDir = join(homedir(), '.claude', 'tasks', teamId)
+    if (!existsSync(tasksDir)) return
+
+    const { readdir } = await import('fs/promises')
+    const files = await readdir(tasksDir)
+    const jsonFiles = files.filter(f => f.endsWith('.json') && f !== '.lock')
+
+    for (const file of jsonFiles) {
+      const filePath = join(tasksDir, file)
+      try {
+        const content = await readFile(filePath, 'utf-8')
+        const task = JSON.parse(content)
+
+        // Match by subject (teammate name) or description containing the teammate session ID
+        const isMatch = task.status === 'in_progress' && (
+          task.subject === teammateId ||
+          (typeof task.subject === 'string' && this.sessions.get(teammateId)?.teammateName &&
+            task.subject === this.sessions.get(teammateId)?.teammateName)
+        )
+
+        if (isMatch) {
+          task.status = status === 'completed' ? 'completed' : 'failed'
+          await writeFile(filePath, JSON.stringify(task, null, 2), 'utf-8')
+          sessionLog.info(`[AgentTeams] Updated SDK task file ${filePath} → ${status}`)
+        }
+      } catch {
+        // File may have been deleted or is not valid JSON — skip
+      }
+    }
   }
 
   private sendEvent(event: SessionEvent, workspaceId?: string): void {
@@ -8765,6 +10810,11 @@ export class SessionManager {
       clearTimeout(timer)
     }
     this.complianceSyncTimers.clear()
+    // Clear debounced source reload timers
+    for (const [_, timer] of this.sourceReloadTimers) {
+      clearTimeout(timer)
+    }
+    this.sourceReloadTimers.clear()
     // Dispose all HookSystems (includes scheduler, handlers, and event loggers)
     for (const [workspacePath, hookSystem] of this.hookSystems) {
       try {
@@ -8806,6 +10856,17 @@ export class SessionManager {
     this.healthMonitor.dispose()
     this.teamHealthAlertHandlers.clear()
 
+    // Implements H3: Evict stale review states on shutdown
+    const reviewLoop = teamManager.getReviewLoop()
+    if (reviewLoop) {
+      reviewLoop.evictStaleReviews(0) // Evict all terminal reviews on shutdown
+    }
+
+    // Implements C5: Clear all team manager in-memory Maps on shutdown
+    teamManager.evictAllTeamData()
+
     sessionLog.info('Cleanup complete')
   }
 }
+
+

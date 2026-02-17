@@ -61,6 +61,7 @@ export class CraftMcpClient {
   private client: Client;
   private transport: Transport;
   private connected = false;
+  private connecting: Promise<void> | null = null; // BUG-012 fix: guard against concurrent connect()
 
   constructor(config: McpClientConfig) {
     this.client = new Client({
@@ -78,10 +79,19 @@ export class CraftMcpClient {
           processEnv[key] = value;
         }
       }
+      // BUG-005 fix: Filter config.env against blocked vars to prevent credential leakage
+      const safeConfigEnv: Record<string, string> = {};
+      if (config.env) {
+        for (const [key, value] of Object.entries(config.env)) {
+          if (!BLOCKED_ENV_VARS.includes(key)) {
+            safeConfigEnv[key] = value;
+          }
+        }
+      }
       this.transport = new StdioClientTransport({
         command: config.command,
         args: config.args,
-        env: { ...processEnv, ...config.env },
+        env: { ...processEnv, ...safeConfigEnv },
       });
     } else {
       // HTTP transport for remote MCP servers
@@ -98,7 +108,18 @@ export class CraftMcpClient {
 
   async connect(): Promise<void> {
     if (this.connected) return;
+    // BUG-012 fix: If already connecting, await the in-flight attempt
+    if (this.connecting) return this.connecting;
 
+    this.connecting = this._doConnect();
+    try {
+      await this.connecting;
+    } finally {
+      this.connecting = null;
+    }
+  }
+
+  private async _doConnect(): Promise<void> {
     await this.client.connect(this.transport);
 
     // Verify connection works by listing tools

@@ -67,7 +67,7 @@ import { join } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { rmSync } from 'fs'
 import { SessionManager } from './sessions'
-import { registerIpcHandlers } from './ipc'
+import { registerIpcHandlers, cleanupTeamListeners } from './ipc'
 import { createApplicationMenu } from './menu'
 import { WindowManager } from './window-manager'
 import { loadWindowState, saveWindowState } from './window-state'
@@ -503,6 +503,9 @@ app.on('before-quit', async (event) => {
     }
     // Clean up SessionManager resources (file watchers, timers, etc.)
     sessionManager.cleanup()
+
+    // BUG-001 fix: Remove team event listeners to prevent memory leaks
+    cleanupTeamListeners()
 
     // Clean up power manager (release power blocker)
     const { cleanup: cleanupPowerManager } = await import('./power-manager')

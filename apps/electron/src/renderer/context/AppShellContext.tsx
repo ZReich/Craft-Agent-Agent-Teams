@@ -67,6 +67,12 @@ export interface AppShellContextType {
   sessionOptions: Map<string, SessionOptions>
   /** Workspace-level agent teams enabled — drives per-session toggle default (REQ-001) */
   workspaceAgentTeamsEnabled?: boolean
+  /** Workspace-level YOLO enabled — drives per-session toggle default (REQ-004) */
+  workspaceYoloEnabled?: boolean
+  /** Workspace-level Design Flow enabled — drives per-session toggle default (REQ-004) */
+  workspaceDesignFlowEnabled?: boolean
+  /** Update workspace-level feature flags from settings pages (fixes stale state after toggle) */
+  onWorkspaceFeatureFlagsChange?: (flags: { agentTeamsEnabled?: boolean; yoloEnabled?: boolean; designFlowEnabled?: boolean }) => void
 
   // Session callbacks
   onCreateSession: (workspaceId: string, options?: import('../../shared/types').CreateSessionOptions) => Promise<Session>
@@ -225,14 +231,15 @@ export function useSessionOptionsFor(sessionId: string): {
   setPermissionMode: (mode: PermissionMode) => void
   isSafeModeActive: () => boolean
 } {
-  const { sessionOptions, onSessionOptionsChange, workspaceAgentTeamsEnabled } = useAppShellContext()
+  const { sessionOptions, onSessionOptionsChange, workspaceAgentTeamsEnabled, workspaceYoloEnabled, workspaceDesignFlowEnabled } = useAppShellContext()
 
-  // Implements REQ-001: workspace agentTeamsEnabled drives per-session toggle default
-  const effectiveDefaults = React.useMemo(() => (
-    workspaceAgentTeamsEnabled
-      ? { ...defaultSessionOptions, agentTeamsEnabled: true }
+  // Implements REQ-001, REQ-004: workspace feature flags drive per-session toggle defaults
+  const effectiveDefaults = React.useMemo(() => {
+    const hasAnyOverride = workspaceAgentTeamsEnabled || workspaceYoloEnabled || workspaceDesignFlowEnabled
+    return hasAnyOverride
+      ? { ...defaultSessionOptions, agentTeamsEnabled: !!workspaceAgentTeamsEnabled, yoloModeEnabled: !!workspaceYoloEnabled, designFlowEnabled: !!workspaceDesignFlowEnabled }
       : defaultSessionOptions
-  ), [workspaceAgentTeamsEnabled])
+  }, [workspaceAgentTeamsEnabled, workspaceYoloEnabled, workspaceDesignFlowEnabled])
 
   const options = sessionOptions.get(sessionId) ?? effectiveDefaults
 

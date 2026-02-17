@@ -25,6 +25,9 @@ export interface HealthMonitorConfig {
   checkIntervalMs: number;
   /** Context window usage percentage that triggers a warning. Default: 0.85 (85%) */
   contextWarningThreshold: number;
+  /** Optional adaptive tool-call throttle config. When provided, teammate sessions
+   *  use TCP slow-start / AIMD congestion control to prevent retry storms proactively. */
+  throttle?: Partial<import('./tool-call-throttle.ts').ThrottleConfig>;
 }
 
 export const DEFAULT_HEALTH_CONFIG: HealthMonitorConfig = {
@@ -39,7 +42,10 @@ export const DEFAULT_HEALTH_CONFIG: HealthMonitorConfig = {
 // Types
 // ============================================================
 
-export type HealthIssueType = 'stall' | 'error-loop' | 'retry-storm' | 'context-exhaustion';
+export type HealthIssueType = 'stall' | 'error-loop' | 'retry-storm' | 'retry-storm-throttle' | 'retry-storm-kill' | 'context-exhaustion';
+
+/** Implements REQ-B1: 3-stage retry storm escalation */
+export type RetryStormStage = 'none' | 'warned' | 'throttled' | 'killed';
 
 export interface HealthIssue {
   type: HealthIssueType;
@@ -50,6 +56,8 @@ export interface HealthIssue {
   detectedAt: string;
   /** How long the issue has persisted (ms) */
   duration?: number;
+  /** The tool that triggered the issue (for retry-storm events) */
+  toolName?: string;
 }
 
 export interface TeammateHealthState {
@@ -59,9 +67,15 @@ export interface TeammateHealthState {
   currentTaskId?: string;
   consecutiveErrors: number;
   lastErrorTool?: string;
-  recentToolCalls: Array<{ tool: string; input: string; timestamp: string }>;
+  recentToolCalls: Array<{ tool: string; input: string; normalizedInput: string; timestamp: string }>;
+  /** Phase 4a: Captured tool results so killed agents' partial work isn't fully lost */
+  recentToolResults: Array<{ tool: string; resultPreview: string; timestamp: string; isError: boolean }>;
   contextUsage?: number; // 0-1 percentage
   issues: HealthIssue[];
+  /** Implements REQ-B1: Current retry storm escalation stage */
+  retryStormStage: RetryStormStage;
+  /** Running count of similar consecutive tool calls for retry storm detection */
+  retryStormCount: number;
 }
 
 export interface TeammateActivity {
@@ -70,6 +84,8 @@ export interface TeammateActivity {
   toolInput?: string;
   error?: boolean;
   taskId?: string;
+  /** Phase 4a: Preview of tool result (for partial work recovery on kill) */
+  resultPreview?: string;
 }
 
 // ============================================================
@@ -204,9 +220,26 @@ export class TeammateHealthMonitor extends EventEmitter {
 
     // Track tool calls in the ring buffer
     if (activity.type === 'tool_call' && activity.toolName) {
+      const rawInput = activity.toolInput ?? '';
+      const normalizedInput = this.normalizeToolInput(rawInput, activity.toolName);
+
+      // Phase 1c: Smart retry-storm reset — if the agent changes tool or input,
+      // that's evidence they've changed approach. Reset escalation so they aren't
+      // punished for past storm behavior after course-correcting.
+      if (state.retryStormStage !== 'none' && state.recentToolCalls.length > 0) {
+        const lastCall = state.recentToolCalls[state.recentToolCalls.length - 1]!;
+        const isDifferentTool = lastCall.tool !== activity.toolName;
+        const isDifferentInput = !this.areInputsSimilar(lastCall.normalizedInput, normalizedInput);
+        if (isDifferentTool || isDifferentInput) {
+          state.retryStormStage = 'none';
+          state.retryStormCount = 0;
+        }
+      }
+
       state.recentToolCalls.push({
         tool: activity.toolName,
-        input: activity.toolInput ?? '',
+        input: rawInput,
+        normalizedInput,
         timestamp: now,
       });
 
@@ -216,7 +249,7 @@ export class TeammateHealthMonitor extends EventEmitter {
       }
     }
 
-    // Track consecutive errors
+    // Track consecutive errors + capture results for partial work recovery
     if (activity.type === 'tool_result') {
       if (activity.error && activity.toolName) {
         if (state.lastErrorTool === activity.toolName) {
@@ -229,6 +262,21 @@ export class TeammateHealthMonitor extends EventEmitter {
         // Successful result resets the error counter
         state.consecutiveErrors = 0;
         state.lastErrorTool = undefined;
+      }
+
+      // Phase 4a: Capture non-error tool results for partial work recovery.
+      // When an agent gets killed, these previews let us surface what they found.
+      if (activity.resultPreview && activity.toolName && !activity.error) {
+        state.recentToolResults.push({
+          tool: activity.toolName,
+          resultPreview: activity.resultPreview,
+          timestamp: now,
+          isError: !!activity.error,
+        });
+        // Keep only last N results (same cap as tool calls)
+        if (state.recentToolResults.length > MAX_RECENT_TOOL_CALLS) {
+          state.recentToolResults.splice(0, state.recentToolResults.length - MAX_RECENT_TOOL_CALLS);
+        }
       }
     }
   }
@@ -250,6 +298,13 @@ export class TeammateHealthMonitor extends EventEmitter {
   // ============================================================
   // Health Queries
   // ============================================================
+
+  /**
+   * Get the throttle config overrides (for creating ToolCallThrottle instances).
+   */
+  getThrottleConfig(): Partial<import('./tool-call-throttle.ts').ThrottleConfig> | undefined {
+    return this.config.throttle;
+  }
 
   /**
    * Get the current health state for a specific teammate.
@@ -335,34 +390,143 @@ export class TeammateHealthMonitor extends EventEmitter {
     }
   }
 
+  /** High-volume research tools that get higher retry storm thresholds */
+  private static readonly RESEARCH_TOOLS = new Set([
+    'WebSearch', 'WebFetch', 'Read', 'Grep', 'Glob',
+  ]);
+
   /**
-   * Check for retry storms: multiple similar tool calls in recent history.
+   * Implements REQ-B1: 3-stage retry storm escalation.
+   *
+   * Stage 1 (warn):     At threshold (5 normal / 10 research), emit 'retry-storm'
+   *                      with guidance message for the agent to try a different approach.
+   * Stage 2 (throttle): At threshold+3 (8 normal / 13 research), emit 'retry-storm-throttle'
+   *                      signaling the session layer should add a 30s delay.
+   * Stage 3 (kill):     At threshold+7 (12 normal / 17 research), emit 'retry-storm-kill'
+   *                      signaling the session layer should force-abort the teammate.
    */
   private checkRetryStorm(teamId: string, state: TeammateHealthState): void {
     const calls = state.recentToolCalls;
     if (calls.length < this.config.retryStormThreshold) return;
 
-    // Check the most recent N calls
-    const recentSlice = calls.slice(-this.config.retryStormThreshold);
-    const firstCall = recentSlice[0];
-    if (!firstCall) return;
+    // Count consecutive similar calls from the end
+    const lastCall = calls[calls.length - 1];
+    if (!lastCall) return;
 
-    // All calls must be the same tool with similar input (first 100 chars)
-    const firstTool = firstCall.tool;
-    const inputPrefix = firstCall.input.slice(0, 100);
-    const allSimilar = recentSlice.every(
-      (call) => call.tool === firstTool && call.input.slice(0, 100) === inputPrefix,
-    );
+    const lastTool = lastCall.tool;
+    const normalizedInput = lastCall.normalizedInput;
+    let similarCount = 0;
+    for (let i = calls.length - 1; i >= 0; i--) {
+      const call = calls[i]!;
+      if (call.tool === lastTool && this.areInputsSimilar(call.normalizedInput, normalizedInput)) {
+        similarCount++;
+      } else {
+        break;
+      }
+    }
 
-    if (allSimilar) {
+    // Research tools get higher thresholds to avoid false positives
+    const isResearchTool = TeammateHealthMonitor.RESEARCH_TOOLS.has(lastTool);
+    const warnThreshold = isResearchTool ? 10 : this.config.retryStormThreshold;
+    const throttleThreshold = warnThreshold + 3;
+    const killThreshold = warnThreshold + 7;
+
+    state.retryStormCount = similarCount;
+
+    if (similarCount >= killThreshold && state.retryStormStage !== 'killed') {
+      // Stage 3: Kill
+      state.retryStormStage = 'killed';
+      this.emitIssue(teamId, {
+        type: 'retry-storm-kill',
+        teammateId: state.teammateId,
+        teammateName: state.teammateName,
+        taskId: state.currentTaskId,
+        toolName: lastTool,
+        details: `${similarCount} similar calls to "${lastTool}" — force-aborting teammate (stage 3/3)`,
+        detectedAt: new Date().toISOString(),
+      });
+    } else if (similarCount >= throttleThreshold && state.retryStormStage !== 'throttled' && state.retryStormStage !== 'killed') {
+      // Stage 2: Throttle
+      state.retryStormStage = 'throttled';
+      this.emitIssue(teamId, {
+        type: 'retry-storm-throttle',
+        teammateId: state.teammateId,
+        teammateName: state.teammateName,
+        taskId: state.currentTaskId,
+        toolName: lastTool,
+        details: `${similarCount} similar calls to "${lastTool}" — throttling agent (stage 2/3). Try a completely different approach.`,
+        detectedAt: new Date().toISOString(),
+      });
+    } else if (similarCount >= warnThreshold && state.retryStormStage === 'none') {
+      // Stage 1: Warn
+      state.retryStormStage = 'warned';
       this.emitIssue(teamId, {
         type: 'retry-storm',
         teammateId: state.teammateId,
         teammateName: state.teammateName,
         taskId: state.currentTaskId,
-        details: `${recentSlice.length} similar calls to "${firstTool}" detected`,
+        toolName: lastTool,
+        details: `${similarCount} similar calls to "${lastTool}" — warning: try a different approach (stage 1/3)`,
         detectedAt: new Date().toISOString(),
       });
+    }
+  }
+
+  /**
+   * Normalize tool inputs so trivial formatting/query jitter doesn't evade retry-storm detection.
+   * Implements REQ-103: similarity-aware dedupe for repeated searches/fetches.
+   */
+  private normalizeToolInput(input: string, toolName: string): string {
+    let normalized = input.trim().toLowerCase();
+
+    // Collapse whitespace and strip punctuation noise
+    normalized = normalized.replace(/\s+/g, ' ');
+    normalized = normalized.replace(/[^\w\s:/?&.=+-]/g, ' ');
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+
+    // Remove common page/offset jitter tokens that often cause retry storms
+    if (toolName === 'WebSearch' || toolName === 'WebFetch') {
+      normalized = normalized
+        .replace(/\b(page|p|offset|start|cursor)\s*[:=]?\s*\d+\b/g, '')
+        .replace(/\b(recency|days?)\s*[:=]?\s*\d+\b/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    // Keep bounded memory footprint
+    return normalized.slice(0, 160);
+  }
+
+  /**
+   * Similarity check with fast token overlap fallback for near-duplicate prompts.
+   */
+  private areInputsSimilar(a: string, b: string): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+
+    const aTokens = new Set(a.split(/\s+/).filter(Boolean));
+    const bTokens = new Set(b.split(/\s+/).filter(Boolean));
+    if (aTokens.size === 0 || bTokens.size === 0) return false;
+
+    let overlap = 0;
+    for (const token of aTokens) {
+      if (bTokens.has(token)) overlap++;
+    }
+
+    const denom = Math.max(aTokens.size, bTokens.size);
+    return overlap / denom >= 0.85;
+  }
+
+  /**
+   * Reset the retry storm stage for a teammate.
+   * Now primarily triggered internally by recordActivity() when a tool change or
+   * input change is detected. Kept public for external callers (e.g., throttle system).
+   */
+  resetRetryStormStage(teamId: string, teammateId: string): void {
+    const state = this.states.get(teamId)?.get(teammateId);
+    if (state && state.retryStormStage !== 'none') {
+      state.retryStormStage = 'none';
+      state.retryStormCount = 0;
     }
   }
 
@@ -422,7 +586,10 @@ export class TeammateHealthMonitor extends EventEmitter {
         lastActivityAt: new Date().toISOString(),
         consecutiveErrors: 0,
         recentToolCalls: [],
+        recentToolResults: [],
         issues: [],
+        retryStormStage: 'none',
+        retryStormCount: 0,
       });
     }
 

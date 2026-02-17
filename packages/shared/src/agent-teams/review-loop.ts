@@ -27,8 +27,8 @@ import {
   formatSuccessReport,
   mergeQualityGateConfig,
   inferTaskType,
+  shouldSkipQualityGates,
 } from './quality-gates';
-import { shouldSkipQualityGates } from '@craft-agent/core/types';
 
 // ============================================================
 // Types
@@ -268,6 +268,33 @@ export class ReviewLoopOrchestrator extends EventEmitter {
     this.queue = this.queue.filter(q => q.teamId !== teamId);
   }
 
+  /**
+   * Evict completed/escalated review states to free memory.
+   * Implements H3: Auto-evict old review states to prevent unbounded growth.
+   * Removes terminal reviews older than maxAgeMs (default 1 hour).
+   * Trims cycle history to last 2 entries for remaining terminal reviews.
+   */
+  evictStaleReviews(maxAgeMs = 60 * 60 * 1000): number {
+    let evicted = 0;
+    const now = Date.now();
+    const terminalStatuses = new Set(['passed', 'escalated', 'failed']);
+
+    for (const [taskId, review] of this.reviews.entries()) {
+      if (!terminalStatuses.has(review.status)) continue;
+
+      const startTime = review.startedAt ? new Date(review.startedAt).getTime() : 0;
+      if (now - startTime > maxAgeMs) {
+        this.reviews.delete(taskId);
+        evicted++;
+      } else if (review.cycleHistory.length > 2) {
+        // Trim cycle history to last 2 entries to save memory
+        review.cycleHistory = review.cycleHistory.slice(-2);
+      }
+    }
+
+    return evicted;
+  }
+
   // ============================================================
   // Core Review Loop
   // ============================================================
@@ -448,22 +475,8 @@ export class ReviewLoopOrchestrator extends EventEmitter {
         escalationReport = 'Escalation failed — manual review required.';
       }
 
-      // Send escalation diagnosis to teammate as a last attempt
-      const feedback = [
-        `## Quality Gate Review — ESCALATED (${review.cycleCount}/${review.maxCycles} cycles exhausted)`,
-        '',
-        `Your work has been reviewed ${review.cycleCount} times and has not passed. A more capable model has analyzed the persistent issues:`,
-        '',
-        escalationReport,
-        '',
-        '---',
-        'Please apply these fixes. If the issues persist, the task will be flagged for manual intervention.',
-      ].join('\n');
-
-      await this.callbacks.sendFeedback(teamId, review.teammateId, feedback);
-
-      // Return task to in_progress for one final attempt after escalation
-      this.callbacks.updateTaskStatus(teamId, taskId, 'in_progress', review.teammateId);
+      // Mark task completed after escalation — bypass review loop to prevent infinite re-enqueue
+      this.callbacks.updateTaskStatus(teamId, taskId, 'completed', review.teammateId, { bypassReviewLoop: true });
 
       await this.callbacks.auditLog?.({
         type: 'escalation-completed',

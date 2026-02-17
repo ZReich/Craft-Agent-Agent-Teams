@@ -46,5 +46,6 @@ export function stripPathPrefix(filePath: string, prefix: string): string {
   if (normalizedFile.startsWith(normalizedPrefix + '/')) {
     return normalizedFile.slice(normalizedPrefix.length + 1);
   }
-  return filePath;
+  // BUG-010 fix: Return normalized path for consistent forward-slash output
+  return normalizedFile;
 }
