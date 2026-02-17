@@ -433,8 +433,17 @@ teamPhases: Map<string, TeamPhase[]>              // Team → phase definitions
 yoloOrchestrators: Map<string, YoloOrchestrator> // Team → YOLO instance
 teamStateStores: Map<string, TeamStateStore>      // Team → persistence
 qualityGateResults: Map<string, Map<string, QualityGateResult>>  // Team → per-teammate QG results
+taskCompletionContracts: Map<string, Map<string, TaskCompletionContract>> // Team → task → required artifacts
 reviewLoop: ReviewLoopOrchestrator | null         // Attached QG pipeline
 ```
+
+### Completion Contracts (artifact gates)
+
+`AgentTeamManager.createTask()` supports optional completion contracts (`requiredArtifacts`).
+When a task is marked `completed`, manager validates that required artifact files exist
+(and are non-empty by default). If validation fails, completion is rejected and task is marked `failed`.
+
+This provides deterministic handoff gating for research/planning tasks that skip code quality gates.
 
 ### Resource Limits
 

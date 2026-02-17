@@ -529,6 +529,10 @@ export class AppServerClient extends EventEmitter {
     return this.process !== null && this.initialized;
   }
 
+  private createNotConnectedError(operation: string): Error {
+    return new Error(`Not connected (${operation}, state=${this.connectionState})`);
+  }
+
   // ============================================================
   // JSON-RPC Protocol
   // ============================================================
@@ -538,7 +542,7 @@ export class AppServerClient extends EventEmitter {
    */
   async request<T>(method: string, params?: unknown): Promise<T> {
     if (!this.process?.stdin?.writable) {
-      throw new Error('Not connected');
+      throw this.createNotConnectedError(`request:${method}`);
     }
 
     const id = String(this.nextRequestId++);
@@ -597,7 +601,7 @@ export class AppServerClient extends EventEmitter {
    */
   async notify(method: string, params?: unknown): Promise<void> {
     if (!this.process?.stdin?.writable) {
-      throw new Error('Not connected');
+      throw this.createNotConnectedError(`notify:${method}`);
     }
 
     const notification: JsonRpcNotification = {
@@ -616,7 +620,7 @@ export class AppServerClient extends EventEmitter {
    */
   async respond(id: RequestId, result: unknown): Promise<void> {
     if (!this.process?.stdin?.writable) {
-      throw new Error('Not connected');
+      throw this.createNotConnectedError(`respond:${String(id)}`);
     }
 
     const response: JsonRpcResponse = {

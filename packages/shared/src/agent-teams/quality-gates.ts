@@ -31,6 +31,34 @@ export const DEFAULT_QUALITY_GATE_CONFIG: QualityGateConfig = {
   baselineAwareTests: true,
   knownFailingTests: [],
   testScope: 'affected',
+  maxParallelReviews: 2, // REQ-NEXT-005
+  useCombinedReview: true, // REQ-NEXT-012
+  deterministicAnchors: {
+    enabled: true,
+    weight: 0.3,
+  },
+  // REQ-NEXT-013: low-risk AI bypass defaults (configurable per workspace)
+  bypass: {
+    enabled: true,
+    architecture: {
+      maxDiffLines: 50,
+      maxFilesChanged: 2,
+      allowNewFiles: false,
+      defaultScore: 90,
+    },
+    simplicity: {
+      maxDiffLines: 100,
+      maxFunctionLines: 50,
+      defaultScore: 90,
+    },
+    errors: {
+      maxDiffLines: 50,
+      requirePassingTests: true,
+      minTestCount: 1,
+      disallowAsyncAwait: true,
+      defaultScore: 90,
+    },
+  },
   reviewModel: 'claude-opus-4-6',
   reviewProvider: 'anthropic',
   escalationModel: 'claude-opus-4-6',
@@ -306,9 +334,54 @@ export function mergeQualityGateConfig(
     }
   }
 
+  // Deep-merge bypass config (REQ-NEXT-013)
+  if (userConfig.bypass) {
+    const defaultBypass = DEFAULT_QUALITY_GATE_CONFIG.bypass;
+    const userBypass = userConfig.bypass;
+    merged.bypass = {
+      enabled: userBypass.enabled ?? defaultBypass?.enabled ?? true,
+      architecture: {
+        maxDiffLines: userBypass.architecture?.maxDiffLines ?? defaultBypass?.architecture?.maxDiffLines ?? 50,
+        maxFilesChanged: userBypass.architecture?.maxFilesChanged ?? defaultBypass?.architecture?.maxFilesChanged ?? 2,
+        allowNewFiles: userBypass.architecture?.allowNewFiles ?? defaultBypass?.architecture?.allowNewFiles ?? false,
+        defaultScore: userBypass.architecture?.defaultScore ?? defaultBypass?.architecture?.defaultScore ?? 90,
+      },
+      simplicity: {
+        maxDiffLines: userBypass.simplicity?.maxDiffLines ?? defaultBypass?.simplicity?.maxDiffLines ?? 100,
+        maxFunctionLines: userBypass.simplicity?.maxFunctionLines ?? defaultBypass?.simplicity?.maxFunctionLines ?? 50,
+        defaultScore: userBypass.simplicity?.defaultScore ?? defaultBypass?.simplicity?.defaultScore ?? 90,
+      },
+      errors: {
+        maxDiffLines: userBypass.errors?.maxDiffLines ?? defaultBypass?.errors?.maxDiffLines ?? 50,
+        requirePassingTests: userBypass.errors?.requirePassingTests ?? defaultBypass?.errors?.requirePassingTests ?? true,
+        minTestCount: userBypass.errors?.minTestCount ?? defaultBypass?.errors?.minTestCount ?? 1,
+        disallowAsyncAwait: userBypass.errors?.disallowAsyncAwait ?? defaultBypass?.errors?.disallowAsyncAwait ?? true,
+        defaultScore: userBypass.errors?.defaultScore ?? defaultBypass?.errors?.defaultScore ?? 90,
+      },
+    };
+  }
+
+  // REQ-NEXT-003: deterministic anchor blend defaults + clamped weight
+  if (userConfig.deterministicAnchors) {
+    merged.deterministicAnchors = {
+      enabled: userConfig.deterministicAnchors.enabled ?? DEFAULT_QUALITY_GATE_CONFIG.deterministicAnchors?.enabled ?? true,
+      weight: userConfig.deterministicAnchors.weight ?? DEFAULT_QUALITY_GATE_CONFIG.deterministicAnchors?.weight ?? 0.3,
+    };
+  } else if (!merged.deterministicAnchors) {
+    merged.deterministicAnchors = { ...(DEFAULT_QUALITY_GATE_CONFIG.deterministicAnchors ?? { enabled: true, weight: 0.3 }) };
+  }
+  if (merged.deterministicAnchors) {
+    merged.deterministicAnchors.weight = Math.min(0.6, Math.max(0, merged.deterministicAnchors.weight));
+  }
+
   // Clamp pass threshold to avoid impossible settings
   if (typeof merged.passThreshold === 'number') {
     merged.passThreshold = Math.min(95, Math.max(70, merged.passThreshold));
+  }
+  if (typeof merged.maxParallelReviews === 'number') {
+    merged.maxParallelReviews = Math.min(6, Math.max(1, Math.round(merged.maxParallelReviews)));
+  } else {
+    merged.maxParallelReviews = DEFAULT_QUALITY_GATE_CONFIG.maxParallelReviews ?? 2;
   }
 
   // If a review model was set without an explicit provider, infer it

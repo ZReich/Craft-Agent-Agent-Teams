@@ -72,6 +72,8 @@ export type {
   TestStageResult,
   QualityGateResult,
   QualityGateStageConfig,
+  QualityGateBypassConfig,
+  QualityGateBypassOverrides,
   QualityGateConfig,
   TaskType,
   TDDPhase,

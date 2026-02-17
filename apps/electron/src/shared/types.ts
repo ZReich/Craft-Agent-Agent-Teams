@@ -1542,7 +1542,22 @@ export interface ElectronAPI {
   getYoloState(teamId: string): Promise<YoloState | null>
 
   // Team State Persistence (REQ-002)
-  getPersistedTeamState(leadSessionId: string): Promise<{ messages: TeammateMessage[]; tasks: TeamTask[]; activity: TeamActivityEvent[]; qualityGates?: Record<string, QualityGateResult>; yoloState?: YoloState | null } | null>
+  getPersistedTeamState(leadSessionId: string): Promise<{
+    messages: TeammateMessage[]
+    tasks: TeamTask[]
+    activity: TeamActivityEvent[]
+    knowledge?: Array<{
+      id: string
+      type: string
+      content: string
+      source: string
+      filePaths?: string[]
+      tags: string[]
+      timestamp: number
+    }>
+    qualityGates?: Record<string, QualityGateResult>
+    yoloState?: YoloState | null
+  } | null>
 
   // SDD
   getSDDState(sessionId: string): Promise<{ sddEnabled: boolean; activeSpecId?: string; sddComplianceReports: SpecComplianceReport[] }>
@@ -1649,6 +1664,22 @@ export interface WorkspaceSettings {
   qualityGatesKnownFailingTests?: string[]
   /** Test scope for per-task quality gates: 'affected' (vitest --changed), 'full' (entire suite), 'none' (skip tests) */
   qualityGatesTestScope?: 'affected' | 'full' | 'none'
+  /** Run stages 3-6 via a single combined AI call (REQ-NEXT-012) */
+  qualityGatesUseCombinedReview?: boolean
+  /** Enable confidence-based bypass for low-risk AI stages (REQ-NEXT-013) */
+  qualityGatesBypassEnabled?: boolean
+  qualityGatesBypassArchMaxDiffLines?: number
+  qualityGatesBypassArchMaxFilesChanged?: number
+  qualityGatesBypassArchAllowNewFiles?: boolean
+  qualityGatesBypassArchDefaultScore?: number
+  qualityGatesBypassSimplicityMaxDiffLines?: number
+  qualityGatesBypassSimplicityMaxFunctionLines?: number
+  qualityGatesBypassSimplicityDefaultScore?: number
+  qualityGatesBypassErrorsMaxDiffLines?: number
+  qualityGatesBypassErrorsRequirePassingTests?: boolean
+  qualityGatesBypassErrorsMinTestCount?: number
+  qualityGatesBypassErrorsDisallowAsyncAwait?: boolean
+  qualityGatesBypassErrorsDefaultScore?: number
   qualityGatesSyntaxEnabled?: boolean
   qualityGatesTestsEnabled?: boolean
   qualityGatesArchEnabled?: boolean

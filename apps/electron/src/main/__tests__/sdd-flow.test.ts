@@ -22,7 +22,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   AbortError: class AbortError extends Error {},
 }));
 
-import { SessionManager, buildTeammatePromptWithCompactSpec } from '../sessions';
+import { SessionManager, buildTeammatePromptWithCompactSpec, parseSpecMarkdown } from '../sessions';
 
 describe('SDD auto-spec + compact-spec', () => {
   it('creates an active spec when missing', async () => {
@@ -96,4 +96,39 @@ describe('SDD auto-spec + compact-spec', () => {
     expect(prompt).not.toContain('TOOL BUDGETS');
     expect(prompt).toContain('TEAM COMPLETION PROTOCOL (MANDATORY)');
   });
+
+  it('parses non-numeric requirement IDs from Requirements section', () => {
+    const markdown = [
+      '# Fix Spec',
+      '',
+      '**DRI:** Test',
+      '',
+      '## Requirements',
+      '- **REQ-FIX-001 (high, status: implemented):** Progressive header parsing',
+      '- **REQ-FIX-002 (medium):** Cap compliance reports',
+    ].join('\n')
+
+    const parsed = parseSpecMarkdown(markdown, '/tmp/spec.md')
+    expect(parsed.requirements.map(r => r.id)).toEqual(['REQ-FIX-001', 'REQ-FIX-002'])
+    expect(parsed.requirements[0].status).toBe('implemented')
+  })
+
+  it('parses plan-style requirement headings when Requirements section is absent', () => {
+    const markdown = [
+      '# Plan',
+      '',
+      '### 1. REQ-FIX-001: Dynamic header reading in jsonl.ts',
+      '### 2. REQ-FIX-002: Cap sddComplianceReports in header',
+      '### 3. REQ-FIX-003: Improve warning logs in listSessions',
+      '### 4. REQ-FIX-004: Add regression test',
+    ].join('\n')
+
+    const parsed = parseSpecMarkdown(markdown, '/tmp/plan.md')
+    expect(parsed.requirements.map(r => r.id)).toEqual([
+      'REQ-FIX-001',
+      'REQ-FIX-002',
+      'REQ-FIX-003',
+      'REQ-FIX-004',
+    ])
+  })
 });

@@ -134,7 +134,7 @@ function getProvider(model: string): string {
 }
 
 export default function AgentTeamsSettingsPage() {
-  const { activeWorkspaceId, llmConnections } = useAppShellContext()
+  const { activeWorkspaceId, llmConnections, onWorkspaceFeatureFlagsChange } = useAppShellContext()
   const electronAPI = window.electronAPI as any
 
   // Implements REQ-004: keep settings navigation resilient if Agent Teams IPC/preload is unavailable.
@@ -372,6 +372,8 @@ export default function AgentTeamsSettingsPage() {
   const handleTeamsToggle = useCallback(
     async (enabled: boolean) => {
       setTeamsEnabled(enabled)
+      // Update App.tsx state so Session Controls dropdown reflects the change immediately
+      onWorkspaceFeatureFlagsChange?.({ agentTeamsEnabled: enabled })
       if (!hasAgentTeamsSettingsApi || !activeWorkspaceId) return
       try {
         await electronAPI.setAgentTeamsEnabled(activeWorkspaceId, enabled)
@@ -379,7 +381,7 @@ export default function AgentTeamsSettingsPage() {
         console.error('Failed to toggle agent teams:', error)
       }
     },
-    [activeWorkspaceId, hasAgentTeamsSettingsApi]
+    [activeWorkspaceId, hasAgentTeamsSettingsApi, onWorkspaceFeatureFlagsChange]
   )
 
   // Preset change handler
@@ -677,8 +679,10 @@ export default function AgentTeamsSettingsPage() {
   const handleDesignFlowToggle = useCallback((enabled: boolean) => {
     setDesignFlowEnabled(enabled)
     saveSetting('designFlowEnabled', enabled)
+    // Update App.tsx state so Session Controls dropdown reflects the change immediately
+    onWorkspaceFeatureFlagsChange?.({ designFlowEnabled: enabled })
     if (enabled) loadDesignTemplates()
-  }, [saveSetting, loadDesignTemplates])
+  }, [saveSetting, loadDesignTemplates, onWorkspaceFeatureFlagsChange])
 
   const handleDesignFlowVariantsChange = useCallback((value: string) => {
     const count = parseInt(value) as 2 | 4 | 6
@@ -702,7 +706,9 @@ export default function AgentTeamsSettingsPage() {
     const m = mode as 'off' | 'fixed' | 'smart'
     setYoloMode(m)
     saveSetting('yoloMode', m)
-  }, [saveSetting])
+    // Update App.tsx state so Session Controls dropdown reflects the change immediately
+    onWorkspaceFeatureFlagsChange?.({ yoloEnabled: m !== 'off' })
+  }, [saveSetting, onWorkspaceFeatureFlagsChange])
 
   const handleYoloCostCapBlur = useCallback(() => {
     const parsed = parseFloat(yoloCostCapUsd)

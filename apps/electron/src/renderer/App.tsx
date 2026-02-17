@@ -1006,6 +1006,14 @@ export default function App() {
     // ultrathinkEnabled is UI-only (single-shot), no backend persistence needed
   }, [workspaceAgentTeamsEnabled])
 
+  // Callback for settings pages to update workspace-level feature flags in real-time
+  // Fixes: toggles in Session Controls not appearing until app restart after settings change
+  const handleWorkspaceFeatureFlagsChange = useCallback((flags: { agentTeamsEnabled?: boolean; yoloEnabled?: boolean; designFlowEnabled?: boolean }) => {
+    if (flags.agentTeamsEnabled !== undefined) setWorkspaceAgentTeamsEnabled(flags.agentTeamsEnabled)
+    if (flags.yoloEnabled !== undefined) setWorkspaceYoloEnabled(flags.yoloEnabled)
+    if (flags.designFlowEnabled !== undefined) setWorkspaceDesignFlowEnabled(flags.designFlowEnabled)
+  }, [])
+
   // Handle input draft changes per session with debounced persistence
   const draftSaveTimeoutRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
@@ -1288,6 +1296,7 @@ export default function App() {
     workspaceAgentTeamsEnabled,
     workspaceYoloEnabled,
     workspaceDesignFlowEnabled,
+    onWorkspaceFeatureFlagsChange: handleWorkspaceFeatureFlagsChange,
     // Session callbacks
     onCreateSession: handleCreateSession,
     onSendMessage: handleSendMessage,
@@ -1334,6 +1343,7 @@ export default function App() {
     workspaceAgentTeamsEnabled,
     workspaceYoloEnabled,
     workspaceDesignFlowEnabled,
+    handleWorkspaceFeatureFlagsChange,
     handleCreateSession,
     handleSendMessage,
     handleRenameSession,

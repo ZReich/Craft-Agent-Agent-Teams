@@ -403,6 +403,9 @@ export function listSessions(workspaceRootPath: string): SessionMetadata[] {
           const metadata = headerToMetadata(header, workspaceRootPath);
           if (metadata) sessions.push(metadata);
         } else {
+          // Implements REQ-FIX-003: Log specific session ID for failed header reads
+          // so the issue is visible in logs (previously only a count was logged via debug).
+          console.warn(`[sessions] Failed to read header for session "${sessionId}" — possible oversized or corrupted header`);
           skippedHeaders++;
         }
       }

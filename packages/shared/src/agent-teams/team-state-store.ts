@@ -11,6 +11,7 @@
  *   {"t":"msg","d":<TeammateMessage>}
  *   {"t":"task","d":<TeamTask>}
  *   {"t":"act","d":<TeamActivityEvent>}
+ *   {"t":"kb","d":<KnowledgeEntry>}
  */
 
 import { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
@@ -22,6 +23,7 @@ import type {
   QualityGateResult,
   YoloState,
 } from '@craft-agent/core/types';
+import type { KnowledgeEntry } from './team-knowledge-bus';
 
 // ============================================================
 // Types
@@ -29,10 +31,10 @@ import type {
 
 // BUG-020 fix: Extended entry types for quality gates and YOLO state
 interface TeamStateEntry {
-  /** Type tag: msg = message, task = task, act = activity, qg = quality gate, yolo = YOLO state */
-  t: 'msg' | 'task' | 'act' | 'qg' | 'yolo';
+  /** Type tag: msg = message, task = task, act = activity, qg = quality gate, yolo = YOLO state, kb = team knowledge entry */
+  t: 'msg' | 'task' | 'act' | 'qg' | 'yolo' | 'kb';
   /** Payload */
-  d: TeammateMessage | TeamTask | TeamActivityEvent | QualityGateResult | YoloState;
+  d: TeammateMessage | TeamTask | TeamActivityEvent | QualityGateResult | YoloState | KnowledgeEntry;
   /** Optional key for keyed entries (e.g., teammate session ID for quality gates) */
   k?: string;
 }
@@ -41,6 +43,7 @@ export interface TeamState {
   messages: TeammateMessage[];
   tasks: TeamTask[];
   activity: TeamActivityEvent[];
+  knowledge: KnowledgeEntry[];
   qualityGates: Map<string, QualityGateResult>;
   yoloState: YoloState | null;
 }
@@ -70,6 +73,10 @@ export class TeamStateStore {
     this.appendEntry({ t: 'act', d: event });
   }
 
+  appendKnowledge(entry: KnowledgeEntry): void {
+    this.appendEntry({ t: 'kb', d: entry });
+  }
+
   // BUG-020 fix: Persist quality gate results
   appendQualityGate(teammateSessionId: string, result: QualityGateResult): void {
     this.appendEntry({ t: 'qg', d: result, k: teammateSessionId });
@@ -83,7 +90,7 @@ export class TeamStateStore {
   // ── Load All State ──────────────────────────────────────────
 
   load(): TeamState {
-    const result: TeamState = { messages: [], tasks: [], activity: [], qualityGates: new Map(), yoloState: null };
+    const result: TeamState = { messages: [], tasks: [], activity: [], knowledge: [], qualityGates: new Map(), yoloState: null };
 
     if (!existsSync(this.filePath)) {
       return result;
@@ -122,6 +129,9 @@ export class TeamStateStore {
         }
         case 'act':
           result.activity.push(entry.d as TeamActivityEvent);
+          break;
+        case 'kb':
+          result.knowledge.push(entry.d as KnowledgeEntry);
           break;
         // BUG-020 fix: Load quality gate and YOLO state
         case 'qg':
@@ -164,6 +174,9 @@ export class TeamStateStore {
     }
     for (const act of state.activity) {
       lines.push(JSON.stringify({ t: 'act', d: act }));
+    }
+    for (const kb of state.knowledge) {
+      lines.push(JSON.stringify({ t: 'kb', d: kb }));
     }
     // BUG-020 fix: Persist quality gates and YOLO state during compaction
     for (const [k, qg] of state.qualityGates) {

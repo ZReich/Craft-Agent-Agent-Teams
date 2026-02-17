@@ -186,6 +186,10 @@ Key modules: `quality-gates.ts`, `review-loop.ts`, `integration-gate.ts`, `healt
 
 Team lifecycle is managed by `AgentTeamManager` in `src/agent/agent-team-manager.ts`.
 
+Recent reliability hardening:
+- Explore mode now allows agent-team control-plane session tools (`Task`, `SendMessage`, `TeamCreate`, `TeamDelete`) while still blocking source/auth mutation tools.
+- `AgentTeamManager` now supports per-task completion contracts (`requiredArtifacts`) so task completion can be blocked when required handoff artifacts are missing.
+
 ## Dependencies
 
 - `@craft-agent/core` - Shared types

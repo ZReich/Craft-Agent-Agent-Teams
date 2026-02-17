@@ -67,7 +67,7 @@ export interface TeammateHealthState {
   currentTaskId?: string;
   consecutiveErrors: number;
   lastErrorTool?: string;
-  recentToolCalls: Array<{ tool: string; input: string; timestamp: string }>;
+  recentToolCalls: Array<{ tool: string; input: string; normalizedInput: string; timestamp: string }>;
   /** Phase 4a: Captured tool results so killed agents' partial work isn't fully lost */
   recentToolResults: Array<{ tool: string; resultPreview: string; timestamp: string; isError: boolean }>;
   contextUsage?: number; // 0-1 percentage
@@ -220,7 +220,8 @@ export class TeammateHealthMonitor extends EventEmitter {
 
     // Track tool calls in the ring buffer
     if (activity.type === 'tool_call' && activity.toolName) {
-      const inputPrefix = (activity.toolInput ?? '').slice(0, 100);
+      const rawInput = activity.toolInput ?? '';
+      const normalizedInput = this.normalizeToolInput(rawInput, activity.toolName);
 
       // Phase 1c: Smart retry-storm reset — if the agent changes tool or input,
       // that's evidence they've changed approach. Reset escalation so they aren't
@@ -228,7 +229,7 @@ export class TeammateHealthMonitor extends EventEmitter {
       if (state.retryStormStage !== 'none' && state.recentToolCalls.length > 0) {
         const lastCall = state.recentToolCalls[state.recentToolCalls.length - 1]!;
         const isDifferentTool = lastCall.tool !== activity.toolName;
-        const isDifferentInput = lastCall.input.slice(0, 100) !== inputPrefix;
+        const isDifferentInput = !this.areInputsSimilar(lastCall.normalizedInput, normalizedInput);
         if (isDifferentTool || isDifferentInput) {
           state.retryStormStage = 'none';
           state.retryStormCount = 0;
@@ -237,7 +238,8 @@ export class TeammateHealthMonitor extends EventEmitter {
 
       state.recentToolCalls.push({
         tool: activity.toolName,
-        input: activity.toolInput ?? '',
+        input: rawInput,
+        normalizedInput,
         timestamp: now,
       });
 
@@ -412,11 +414,11 @@ export class TeammateHealthMonitor extends EventEmitter {
     if (!lastCall) return;
 
     const lastTool = lastCall.tool;
-    const inputPrefix = lastCall.input.slice(0, 100);
+    const normalizedInput = lastCall.normalizedInput;
     let similarCount = 0;
     for (let i = calls.length - 1; i >= 0; i--) {
       const call = calls[i]!;
-      if (call.tool === lastTool && call.input.slice(0, 100) === inputPrefix) {
+      if (call.tool === lastTool && this.areInputsSimilar(call.normalizedInput, normalizedInput)) {
         similarCount++;
       } else {
         break;
@@ -468,6 +470,51 @@ export class TeammateHealthMonitor extends EventEmitter {
         detectedAt: new Date().toISOString(),
       });
     }
+  }
+
+  /**
+   * Normalize tool inputs so trivial formatting/query jitter doesn't evade retry-storm detection.
+   * Implements REQ-103: similarity-aware dedupe for repeated searches/fetches.
+   */
+  private normalizeToolInput(input: string, toolName: string): string {
+    let normalized = input.trim().toLowerCase();
+
+    // Collapse whitespace and strip punctuation noise
+    normalized = normalized.replace(/\s+/g, ' ');
+    normalized = normalized.replace(/[^\w\s:/?&.=+-]/g, ' ');
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+
+    // Remove common page/offset jitter tokens that often cause retry storms
+    if (toolName === 'WebSearch' || toolName === 'WebFetch') {
+      normalized = normalized
+        .replace(/\b(page|p|offset|start|cursor)\s*[:=]?\s*\d+\b/g, '')
+        .replace(/\b(recency|days?)\s*[:=]?\s*\d+\b/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    // Keep bounded memory footprint
+    return normalized.slice(0, 160);
+  }
+
+  /**
+   * Similarity check with fast token overlap fallback for near-duplicate prompts.
+   */
+  private areInputsSimilar(a: string, b: string): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+
+    const aTokens = new Set(a.split(/\s+/).filter(Boolean));
+    const bTokens = new Set(b.split(/\s+/).filter(Boolean));
+    if (aTokens.size === 0 || bTokens.size === 0) return false;
+
+    let overlap = 0;
+    for (const token of aTokens) {
+      if (bTokens.has(token)) overlap++;
+    }
+
+    const denom = Math.max(aTokens.size, bTokens.size);
+    return overlap / denom >= 0.85;
   }
 
   /**

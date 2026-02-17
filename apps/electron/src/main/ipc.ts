@@ -1889,6 +1889,20 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       qualityGatesBaselineAwareTests: qg?.baselineAwareTests ?? true,
       qualityGatesKnownFailingTests: qg?.knownFailingTests ?? [],
       qualityGatesTestScope: qg?.testScope ?? 'affected',
+      qualityGatesUseCombinedReview: qg?.useCombinedReview ?? true,
+      qualityGatesBypassEnabled: qg?.bypass?.enabled ?? true,
+      qualityGatesBypassArchMaxDiffLines: qg?.bypass?.architecture?.maxDiffLines ?? 50,
+      qualityGatesBypassArchMaxFilesChanged: qg?.bypass?.architecture?.maxFilesChanged ?? 2,
+      qualityGatesBypassArchAllowNewFiles: qg?.bypass?.architecture?.allowNewFiles ?? false,
+      qualityGatesBypassArchDefaultScore: qg?.bypass?.architecture?.defaultScore ?? 90,
+      qualityGatesBypassSimplicityMaxDiffLines: qg?.bypass?.simplicity?.maxDiffLines ?? 100,
+      qualityGatesBypassSimplicityMaxFunctionLines: qg?.bypass?.simplicity?.maxFunctionLines ?? 50,
+      qualityGatesBypassSimplicityDefaultScore: qg?.bypass?.simplicity?.defaultScore ?? 90,
+      qualityGatesBypassErrorsMaxDiffLines: qg?.bypass?.errors?.maxDiffLines ?? 50,
+      qualityGatesBypassErrorsRequirePassingTests: qg?.bypass?.errors?.requirePassingTests ?? true,
+      qualityGatesBypassErrorsMinTestCount: qg?.bypass?.errors?.minTestCount ?? 1,
+      qualityGatesBypassErrorsDisallowAsyncAwait: qg?.bypass?.errors?.disallowAsyncAwait ?? true,
+      qualityGatesBypassErrorsDefaultScore: qg?.bypass?.errors?.defaultScore ?? 90,
       qualityGatesSyntaxEnabled: qg?.stages?.syntax?.enabled ?? true,
       qualityGatesTestsEnabled: qg?.stages?.tests?.enabled ?? true,
       qualityGatesArchEnabled: qg?.stages?.architecture?.enabled ?? true,
@@ -1924,7 +1938,26 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const workspace = getWorkspaceOrThrow(workspaceId)
 
     // Validate key is a known workspace setting
-    const validKeys = ['name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel', 'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection', 'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel', 'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel', 'agentTeamsLeadThinking', 'agentTeamsHeadThinking', 'agentTeamsWorkerThinking', 'agentTeamsReviewerThinking', 'agentTeamsEscalationThinking', 'agentTeamsCostCapUsd', 'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD', 'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests', 'qualityGatesTestScope', 'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled', 'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled', 'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate', 'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage', 'sddAutoComplianceReports', 'sddDefaultSpecTemplate']
+    const validKeys = [
+      'name', 'model', 'enabledSourceSlugs', 'permissionMode', 'cyclablePermissionModes', 'thinkingLevel',
+      'workingDirectory', 'recentWorkingDirectories', 'localMcpEnabled', 'defaultLlmConnection',
+      'agentTeamsEnabled', 'agentTeamsModelPreset', 'agentTeamsLeadModel', 'agentTeamsHeadModel',
+      'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel',
+      'agentTeamsLeadThinking', 'agentTeamsHeadThinking', 'agentTeamsWorkerThinking',
+      'agentTeamsReviewerThinking', 'agentTeamsEscalationThinking', 'agentTeamsCostCapUsd',
+      'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD',
+      'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests',
+      'qualityGatesTestScope', 'qualityGatesUseCombinedReview',
+      'qualityGatesBypassEnabled',
+      'qualityGatesBypassArchMaxDiffLines', 'qualityGatesBypassArchMaxFilesChanged', 'qualityGatesBypassArchAllowNewFiles', 'qualityGatesBypassArchDefaultScore',
+      'qualityGatesBypassSimplicityMaxDiffLines', 'qualityGatesBypassSimplicityMaxFunctionLines', 'qualityGatesBypassSimplicityDefaultScore',
+      'qualityGatesBypassErrorsMaxDiffLines', 'qualityGatesBypassErrorsRequirePassingTests', 'qualityGatesBypassErrorsMinTestCount', 'qualityGatesBypassErrorsDisallowAsyncAwait', 'qualityGatesBypassErrorsDefaultScore',
+      'qualityGatesSyntaxEnabled', 'qualityGatesTestsEnabled', 'qualityGatesArchEnabled',
+      'qualityGatesSimplicityEnabled', 'qualityGatesErrorsEnabled', 'qualityGatesCompletenessEnabled',
+      'yoloMode', 'yoloCostCapUsd', 'yoloTimeoutMinutes', 'yoloMaxConcurrency', 'yoloAutoRemediate',
+      'yoloMaxRemediationRounds', 'sddEnabled', 'sddRequireDRIAssignment', 'sddRequireFullCoverage',
+      'sddAutoComplianceReports', 'sddDefaultSpecTemplate'
+    ]
     if (!validKeys.includes(key)) {
       throw new Error(`Invalid workspace setting key: ${key}. Valid keys: ${validKeys.join(', ')}`)
     }
@@ -2001,6 +2034,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         qualityGatesBaselineAwareTests: 'baselineAwareTests',
         qualityGatesKnownFailingTests: 'knownFailingTests',
         qualityGatesTestScope: 'testScope',
+        qualityGatesUseCombinedReview: 'useCombinedReview',
       }
 
       // Per-stage enabled toggles
@@ -2011,6 +2045,22 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         qualityGatesSimplicityEnabled: 'simplicity',
         qualityGatesErrorsEnabled: 'errors',
         qualityGatesCompletenessEnabled: 'completeness',
+      }
+
+      const qgBypassMap: Record<string, { stage: 'root' | 'architecture' | 'simplicity' | 'errors'; field: string; kind: 'number' | 'boolean' }> = {
+        qualityGatesBypassEnabled: { stage: 'root', field: 'enabled', kind: 'boolean' },
+        qualityGatesBypassArchMaxDiffLines: { stage: 'architecture', field: 'maxDiffLines', kind: 'number' },
+        qualityGatesBypassArchMaxFilesChanged: { stage: 'architecture', field: 'maxFilesChanged', kind: 'number' },
+        qualityGatesBypassArchAllowNewFiles: { stage: 'architecture', field: 'allowNewFiles', kind: 'boolean' },
+        qualityGatesBypassArchDefaultScore: { stage: 'architecture', field: 'defaultScore', kind: 'number' },
+        qualityGatesBypassSimplicityMaxDiffLines: { stage: 'simplicity', field: 'maxDiffLines', kind: 'number' },
+        qualityGatesBypassSimplicityMaxFunctionLines: { stage: 'simplicity', field: 'maxFunctionLines', kind: 'number' },
+        qualityGatesBypassSimplicityDefaultScore: { stage: 'simplicity', field: 'defaultScore', kind: 'number' },
+        qualityGatesBypassErrorsMaxDiffLines: { stage: 'errors', field: 'maxDiffLines', kind: 'number' },
+        qualityGatesBypassErrorsRequirePassingTests: { stage: 'errors', field: 'requirePassingTests', kind: 'boolean' },
+        qualityGatesBypassErrorsMinTestCount: { stage: 'errors', field: 'minTestCount', kind: 'number' },
+        qualityGatesBypassErrorsDisallowAsyncAwait: { stage: 'errors', field: 'disallowAsyncAwait', kind: 'boolean' },
+        qualityGatesBypassErrorsDefaultScore: { stage: 'errors', field: 'defaultScore', kind: 'number' },
       }
 
       if (key in qgTopLevelMap) {
@@ -2026,6 +2076,24 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         stages[stageName] = stages[stageName] || {}
         stages[stageName].enabled = Boolean(value)
         qg.stages = stages
+      } else if (key in qgBypassMap) {
+        const cfg = qgBypassMap[key]
+        const bypass = (qg.bypass || {}) as Record<string, unknown>
+        const normalizeValue = (raw: unknown) => {
+          if (cfg.kind === 'boolean') return Boolean(raw)
+          const num = Number(raw)
+          return Number.isFinite(num) ? num : raw
+        }
+
+        if (cfg.stage === 'root') {
+          bypass[cfg.field] = normalizeValue(value)
+        } else {
+          const stageCfg = (bypass[cfg.stage] || {}) as Record<string, unknown>
+          stageCfg[cfg.field] = normalizeValue(value)
+          bypass[cfg.stage] = stageCfg
+        }
+
+        qg.bypass = bypass
       }
 
       config.agentTeams.qualityGates = qg as typeof config.agentTeams.qualityGates
@@ -4444,6 +4512,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         messages: state.messages,
         tasks: state.tasks,
         activity: state.activity,
+        knowledge: state.knowledge,
         qualityGates,
         yoloState: state.yoloState,
       }

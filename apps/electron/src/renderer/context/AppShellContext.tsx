@@ -71,6 +71,8 @@ export interface AppShellContextType {
   workspaceYoloEnabled?: boolean
   /** Workspace-level Design Flow enabled — drives per-session toggle default (REQ-004) */
   workspaceDesignFlowEnabled?: boolean
+  /** Update workspace-level feature flags from settings pages (fixes stale state after toggle) */
+  onWorkspaceFeatureFlagsChange?: (flags: { agentTeamsEnabled?: boolean; yoloEnabled?: boolean; designFlowEnabled?: boolean }) => void
 
   // Session callbacks
   onCreateSession: (workspaceId: string, options?: import('../../shared/types').CreateSessionOptions) => Promise<Session>

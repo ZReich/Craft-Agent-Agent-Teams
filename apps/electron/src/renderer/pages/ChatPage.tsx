@@ -403,7 +403,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     const traceability = latestReport?.traceabilityMap ?? []
     const coverage = latestReport?.requirementsCoverage ?? []
 
-    const requirements: SpecRequirementSummary[] = spec?.requirements?.length
+    const requirementsFromSpec: SpecRequirementSummary[] = spec?.requirements?.length
       ? spec.requirements.map((req) => {
         const trace = traceability.find((t) => t.requirementId === req.id)
         // Implements REQ-SPEC-002: merge compliance report coverage into requirement status
@@ -422,7 +422,12 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
           linkedTestPatterns: trace?.tests ?? req.linkedTestPatterns,
         }
       })
-      : coverage.map((entry) => {
+      : []
+
+    const specRequirementIds = new Set(requirementsFromSpec.map((req) => req.id))
+    const requirementsOnlyInCoverage: SpecRequirementSummary[] = coverage
+      .filter((entry) => !specRequirementIds.has(entry.requirementId))
+      .map((entry) => {
         const trace = traceability.find((t) => t.requirementId === entry.requirementId)
         const status: SpecRequirementSummary['status'] = entry.coverage === 'full'
           ? 'verified'
@@ -439,15 +444,11 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
         }
       })
 
-    const traceabilityMap = traceability.length > 0
-      ? traceability
-      : (spec?.requirements ?? []).map((req) => ({
-        requirementId: req.id,
-        files: req.linkedFilePatterns ?? [],
-        tests: req.linkedTestPatterns ?? [],
-        tasks: req.linkedTaskIds ?? [],
-        tickets: [],
-      }))
+    const requirements: SpecRequirementSummary[] = [...requirementsFromSpec, ...requirementsOnlyInCoverage]
+
+    // Implements REQ-002: do not synthesize traceability from spec placeholders.
+    // Only render observed traceability reported by main process compliance generation.
+    const traceabilityMap = traceability
 
     setSpecRequirements(requirements)
     setSpecTraceabilityMap(traceabilityMap)

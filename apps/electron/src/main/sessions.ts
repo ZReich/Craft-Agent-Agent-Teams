@@ -93,6 +93,8 @@ import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
 import { resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/shared/agent-teams/model-resolution'
 import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
 import { YoloOrchestrator, mergeYoloConfig, decideSpawnStrategy, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
+import { selectArchitectureMode } from '@craft-agent/shared/agent-teams/architecture-selector'
+import { getLearningGuidance } from '@craft-agent/shared/agent-teams/learning-store'
 import { ReviewLoopOrchestrator, type ReviewLoopCallbacks, type ReviewLoopConfig } from '@craft-agent/shared/agent-teams/review-loop'
 import type { YoloConfig, YoloState } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
@@ -108,7 +110,7 @@ import { UsagePersistence, UsageAlertChecker } from '@craft-agent/shared/usage'
 import type { SessionUsage as PersistedSessionUsage, UsageAlert, UsageAlertThresholds } from '@craft-agent/core'
 import type { FSWatcher } from 'fs'
 import { HookSystem, type HookSystemMetadataSnapshot } from '@craft-agent/shared/hooks-simple'
-import { AgentTeamCompletionCoordinator, type AgentTeamCompletionContext } from './agent-team-completion-coordinator'
+import { AgentTeamCompletionCoordinator, type AgentTeamCompletionContext, type ReviewerQaVerdict } from './agent-team-completion-coordinator'
 
 // Import and re-export (extracted to avoid Electron dependency in tests)
 import { sanitizeForTitle } from './title-sanitizer'
@@ -244,6 +246,8 @@ const TEAM_ROLE_LEAD: TeamRole = 'lead'
 // The limit is enforced in createTeammateSession().
 const MAX_TEAMMATES_PER_TEAM = 10
 const MAX_TEAMMATE_MESSAGES = 500
+// Auto-replacement hardening: allow a single automatic worker restart per task fingerprint.
+const MAX_AUTO_REPLACEMENT_ATTEMPTS_PER_TASK = 1
 
 function toRuntimeTeamRole(role: TeamRole): TeamRole {
   // Keep runtime/storage canonicalized to legacy values for now, while accepting
@@ -440,6 +444,55 @@ function buildTeamDeliveryMetadata(options: {
   return `<details><summary>Delivery details</summary>\n\nstatus: delivered | output: ${options.outputPresent ? 'present' : 'empty'}\n\n</details>`
 }
 
+export function buildAutoReplacementAttemptKey(options: {
+  taskDescription?: string
+  taskTitle?: string
+  teammateRole?: TeamRole
+  teammateName?: string
+}): string {
+  const raw = options.taskDescription?.trim()
+    || options.taskTitle?.trim()
+    || `${options.teammateRole ?? 'worker'}:${options.teammateName ?? 'unknown'}`
+  return raw.toLowerCase().slice(0, 240)
+}
+
+export function buildAutoReplacementPrompt(options: {
+  originalPrompt: string
+  teammateName: string
+  failureReason: string
+  partialResults: string[]
+  attempt: number
+}): string {
+  const cleanedPrompt = options.originalPrompt.trim()
+  const partial = options.partialResults
+    .map(line => line.replace(/^\s*-\s*/, '').trim())
+    .filter(Boolean)
+    .slice(-5)
+  const sections = [
+    cleanedPrompt,
+    '',
+    '---',
+    '',
+    `System recovery note: Previous teammate "${options.teammateName}" was terminated (${options.failureReason}).`,
+    `This is auto-replacement attempt #${options.attempt}.`,
+    'Avoid repeating identical tool calls; synthesize existing evidence whenever possible.',
+  ]
+  if (partial.length > 0) {
+    sections.push(
+      '',
+      'Recovered partial findings:',
+      ...partial.map(item => `- ${item}`),
+    )
+  }
+  sections.push(
+    '',
+    'Completion requirements:',
+    '- Send a direct completion handoff to team-lead via SendMessage(type="message", recipient="team-lead").',
+    '- Include explicit evidence links and a clear PASS/FAIL recommendation if this is a review task.',
+  )
+  return sections.join('\n')
+}
+
 // teammateMatchesTargetName moved to ./teammate-codenames.ts for testability
 
 const execFileAsync = promisify(execFile)
@@ -532,6 +585,67 @@ function parseStatus(raw?: string): SpecRequirement['status'] {
   }
 }
 
+function normalizeRequirementId(raw: string): string {
+  return raw.trim().toUpperCase()
+}
+
+function parseRequirementLine(
+  line: string,
+  fallbackIndex: number,
+  ownerDRI: string,
+  acceptanceTests: string[],
+): SpecRequirement {
+  const trimmed = line.trim()
+
+  // Primary spec format:
+  // - **REQ-001 (medium, status: implemented):** Description
+  // Also supports non-numeric IDs such as REQ-FIX-004.
+  const boldPattern = /^\s*-\s*\*\*((REQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*(?:\(([^)]*)\))?)\s*:\*\*\s*(.+)$/i
+  const boldMatch = trimmed.match(boldPattern)
+  if (boldMatch) {
+    const metaParts = (boldMatch[3] ?? '')
+      .split(',')
+      .map(part => part.trim())
+      .filter(Boolean)
+    const priorityToken = metaParts.find(part => ['critical', 'high', 'medium', 'low'].includes(part.toLowerCase()))
+    const statusToken = metaParts.find(part => part.toLowerCase().startsWith('status:'))
+    const statusValue = statusToken ? statusToken.split(':').slice(1).join(':').trim() : undefined
+    return {
+      id: normalizeRequirementId(boldMatch[2]),
+      description: boldMatch[4].trim(),
+      priority: parsePriority(priorityToken),
+      acceptanceTests,
+      assignedDRI: ownerDRI,
+      status: parseStatus(statusValue),
+    }
+  }
+
+  // Fallback for plan-style headings:
+  // ### 1. REQ-FIX-001: Dynamic header reading ...
+  const headingPattern = /^\s{0,3}#{1,6}\s*(?:\d+\.?\s*)?(REQ-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*[:\-]\s*(.+)$/i
+  const headingMatch = trimmed.match(headingPattern)
+  if (headingMatch) {
+    return {
+      id: normalizeRequirementId(headingMatch[1]),
+      description: headingMatch[2].trim(),
+      priority: 'medium',
+      acceptanceTests,
+      assignedDRI: ownerDRI,
+      status: 'pending',
+    }
+  }
+
+  // Generic fallback: preserve legacy behavior.
+  return {
+    id: `REQ-${String(fallbackIndex + 1).padStart(3, '0')}`,
+    description: trimmed.replace(/^[\s*-]+/, ''),
+    priority: 'medium',
+    acceptanceTests,
+    assignedDRI: ownerDRI,
+    status: 'pending',
+  }
+}
+
 export function parseSpecMarkdown(markdown: string, specId: string): Spec {
   const lines = markdown.split(/\r?\n/)
   const titleLine = lines.find(line => line.trim().startsWith('# ')) ?? '# Untitled Spec'
@@ -555,31 +669,26 @@ export function parseSpecMarkdown(markdown: string, specId: string): Spec {
   const requirementLines = extractSectionLines(lines, '## Requirements')
     .map(line => line.trim())
     .filter(line => line.startsWith('-'))
-  const requirements: SpecRequirement[] = requirementLines.map((line, index) => {
-    const match = line.match(/\*\*(REQ-[0-9]+)\s*\(([^)]+)\):\*\*\s*(.+)$/i)
-    if (match) {
-      const metaParts = match[2].split(',').map(part => part.trim()).filter(Boolean)
-      const priorityToken = metaParts.find(part => ['critical', 'high', 'medium', 'low'].includes(part.toLowerCase()))
-      const statusToken = metaParts.find(part => part.toLowerCase().startsWith('status:'))
-      const statusValue = statusToken ? statusToken.split(':').slice(1).join(':').trim() : undefined
-      return {
-        id: match[1].trim(),
-        description: match[3].trim(),
-        priority: parsePriority(priorityToken ?? match[2]),
-        acceptanceTests,
-        assignedDRI: ownerDRI,
-        status: parseStatus(statusValue),
-      }
-    }
-    return {
-      id: `REQ-${String(index + 1).padStart(3, '0')}`,
-      description: line.replace(/^[\s*-]+/, ''),
-      priority: 'medium',
-      acceptanceTests,
-      assignedDRI: ownerDRI,
-      status: 'pending',
-    }
-  })
+  // Fallback for plan docs that don't use "## Requirements", but do include
+  // explicit REQ IDs in headings (e.g., "### 1. REQ-FIX-001: ...").
+  const fallbackRequirementLines = requirementLines.length > 0
+    ? requirementLines
+    : lines
+      .map(line => line.trim())
+      .filter(line => /^(?:#{1,6}\s*(?:\d+\.?\s*)?REQ-|-\s*\*\*REQ-)/i.test(line))
+
+  const parsedRequirements = fallbackRequirementLines
+    .map((line, index) => parseRequirementLine(line, index, ownerDRI, acceptanceTests))
+    .filter((req) => req.description.length > 0)
+
+  // Deduplicate by requirement ID (keep first occurrence).
+  const seenRequirementIds = new Set<string>()
+  const requirements: SpecRequirement[] = []
+  for (const req of parsedRequirements) {
+    if (seenRequirementIds.has(req.id)) continue
+    seenRequirementIds.add(req.id)
+    requirements.push(req)
+  }
 
   const risks: SpecRisk[] = riskLines.map((risk, index) => ({
     id: `RISK-${String(index + 1).padStart(3, '0')}`,
@@ -1442,10 +1551,22 @@ interface ManagedSession {
   teamLevelQgRunning?: boolean
   /** Persisted QG cycle count — survives app restarts */
   qgCycleCount?: number
+  /** REQ-NEXT-008: speculative quality artifact captured during active implementation. */
+  speculativeReviewDiff?: ReviewDiff | null
+  /** Fingerprint for speculative artifact validity checks/fallback. */
+  speculativeReviewFingerprint?: string
+  /** Capture timestamp for speculative artifact staleness checks. */
+  speculativeReviewCapturedAt?: number
   /** Guard: teammate results already relayed to lead — prevents duplicate deliveries */
   completionRelayed?: boolean
   /** Guard: "[System] All teammates completed" synthesis prompt already sent to lead */
   synthesisPromptSent?: boolean
+  /** Reviewer QA verdict parsed from latest reviewer handoff */
+  qaVerdict?: ReviewerQaVerdict
+  /** Guard: QA block warning already sent to lead (avoid spam) */
+  qaGateBlockedNotified?: boolean
+  /** Auto-replacement attempt counts keyed by task fingerprint */
+  autoReplacementAttempts?: Record<string, number>
   /** Implements REQ-A1: Count of teammate spawns queued but not yet kicked off.
    *  Prevents lead from emitting 'complete' before all teammates start. */
   pendingTeammateSpawns?: number
@@ -1678,6 +1799,7 @@ export class SessionManager {
   private teamHealthAlertFlushTimers = new Map<string, NodeJS.Timeout>()
   private readonly teamHealthAlertFlushMs = 90 * 1000
   private teammateKickoffTimers = new Map<string, NodeJS.Timeout>()
+  private speculativeReviewTimers = new Map<string, NodeJS.Timeout>()
   private usagePersistenceByWorkspace: Map<string, UsagePersistence> = new Map()
   private usageAlertCheckerByWorkspace: Map<string, UsageAlertChecker> = new Map()
   private emittedUsageAlertKeys: Set<string> = new Set()
@@ -1752,6 +1874,335 @@ export class SessionManager {
         },
       },
     }
+  }
+
+  // ============================================================
+  // Team Knowledge Bus helpers (REQ-NEXT-001)
+  // ============================================================
+
+  private readonly knowledgeDiscoveryTools = new Set(['Read', 'Grep', 'Glob'])
+  private readonly knowledgeMutationTools = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
+  // Implements REQ-NEXT-011: lightweight inline deterministic feedback loop.
+  private readonly inlineFeedbackState = new Map<string, { lastTestTouchAt: number; lastNudgeAt: number }>()
+  private readonly inlineFeedbackCooldownMs = 90_000
+
+  private extractToolFilePaths(input?: Record<string, unknown>): string[] {
+    if (!input) return []
+    const values: string[] = []
+
+    const pushValue = (value: unknown) => {
+      if (typeof value === 'string' && value.trim().length > 0) {
+        values.push(value.trim())
+      }
+    }
+
+    pushValue(input.path)
+    pushValue(input.file_path)
+    pushValue(input.notebook_path)
+    pushValue(input.cwd)
+
+    if (Array.isArray(input.paths)) {
+      for (const item of input.paths) pushValue(item)
+    }
+
+    if (Array.isArray(input.files)) {
+      for (const item of input.files) pushValue(item)
+    }
+
+    return Array.from(new Set(values.map((path) => path.replace(/\\/g, '/'))))
+  }
+
+  private extractExportSymbols(input?: Record<string, unknown>): string[] {
+    if (!input) return []
+    const textCandidates: string[] = []
+    const push = (value: unknown) => {
+      if (typeof value === 'string' && value.trim()) textCandidates.push(value)
+    }
+
+    push(input.content)
+    push(input.text)
+    push(input.new_string)
+    push(input.old_string)
+
+    const symbols = new Set<string>()
+    const exportRegex = /\bexport\s+(?:interface|type|class|function|const|enum)\s+([A-Za-z0-9_]+)/g
+    for (const candidate of textCandidates) {
+      let match: RegExpExecArray | null
+      while ((match = exportRegex.exec(candidate)) !== null) {
+        if (match[1]) symbols.add(match[1])
+      }
+    }
+
+    return Array.from(symbols)
+  }
+
+  private getTeammateTaskId(teamId: string, teammateId: string): string | undefined {
+    return teamManager
+      .getTasks(teamId)
+      .find((task) => task.assignee === teammateId && (task.status === 'in_progress' || task.status === 'in_review'))
+      ?.id
+  }
+
+  private handleKnowledgeToolStart(
+    teamId: string,
+    managed: ManagedSession,
+    event: Extract<AgentEvent, { type: 'tool_start' }>,
+  ): void {
+    if (!event.toolName || !this.knowledgeMutationTools.has(event.toolName)) return
+
+    const filePaths = this.extractToolFilePaths(event.input)
+    if (filePaths.length === 0) return
+
+    const teammateName = managed.teammateName || managed.name || managed.id
+    const taskId = this.getTeammateTaskId(teamId, managed.id)
+
+    for (const filePath of filePaths) {
+      const conflict = teamManager.recordKnowledgeFileEdit(teamId, {
+        filePath,
+        teammateId: managed.id,
+        teammateName,
+        taskId,
+      })
+      if (conflict) {
+        void this.notifyKnowledgeConflict(teamId, conflict)
+      }
+    }
+  }
+
+  private handleKnowledgeToolResult(
+    teamId: string,
+    managed: ManagedSession,
+    event: Extract<AgentEvent, { type: 'tool_result' }>,
+  ): void {
+    if (event.isError || !event.toolName) return
+
+    const filePaths = this.extractToolFilePaths(event.input)
+    const teammateName = managed.teammateName || managed.name || managed.id
+
+    if (this.knowledgeDiscoveryTools.has(event.toolName)) {
+      const baseTags = [
+        'episodic',
+        'discovery',
+        `tool:${event.toolName.toLowerCase()}`,
+        ...filePaths.slice(0, 4).map((path) => path.split('/').pop() || path),
+      ]
+      teamManager.publishKnowledge(teamId, {
+        // PostToolUse memory capture (REQ-NEXT-001)
+        type: 'discovery',
+        content: `${teammateName} used ${event.toolName}${filePaths.length ? ` on ${filePaths.join(', ')}` : ''}`,
+        source: managed.id,
+        filePaths,
+        tags: baseTags,
+        ttl: 1000 * 60 * 60 * 24 * 7, // 7 days for episodic traces
+      })
+      return
+    }
+
+    // Heads publishing interface contracts helps sibling heads avoid redundant rediscovery.
+    if (managed.teammateRole === TEAM_ROLE_HEAD && this.knowledgeMutationTools.has(event.toolName)) {
+      const exportsChanged = this.extractExportSymbols(event.input)
+      if (exportsChanged.length === 0) return
+
+      teamManager.publishKnowledge(teamId, {
+        type: 'interface-contract',
+        content: `${teammateName} updated exported interfaces: ${exportsChanged.slice(0, 8).join(', ')}`,
+        source: managed.id,
+        filePaths,
+        tags: ['interface-contract', 'head', ...exportsChanged.map((name) => name.toLowerCase())],
+      })
+      void this.notifyPeerHeadsOfInterfaceContract(teamId, managed, exportsChanged, filePaths)
+    }
+  }
+
+  /**
+   * Implements REQ-NEXT-004: notify sibling Heads about interface contract changes.
+   */
+  private async notifyPeerHeadsOfInterfaceContract(
+    teamId: string,
+    source: ManagedSession,
+    exportsChanged: string[],
+    filePaths: string[],
+  ): Promise<void> {
+    const peers = Array.from(this.sessions.values()).filter((session) =>
+      session.id !== source.id
+      && session.teamId === teamId
+      && session.teammateRole === TEAM_ROLE_HEAD,
+    )
+    if (peers.length === 0) return
+
+    const sourceName = source.teammateName || source.name || source.id
+    const fileLabel = filePaths.length > 0 ? filePaths.slice(0, 3).join(', ') : 'shared interfaces'
+    const message = [
+      `**Peer interface update**`,
+      `${sourceName} changed exported contracts: ${exportsChanged.slice(0, 8).join(', ')}`,
+      `Files: ${fileLabel}`,
+      `Action: validate dependencies against these contracts before integration.`,
+    ].join('\n')
+
+    for (const peer of peers) {
+      try {
+        await this.sendMessage(peer.id, message)
+      } catch (err) {
+        sessionLog.warn(`[PeerChannels] Failed to notify head ${peer.id} about contract update:`, err)
+      }
+    }
+
+    teamManager.logActivity(
+      teamId,
+      'message-sent',
+      `Interface contract alert from ${sourceName} sent to ${peers.length} peer head(s)`,
+      source.id,
+      sourceName,
+    )
+  }
+
+  private async notifyKnowledgeConflict(teamId: string, conflict: {
+    filePath: string
+    editors: Array<{ teammateId: string; teammateName: string }>
+  }): Promise<void> {
+    const names = conflict.editors.map((editor) => editor.teammateName)
+    const warning = [
+      `⚠️ Team Knowledge Bus conflict warning`,
+      `File: ${conflict.filePath}`,
+      `Editors: ${names.join(', ')}`,
+      `Please coordinate ownership to avoid merge collisions.`,
+    ].join('\n')
+
+    for (const editor of conflict.editors) {
+      try {
+        await this.sendMessage(editor.teammateId, warning)
+      } catch (err) {
+        sessionLog.warn(`[KnowledgeBus] Failed to notify ${editor.teammateId} about conflict:`, err)
+      }
+    }
+
+    const lead = this.findLeadSessionForTeam(teamId)
+    if (lead) {
+      try {
+        await this.sendMessage(lead.id, `**Knowledge Bus warning**\n\n${warning}`)
+      } catch (err) {
+        sessionLog.warn(`[KnowledgeBus] Failed to notify lead ${lead.id} about conflict:`, err)
+      }
+    }
+
+    teamManager.logActivity(teamId, 'error', `Knowledge bus conflict detected: ${conflict.filePath} (${names.join(', ')})`)
+  }
+
+  private isTestLikePath(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/').toLowerCase()
+    return /(^|\/)(__tests__|tests)\//.test(normalized) || /\.(test|spec)\.[jt]sx?$/.test(normalized)
+  }
+
+  private collectInlineFeedbackNudges(event: Extract<AgentEvent, { type: 'tool_result' }>, filePaths: string[], lastTestTouchAt: number): string[] {
+    const input = event.input ?? {}
+    const textCandidates = [
+      typeof input.content === 'string' ? input.content : '',
+      typeof input.text === 'string' ? input.text : '',
+      typeof input.new_string === 'string' ? input.new_string : '',
+    ].filter(Boolean)
+
+    const joined = textCandidates.join('\n')
+    const hasSourceEdit = filePaths.some((path) => !this.isTestLikePath(path) && /\.[jt]sx?$/i.test(path))
+    const hasTestEdit = filePaths.some((path) => this.isTestLikePath(path))
+
+    const nudges: string[] = []
+    const now = Date.now()
+    if (hasSourceEdit && !hasTestEdit && now - lastTestTouchAt > 10 * 60 * 1000) {
+      nudges.push('TDD reminder: consider adding/updating tests alongside source changes.')
+    }
+
+    if (/\basync\b|\bawait\b/.test(joined) && !/\btry\s*\{|\bcatch\s*\(/.test(joined)) {
+      nudges.push('Async safety reminder: ensure async boundaries include clear error handling.')
+    }
+
+    if (/\bTODO\b|\bFIXME\b|\bHACK\b/i.test(joined)) {
+      nudges.push('Completeness reminder: avoid leaving TODO/FIXME/HACK markers in final implementation.')
+    }
+
+    if (/ipcMain\.handle\(/.test(joined) && !/IPC_CHANNELS\./.test(joined)) {
+      nudges.push('Wiring reminder: verify new IPC handlers are mirrored in preload/renderer contracts.')
+    }
+
+    return nudges
+  }
+
+  /**
+   * Implements REQ-NEXT-011: cheap inline deterministic nudges after edit/write tool use.
+   */
+  private maybeSendInlineFeedbackNudge(
+    managed: ManagedSession,
+    event: Extract<AgentEvent, { type: 'tool_result' }>,
+  ): void {
+    if (event.isError || !event.toolName || !this.knowledgeMutationTools.has(event.toolName)) return
+
+    const filePaths = this.extractToolFilePaths(event.input)
+    if (filePaths.length === 0) return
+
+    const state = this.inlineFeedbackState.get(managed.id) ?? { lastTestTouchAt: 0, lastNudgeAt: 0 }
+    const now = Date.now()
+    if (filePaths.some((path) => this.isTestLikePath(path))) {
+      state.lastTestTouchAt = now
+    }
+
+    if (now - state.lastNudgeAt < this.inlineFeedbackCooldownMs) {
+      this.inlineFeedbackState.set(managed.id, state)
+      return
+    }
+
+    const nudges = this.collectInlineFeedbackNudges(event, filePaths, state.lastTestTouchAt)
+    if (nudges.length === 0) {
+      this.inlineFeedbackState.set(managed.id, state)
+      return
+    }
+
+    state.lastNudgeAt = now
+    this.inlineFeedbackState.set(managed.id, state)
+
+    const message = [
+      '[Inline feedback loop]',
+      ...nudges.map((nudge) => `- ${nudge}`),
+    ].join('\n')
+
+    void this.sendMessage(managed.id, message).catch((err) => {
+      sessionLog.warn(`[InlineFeedback] Failed to send nudge to ${managed.id}:`, err)
+    })
+  }
+
+  private buildReviewFingerprint(diff: ReviewDiff | null): string {
+    if (!diff) return 'none'
+    const payload = diff.unifiedDiff || ''
+    return `${payload.length}:${payload.slice(0, 120)}:${payload.slice(-120)}`
+  }
+
+  /**
+   * Implements REQ-NEXT-008: speculative quality artifacts captured before completion.
+   */
+  private scheduleSpeculativeReviewCapture(managed: ManagedSession): void {
+    if (!managed.workingDirectory || !managed.parentSessionId) return
+
+    const existing = this.speculativeReviewTimers.get(managed.id)
+    if (existing) {
+      clearTimeout(existing)
+      this.speculativeReviewTimers.delete(managed.id)
+    }
+
+    const timer = setTimeout(async () => {
+      this.speculativeReviewTimers.delete(managed.id)
+      if (!managed.workingDirectory || !managed.parentSessionId) return
+      try {
+        const reviewDiff = await DiffCollector.collectWorkingDiff(managed.workingDirectory)
+        managed.speculativeReviewDiff = reviewDiff
+        managed.speculativeReviewCapturedAt = Date.now()
+        managed.speculativeReviewFingerprint = this.buildReviewFingerprint(reviewDiff)
+      } catch (err) {
+        sessionLog.warn(`[SpeculativeQG] Failed to capture speculative artifact for ${managed.id}:`, err)
+      }
+    }, 1200)
+
+    if (typeof timer.unref === 'function') {
+      timer.unref()
+    }
+    this.speculativeReviewTimers.set(managed.id, timer)
   }
 
   /**
@@ -2004,10 +2455,18 @@ export class SessionManager {
           ?.map(r => `- **${r.tool}**: ${r.resultPreview.slice(0, 200)}`)
           ?? []
 
-        this.terminateTeammateSession(issue.teammateId, `health-auto-kill:${autoKillReason}`).then(killed => {
+        this.terminateTeammateSession(issue.teammateId, `health-auto-kill:${autoKillReason}`).then(async killed => {
           if (killed) {
             // Relay termination notice to lead
             this.updateTeammateTasks(resolvedTeamIdForKill, issue.teammateId, 'failed')
+
+            const replacement = await this.maybeAutoReplaceFailedTeammate({
+              teamId: resolvedTeamIdForKill,
+              leadSessionId,
+              failedTeammateId: issue.teammateId,
+              failureReason: autoKillReason,
+              partialResults,
+            })
 
             const partialSection = partialResults.length > 0
               ? [
@@ -2019,12 +2478,25 @@ export class SessionManager {
               ]
               : []
 
+            const replacementSection = replacement.replaced
+              ? [
+                '',
+                `Auto-replacement: started **${replacement.replacementName}** (${replacement.replacementSessionId}).`,
+                'The replacement worker is now running the recovered task prompt.',
+              ]
+              : [
+                '',
+                `Auto-replacement: not started (${replacement.reason}).`,
+                'You may re-assign the work manually if needed.',
+              ]
+
             this.sendMessage(leadSessionId, [
               `**${issue.teammateName}** was auto-terminated by the health monitor.`,
               `Reason: ${autoKillReason}`,
               '',
               'The teammate was unresponsive to shutdown requests and consuming resources.',
-              'Its task has been marked as failed. You may re-assign the work or complete it yourself.',
+              'Its task has been marked as failed.',
+              ...replacementSection,
               ...partialSection,
             ].join('\n')).catch(sendErr => {
               // BUG-004 fix: Log instead of silently swallowing
@@ -2228,6 +2700,111 @@ export class SessionManager {
     return true
   }
 
+  private findLatestTaskForAssignee(teamId: string, assigneeId: string): TeamTask | undefined {
+    const tasks = teamManager.getTasks(teamId)
+      .filter(task => task.assignee === assigneeId)
+      .sort((a, b) => {
+        const aTs = Date.parse(a.createdAt || '') || 0
+        const bTs = Date.parse(b.createdAt || '') || 0
+        return bTs - aTs
+      })
+    return tasks[0]
+  }
+
+  private async maybeAutoReplaceFailedTeammate(params: {
+    teamId: string
+    leadSessionId: string
+    failedTeammateId: string
+    failureReason: string
+    partialResults: string[]
+  }): Promise<{ replaced: boolean; reason: string; replacementName?: string; replacementSessionId?: string }> {
+    // Implements REQ-RECOVERY-001: automatic worker replacement after health-monitor kill/failure.
+    const failed = this.sessions.get(params.failedTeammateId)
+    if (!failed) {
+      return { replaced: false, reason: 'failed teammate session not found' }
+    }
+
+    if (failed.teammateRole !== TEAM_ROLE_WORKER) {
+      return { replaced: false, reason: `auto-replacement is restricted to worker role (got "${failed.teammateRole ?? 'unknown'}")` }
+    }
+
+    const lead = this.sessions.get(params.leadSessionId)
+    if (!lead || !lead.isTeamLead) {
+      return { replaced: false, reason: 'team lead session not available' }
+    }
+
+    const task = this.findLatestTaskForAssignee(params.teamId, params.failedTeammateId)
+    const promptFromTask = task?.description?.trim()
+    const promptFromHistory = [...failed.messages]
+      .reverse()
+      .find(m => m.role === 'user' && !m.isIntermediate)?.content?.trim()
+    const originalPrompt = promptFromTask || promptFromHistory
+
+    if (!originalPrompt) {
+      return { replaced: false, reason: 'could not recover original task prompt for replacement' }
+    }
+
+    const attemptKey = buildAutoReplacementAttemptKey({
+      taskDescription: task?.description,
+      taskTitle: task?.title,
+      teammateRole: failed.teammateRole,
+      teammateName: failed.teammateName,
+    })
+    const attempts = lead.autoReplacementAttempts ?? {}
+    const previousAttempts = attempts[attemptKey] ?? 0
+    if (previousAttempts >= MAX_AUTO_REPLACEMENT_ATTEMPTS_PER_TASK) {
+      return {
+        replaced: false,
+        reason: `replacement attempt cap reached (${previousAttempts}/${MAX_AUTO_REPLACEMENT_ATTEMPTS_PER_TASK}) for task fingerprint`,
+      }
+    }
+
+    const nextAttempt = previousAttempts + 1
+    attempts[attemptKey] = nextAttempt
+    lead.autoReplacementAttempts = attempts
+    this.persistSession(lead)
+
+    try {
+      const baseName = failed.teammateName?.trim() || 'worker'
+      const replacementName = `${baseName}-retry-${nextAttempt}`
+      const prompt = buildAutoReplacementPrompt({
+        originalPrompt,
+        teammateName: failed.teammateName || failed.id,
+        failureReason: params.failureReason,
+        partialResults: params.partialResults,
+        attempt: nextAttempt,
+      })
+
+      const replacement = await this.createTeammateSession({
+        parentSessionId: lead.id,
+        workspaceId: lead.workspace.id,
+        teamId: lead.teamId ?? failed.teamId ?? params.teamId,
+        teammateName: replacementName,
+        prompt,
+        llmConnection: lead.llmConnection,
+        role: failed.teammateRole ?? TEAM_ROLE_WORKER,
+      })
+
+      return {
+        replaced: true,
+        reason: `spawned auto-replacement "${replacementName}"`,
+        replacementName,
+        replacementSessionId: replacement.id,
+      }
+    } catch (err) {
+      // Roll back attempt count when spawn itself fails.
+      if (previousAttempts <= 0) {
+        delete attempts[attemptKey]
+      } else {
+        attempts[attemptKey] = previousAttempts
+      }
+      lead.autoReplacementAttempts = attempts
+      this.persistSession(lead)
+      const message = err instanceof Error ? err.message : String(err)
+      return { replaced: false, reason: `replacement spawn failed: ${message}` }
+    }
+  }
+
   private formatLeadToTeammateMessage(content: string): string {
     return `## Team Lead Message\n\n${content.trim()}`
   }
@@ -2357,8 +2934,29 @@ export class SessionManager {
           .map(id => allTasks.find(t => t.id === id))
           .filter((t): t is NonNullable<typeof t> => t != null)
 
-        // Implements REQ-P1: Decide flat vs managed spawn strategy
-        const strategy = decideSpawnStrategy(relevantTasks)
+        // Implements REQ-NEXT-002/006: task-aware architecture selector + learning-guided routing.
+        const learningGuidance = getLearningGuidance(lead.workspace.rootPath)
+        const architectureDecision = selectArchitectureMode(relevantTasks, {
+          learningHint: {
+            preferManaged: learningGuidance.preferManaged,
+            rationale: learningGuidance.rationale.join('; '),
+          },
+        })
+        const strategy = decideSpawnStrategy(relevantTasks, {
+          learningHint: {
+            preferManaged: learningGuidance.preferManaged,
+            rationale: learningGuidance.rationale.join('; '),
+          },
+        })
+        teamManager.logActivity(
+          _teamId,
+          'phase-advanced',
+          `Architecture selector chose ${architectureDecision.mode} (confidence=${Math.round(architectureDecision.confidence * 100)}%). ` +
+            `Rationale: ${architectureDecision.rationale.join(' | ')}. ` +
+            `Features: domains=${architectureDecision.features.meaningfulDomains.join(',') || 'none'}, ` +
+            `tasks=${architectureDecision.features.taskCount}, deps=${architectureDecision.features.dependencyRatio}. ` +
+            `Learning: ${learningGuidance.rationale.join('; ')}`,
+        )
 
         if (strategy.mode === 'flat') {
           await this.spawnWorkersDirectly({
@@ -2637,7 +3235,16 @@ export class SessionManager {
           ? `\n\nSpec Context:\n${task.requirementIds?.map(id => `- ${id}`).join('\n') ?? 'No linked requirements'}`
           : ''
 
-        const workerPrompt = [
+        const domainRouting = decideTeammateRouting({
+          prompt: `${task.title}\n${task.description ?? ''}`,
+          requestedRole: TEAM_ROLE_WORKER,
+        })
+        // REQ-NEXT-010: Explicitly inject domain skill packs when flat mode bypasses Heads.
+        const domainSkillMentions = domainRouting.skillSlugs.length > 0
+          ? domainRouting.skillSlugs.map(slug => `[skill:${slug}]`).join(' ')
+          : ''
+
+        const workerPromptBody = [
           `## Task: ${task.title}`,
           '',
           task.description ?? 'No additional description.',
@@ -2648,6 +3255,9 @@ export class SessionManager {
             ? `\nDependencies (already completed): ${task.dependencies.join(', ')}`
             : '',
         ].filter(Boolean).join('\n')
+        const workerPrompt = domainSkillMentions
+          ? `${domainSkillMentions}\n\n${workerPromptBody}`
+          : workerPromptBody
 
         const workerSession = await this.createTeammateSession({
           parentSessionId: leadSessionId,
@@ -3788,8 +4398,17 @@ export class SessionManager {
               teamManager.hydrateActivity(session.teamId, event)
             }
           }
+          if (state.knowledge.length > 0) {
+            for (const entry of state.knowledge) {
+              teamManager.hydrateKnowledgeEntry(session.teamId, entry)
+            }
+          }
           restored++
-          sessionLog.info(`[AgentTeams] Restored state store for team ${session.teamId} (lead: ${session.id}, ${state.tasks.length} tasks, ${state.messages.length} messages, ${state.activity.length} activity events)`)
+          sessionLog.info(
+            `[AgentTeams] Restored state store for team ${session.teamId} ` +
+            `(lead: ${session.id}, ${state.tasks.length} tasks, ${state.messages.length} messages, ` +
+            `${state.activity.length} activity events, ${state.knowledge.length} knowledge entries)`,
+          )
         }
       } catch (err) {
         sessionLog.warn(`[AgentTeams] Failed to restore state store for team ${session.teamId}:`, err)
@@ -5252,9 +5871,29 @@ export class SessionManager {
       ? `${skillMentions}\n\n${params.prompt}`
       : params.prompt
 
+    // Implements REQ-NEXT-001: Inject compact shared team memory into spawned teammate prompts.
+    const sharedKnowledgeContext = teamManager.buildKnowledgeContext(resolvedTeamId, params.prompt, {
+      maxChars: 1_800, // ~<=500-token budget target
+      maxEntries: 8,
+      maxTokens: 500,
+    })
+    const injectedKnowledgeEntries = sharedKnowledgeContext
+      ? sharedKnowledgeContext.split('\n').filter((line) => line.trim().startsWith('- [')).length
+      : 0
+    teamManager.logActivity(
+      resolvedTeamId,
+      'phase-advanced',
+      `[KnowledgeBus][inject] ${sharedKnowledgeContext ? 'hit' : 'miss'} entries=${injectedKnowledgeEntries}`,
+      teammateSession.id,
+      teammateDisplayName,
+    )
+    const promptWithKnowledge = sharedKnowledgeContext
+      ? `${sharedKnowledgeContext}\n\n${promptWithSkills}`
+      : promptWithSkills
+
     // Implements REQ-BUDGET-003: Pass resolved budgets so agents see their limits in the prompt
     const resolvedBudgets = managedTeammate?.toolCallThrottle?.getResolvedBudgets()
-    const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithSkills, compactSpecContext, resolvedBudgets)
+    const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithKnowledge, compactSpecContext, resolvedBudgets)
 
     // Implements REQ-A1: Track pending teammate spawns on the lead session
     // so shouldDelayCompletionForAgentTeam() can block premature 'complete'.
@@ -5516,8 +6155,20 @@ export class SessionManager {
 
     // Remove from in-memory state
     this.sessions.delete(sessionId)
+    this.inlineFeedbackState.delete(sessionId)
+    const parentTimer = this.speculativeReviewTimers.get(sessionId)
+    if (parentTimer) {
+      clearTimeout(parentTimer)
+      this.speculativeReviewTimers.delete(sessionId)
+    }
     for (const child of children) {
       this.sessions.delete(child.id)
+      this.inlineFeedbackState.delete(child.id)
+      const childTimer = this.speculativeReviewTimers.get(child.id)
+      if (childTimer) {
+        clearTimeout(childTimer)
+        this.speculativeReviewTimers.delete(child.id)
+      }
     }
 
     // Notify all windows
@@ -7572,6 +8223,12 @@ export class SessionManager {
     this.stopComplianceWatcher(sessionId)
 
     this.sessions.delete(sessionId)
+    this.inlineFeedbackState.delete(sessionId)
+    const speculativeTimer = this.speculativeReviewTimers.get(sessionId)
+    if (speculativeTimer) {
+      clearTimeout(speculativeTimer)
+      this.speculativeReviewTimers.delete(sessionId)
+    }
 
     // Clean up session metadata in HookSystem (prevents memory leak)
     const hookSystem = this.hookSystems.get(workspaceRootPath)
@@ -7896,6 +8553,7 @@ export class SessionManager {
               // Implements Phase 1a: Pass toolInput so health monitor can distinguish different queries
               toolInput: event.input ? JSON.stringify(event.input).slice(0, 200) : '',
             })
+            this.handleKnowledgeToolStart(hmTeamId, managed, event)
             // REQ-HB-001: Feed tool call to heartbeat aggregator for activity tracking
             this.heartbeatAggregator.recordToolCall(
               hmTeamId,
@@ -7920,6 +8578,11 @@ export class SessionManager {
               // Phase 4a: Capture result preview for partial work recovery on kill
               resultPreview: event.result ? String(event.result).slice(0, 500) : undefined,
             })
+            this.handleKnowledgeToolResult(hmTeamId, managed, event)
+            this.maybeSendInlineFeedbackNudge(managed, event)
+            if (event.toolName && this.knowledgeMutationTools.has(event.toolName) && !event.isError) {
+              this.scheduleSpeculativeReviewCapture(managed)
+            }
             // Phase 1b fix: Don't blindly reset retry-storm stage on every success.
             // Most storm calls succeed (they return results, just useless ones), so resetting
             // on success defeats the escalation. Instead, the health monitor's checkRetryStorm()
@@ -8281,8 +8944,9 @@ export class SessionManager {
     const tasks = teamId ? teamManager.getTasks(teamId) : []
     const spec = teamId ? teamManager.getTeamSpec(teamId) : undefined
 
-    const requirementIds = spec?.requirements.map(r => r.id)
-      ?? [...new Set(tasks.flatMap(task => task.requirementIds ?? []))]
+    const specRequirementIds = spec?.requirements.map(r => r.id) ?? []
+    const taskRequirementIds = tasks.flatMap(task => task.requirementIds ?? [])
+    const requirementIds = [...new Set([...specRequirementIds, ...taskRequirementIds])]
 
     // Implements BUG-3/BUG-4: scan codebase for actual requirement references
     const workingDir = managed.workingDirectory || managed.sdkCwd || ''
@@ -8290,18 +8954,21 @@ export class SessionManager {
 
     const requirementsCoverage = requirementIds.map(requirementId => {
       const linkedTasks = tasks.filter(task => (task.requirementIds ?? []).includes(requirementId))
-      const refs = codebaseRefs.get(requirementId) ?? { files: [], tests: [] }
+      const scannedRefs = codebaseRefs.get(requirementId) ?? { files: [], tests: [] }
+
+      // Implements REQ-002: only treat code/test references as real compliance evidence
+      // when the requirement is actually linked to team tasks in this run.
+      // This prevents repo-wide REQ-* comments from inflating coverage.
+      const refs = linkedTasks.length > 0 ? scannedRefs : { files: [], tests: [] }
 
       const hasTasks = linkedTasks.length > 0
       const hasFiles = refs.files.length > 0
       const hasTests = refs.tests.length > 0
-      const signals = [hasTasks, hasFiles, hasTests].filter(Boolean).length
-
-      // Coverage: full = all 3 signals (or 2+ with files), partial = any 1+, none = 0
+      // Coverage: no tasks => none, tasks + files/tests => full, tasks-only => partial.
       const coverage: 'full' | 'partial' | 'none' =
-        signals >= 2 && hasFiles ? 'full' :
-        signals >= 1 ? 'partial' :
-        'none'
+        !hasTasks ? 'none'
+          : (hasFiles || hasTests) ? 'full'
+            : 'partial'
 
       const noteParts: string[] = []
       if (hasTasks) noteParts.push(`${linkedTasks.length} task(s)`)
@@ -8329,14 +8996,17 @@ export class SessionManager {
 
     // Implements BUG-4: build traceability map with real file/test data
     const traceabilityMap = requirementsCoverage.map(r => {
-      const refs = codebaseRefs.get(r.requirementId) ?? { files: [], tests: [] }
+      const requirementTasks = tasks
+        .filter(task => (task.requirementIds ?? []).includes(r.requirementId))
+        .map(task => task.id)
+      const refs = requirementTasks.length > 0
+        ? (codebaseRefs.get(r.requirementId) ?? { files: [], tests: [] })
+        : { files: [], tests: [] }
       return {
         requirementId: r.requirementId,
         files: refs.files,
         tests: refs.tests,
-        tasks: tasks
-          .filter(task => (task.requirementIds ?? []).includes(r.requirementId))
-          .map(task => task.id),
+        tasks: requirementTasks,
         tickets: tasks
           .flatMap(task => task.ticketLinks ?? [])
           .filter(ticket => (ticket.requirementIds ?? []).includes(r.requirementId))

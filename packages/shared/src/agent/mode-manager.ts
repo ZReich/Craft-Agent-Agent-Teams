@@ -1748,7 +1748,9 @@ export function shouldAllowToolInMode(
     // Handle session-scoped tools - allow read-only, block mutations
     if (toolName.startsWith('mcp__session__')) {
       // Read-only session tools - always allowed in Explore mode
-      // These tools don't modify state, they only read/validate/invoke secondary models
+      // These tools either:
+      // - read/validate/invoke secondary models, OR
+      // - control ephemeral teammate runtime state only (no persisted source/config mutation).
       const readOnlySessionTools = [
         'mcp__session__SubmitPlan',
         'mcp__session__config_validate',
@@ -1756,6 +1758,13 @@ export function shouldAllowToolInMode(
         'mcp__session__mermaid_validate',
         'mcp__session__source_test',
         'mcp__session__transform_data',
+        'mcp__session__TeamKnowledgeQuery',
+        // Agent team orchestration controls (ephemeral runtime operations)
+        // Implements REQ-101/REQ-109: allow orchestration control plane in Explore mode.
+        'mcp__session__Task',
+        'mcp__session__SendMessage',
+        'mcp__session__TeamCreate',
+        'mcp__session__TeamDelete',
       ];
       if (readOnlySessionTools.includes(toolName)) {
         return { allowed: true };

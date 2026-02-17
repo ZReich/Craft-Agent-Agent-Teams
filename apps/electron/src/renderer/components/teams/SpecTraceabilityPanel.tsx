@@ -12,6 +12,7 @@ export interface SpecTraceabilityPanelProps {
     tasks: string[]
     tickets: string[]
   }>
+  specRequirementIds?: string[]
   className?: string
 }
 
@@ -63,8 +64,21 @@ function ItemPill({ icon: Icon, value, title }: { icon: React.ComponentType<{ cl
   )
 }
 
-export function SpecTraceabilityPanel({ traceabilityMap, className }: SpecTraceabilityPanelProps) {
+export function SpecTraceabilityPanel({ traceabilityMap, specRequirementIds = [], className }: SpecTraceabilityPanelProps) {
   const [expandedRows, setExpandedRows] = React.useState<Record<string, boolean>>({})
+  const executionRequirementIds = React.useMemo(
+    () => traceabilityMap.map((entry) => entry.requirementId),
+    [traceabilityMap],
+  )
+  const specOnly = React.useMemo(
+    () => specRequirementIds.filter((id) => !executionRequirementIds.includes(id)),
+    [specRequirementIds, executionRequirementIds],
+  )
+  const executionOnly = React.useMemo(
+    () => executionRequirementIds.filter((id) => !specRequirementIds.includes(id)),
+    [executionRequirementIds, specRequirementIds],
+  )
+  const hasMismatch = specOnly.length > 0 || executionOnly.length > 0
 
   return (
     <div className={cn('flex flex-col h-full', className)}>
@@ -73,6 +87,14 @@ export function SpecTraceabilityPanel({ traceabilityMap, className }: SpecTracea
         <p className="text-xs text-muted-foreground mt-0.5">
           Requirements ? Files ? Tests ? Tasks
         </p>
+        <p className="text-[11px] text-muted-foreground mt-1">
+          Spec: {specRequirementIds.length} • Execution: {executionRequirementIds.length}
+        </p>
+        {hasMismatch && (
+          <p className="text-[11px] text-yellow-600 dark:text-yellow-400 mt-0.5">
+            Mismatch detected • Spec-only: {specOnly.length} • Execution-only: {executionOnly.length}
+          </p>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 overflow-auto">

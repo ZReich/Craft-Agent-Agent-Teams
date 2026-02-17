@@ -97,6 +97,27 @@ describe('TeammateHealthMonitor', () => {
       expect(health?.consecutiveErrors).toBe(0);
       expect(health?.lastErrorTool).toBeUndefined();
     });
+
+    it('should normalize near-duplicate search queries for retry-storm tracking', () => {
+      const teamId = 'team-1';
+      const mateId = 'mate-1';
+
+      monitor.recordActivity(teamId, mateId, 'Worker A', {
+        type: 'tool_call',
+        toolName: 'WebSearch',
+        toolInput: 'Best Mexican restaurants Billings page=1',
+      });
+      monitor.recordActivity(teamId, mateId, 'Worker A', {
+        type: 'tool_call',
+        toolName: 'WebSearch',
+        toolInput: 'best mexican restaurants billings page=2',
+      });
+
+      const health = monitor.getHealth(teamId, mateId);
+      expect(health).toBeDefined();
+      expect(health?.recentToolCalls).toHaveLength(2);
+      expect(health?.recentToolCalls[0]?.normalizedInput).toBe(health?.recentToolCalls[1]?.normalizedInput);
+    });
   });
 
   describe('context usage', () => {

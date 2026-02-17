@@ -431,7 +431,7 @@ describe('Task Domain Routing — decideSpawnStrategy', () => {
     expect(strategy.mode).toBe('flat');
   });
 
-  it('returns flat for single-domain ≤5 tasks', () => {
+  it('returns flat for single-domain ≤7 tasks', () => {
     const tasks = [
       { id: '1', title: 'Build React header' },
       { id: '2', title: 'Build React footer' },
@@ -441,23 +441,50 @@ describe('Task Domain Routing — decideSpawnStrategy', () => {
     expect(strategy.mode).toBe('flat');
   });
 
-  it('returns managed for multi-domain tasks', () => {
+  it('returns flat for two domains when each domain has ≤4 tasks', () => {
+    const tasks = [
+      { id: '1', title: 'Build React component A' },
+      { id: '2', title: 'Build React component B' },
+      { id: '3', title: 'Build React component C' },
+      { id: '4', title: 'Create API endpoint users A' },
+      { id: '5', title: 'Create API endpoint users B' },
+      { id: '6', title: 'Create API endpoint users C' },
+      { id: '7', title: 'Create API endpoint users D' },
+    ];
+    const strategy = decideSpawnStrategy(tasks);
+    expect(strategy.mode).toBe('flat');
+  });
+
+  it('returns managed for two domains when one domain exceeds 4 tasks', () => {
     const tasks = [
       { id: '1', title: 'Build React component' },
-      { id: '2', title: 'Create API endpoint for users' },
+      { id: '2', title: 'Build React component 2' },
+      { id: '3', title: 'Build React component 3' },
+      { id: '4', title: 'Build React component 4' },
+      { id: '5', title: 'Build React component 5' },
+      { id: '6', title: 'Create API endpoint for users' },
     ];
     const strategy = decideSpawnStrategy(tasks);
     expect(strategy.mode).toBe('managed');
     if (strategy.mode === 'managed') {
-      expect(strategy.heads.length).toBeGreaterThanOrEqual(2);
+      expect(strategy.heads.length).toBe(2);
     }
   });
 
-  it('returns managed for single-domain with 6+ tasks', () => {
-    const tasks = Array.from({ length: 7 }, (_, i) => ({
+  it('returns managed for single-domain with 8+ tasks', () => {
+    const tasks = Array.from({ length: 8 }, (_, i) => ({
       id: String(i),
       title: `Build React component ${i}`,
     }));
+    const strategy = decideSpawnStrategy(tasks);
+    expect(strategy.mode).toBe('managed');
+  });
+
+  it('returns managed when UX/design tasks are present (hard enforcement preserved)', () => {
+    const tasks = [
+      { id: '1', title: 'Create UX wireframe for onboarding flow' },
+      { id: '2', title: 'Implement frontend onboarding component' },
+    ];
     const strategy = decideSpawnStrategy(tasks);
     expect(strategy.mode).toBe('managed');
   });
@@ -469,6 +496,18 @@ describe('Task Domain Routing — decideSpawnStrategy', () => {
     ];
     const strategy = decideSpawnStrategy(tasks);
     expect(strategy.mode).toBe('flat');
+  });
+
+  it('returns managed when learning guidance prefers managed routing', () => {
+    const tasks = [
+      { id: '1', title: 'Build React component A' },
+      { id: '2', title: 'Build React component B' },
+      { id: '3', title: 'Build React component C' },
+    ];
+    const strategy = decideSpawnStrategy(tasks, {
+      learningHint: { preferManaged: true, rationale: 'historical quality regressions in flat mode' },
+    });
+    expect(strategy.mode).toBe('managed');
   });
 });
 

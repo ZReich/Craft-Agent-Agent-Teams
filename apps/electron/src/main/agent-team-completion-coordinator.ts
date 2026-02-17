@@ -1,13 +1,49 @@
 ﻿import { sessionLog } from './logger'
 import { loadWorkspaceConfig } from '@craft-agent/shared/workspaces'
 import { mergeQualityGateConfig, inferTaskType, shouldSkipQualityGates } from '@craft-agent/shared/agent-teams/quality-gates'
+import { applyLearningGuidanceToQualityConfig, getLearningGuidance, recordQualityLearning } from '@craft-agent/shared/agent-teams/learning-store'
 import { type QualityGateConfig, type QualityGateResult } from '@craft-agent/core/types'
 import { DiffCollector } from '@craft-agent/shared/agent-teams/diff-collector'
 import { formatFailureReport, formatSuccessReport, type QualityGateRunner, type TaskContext } from './quality-gate-runner'
 
 type StopReason = 'complete' | 'interrupted' | 'error' | 'timeout'
 
-type ManagedSessionLike = {
+export type ReviewerQaVerdict = 'pass' | 'fail' | 'unknown'
+
+// Implements REQ-QA-001: explicit reviewer PASS/FAIL gate before lead synthesis.
+const QA_FAIL_PATTERNS: RegExp[] = [
+  /\bFAIL(?:ED|URE|ING)?\b/i,
+  /\bDID\s+NOT\s+PASS\b/i,
+  /\bBLOCKER(?:S)?\b/i,
+  /\bCANNOT\s+APPROVE\b/i,
+]
+
+const QA_PASS_PATTERNS: RegExp[] = [
+  /\bPASS(?:ED)?\b/i,
+  /\bAPPROVED\b/i,
+  /\bLGTM\b/i,
+]
+
+export function inferReviewerQaVerdict(content?: string): ReviewerQaVerdict {
+  const text = content?.trim()
+  if (!text) return 'unknown'
+
+  const hasFail = QA_FAIL_PATTERNS.some(pattern => pattern.test(text))
+  if (hasFail) return 'fail'
+
+  const hasPass = QA_PASS_PATTERNS.some(pattern => pattern.test(text))
+  if (hasPass) return 'pass'
+
+  return 'unknown'
+}
+
+function isReviewerSessionCandidate(session: ManagedSessionLike): boolean {
+  if (session.teammateRole === 'reviewer') return true
+  const name = (session.teammateName ?? '').toLowerCase()
+  return /\breviewer\b|\bqa\b/.test(name)
+}
+
+type ManagedSessionIdentity = {
   id: string
   name?: string
   teamId?: string
@@ -19,15 +55,38 @@ type ManagedSessionLike = {
   workspace: { rootPath: string }
   messages: Array<{ role: string; isIntermediate?: boolean; content?: string }>
   agent?: unknown
+}
+
+type ManagedSessionExecutionState = {
   isTeamLead?: boolean
   isProcessing?: boolean
   teamLevelQgRunning?: boolean
   qgCycleCount?: number
+  lastMessageAt?: number
+}
+
+type ManagedSessionReviewArtifacts = {
+  speculativeReviewDiff?: Awaited<ReturnType<typeof DiffCollector.collectWorkingDiff>> | null
+  speculativeReviewFingerprint?: string
+  speculativeReviewCapturedAt?: number
+}
+
+type ManagedSessionGuardFlags = {
   /** Guard: teammate results already relayed to lead — prevents duplicate deliveries */
   completionRelayed?: boolean
   /** Guard: synthesis prompt already sent to this lead — prevents duplicate prompts */
   synthesisPromptSent?: boolean
+  /** Reviewer QA verdict used by explicit synthesis gate */
+  qaVerdict?: ReviewerQaVerdict
+  /** Guard: QA gate block notification already sent */
+  qaGateBlockedNotified?: boolean
 }
+
+type ManagedSessionLike =
+  & ManagedSessionIdentity
+  & ManagedSessionExecutionState
+  & ManagedSessionReviewArtifacts
+  & ManagedSessionGuardFlags
 
 export type AgentTeamCompletionContext = {
   sessions: {
@@ -68,9 +127,19 @@ export type AgentTeamCompletionContext = {
   }
 }
 
+type TeamQgQueueItem = {
+  fn: () => Promise<void>
+  resolve: () => void
+}
+
+type TeamQgQueueState = {
+  active: number
+  queue: TeamQgQueueItem[]
+}
+
 export class AgentTeamCompletionCoordinator {
-  // Sequential QG execution: one QG pipeline at a time per team to prevent CPU/RAM spikes
-  private teamQgQueue = new Map<string, Promise<void>>()
+  // Implements REQ-NEXT-005: bounded parallel quality-gate slots per team.
+  private teamQgQueueState = new Map<string, TeamQgQueueState>()
 
   constructor(private readonly context: AgentTeamCompletionContext) {}
 
@@ -106,11 +175,26 @@ export class AgentTeamCompletionCoordinator {
       ? (lastAssistantMsg?.content ?? '')
       : `*${managed.teammateName || 'Teammate'} sent results via direct message to the lead. Check the lead session for the full report.*`
 
+    if (isReviewerSessionCandidate(managed)) {
+      managed.qaVerdict = inferReviewerQaVerdict(lastAssistantMsg?.content ?? resultContent)
+    }
+
     const teammateName = managed.teammateName
     const resolvedTeamId = this.context.team.resolveTeamId(managed.teamId ?? managed.parentSessionId)
     const deliveryMeta = this.context.messaging.buildTeamDeliveryMetadata({ outputPresent, receiverId: managed.parentSessionId })
     const wsConfig = loadWorkspaceConfig(managed.workspace.rootPath)
-    const qgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
+    const baseQgConfig = mergeQualityGateConfig(wsConfig?.agentTeams?.qualityGates as Partial<QualityGateConfig> | undefined)
+    const learningGuidance = getLearningGuidance(managed.workspace.rootPath)
+    const qgConfig = applyLearningGuidanceToQualityConfig(baseQgConfig, learningGuidance)
+    if (learningGuidance.tightenErrorBypass) {
+      this.context.team.logActivity(
+        resolvedTeamId,
+        'phase-advanced',
+        `[Learning] Tightened quality-gate bypass boundaries for this run (${learningGuidance.rationale.join('; ')})`,
+        managed.id,
+        teammateName,
+      )
+    }
 
     if (!qgConfig.enabled) {
       this.context.teammate.updateTaskStatus(resolvedTeamId, managed.id, 'completed')
@@ -128,7 +212,8 @@ export class AgentTeamCompletionCoordinator {
       return
     }
 
-    // Sequential QG: queue per team so only one QG pipeline runs at a time
+    // REQ-NEXT-005: queue per team with bounded parallel slots.
+    const maxParallel = Math.max(1, Math.min(6, qgConfig.maxParallelReviews ?? 2))
     await this.enqueueQualityGate(resolvedTeamId, () => this.runIndividualQualityGates({
       managed,
       lead,
@@ -138,14 +223,40 @@ export class AgentTeamCompletionCoordinator {
       deliveryMeta,
       qgConfig,
       sessionId,
-    }))
+    }), maxParallel)
   }
 
-  private async enqueueQualityGate(teamId: string, fn: () => Promise<void>): Promise<void> {
-    const prev = this.teamQgQueue.get(teamId) ?? Promise.resolve()
-    const current = prev.then(fn, fn)  // Run even if previous rejected
-    this.teamQgQueue.set(teamId, current)
-    return current
+  private async enqueueQualityGate(teamId: string, fn: () => Promise<void>, maxParallel: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const state = this.teamQgQueueState.get(teamId) ?? { active: 0, queue: [] }
+      state.queue.push({ fn, resolve })
+      this.teamQgQueueState.set(teamId, state)
+      this.drainQualityGateQueue(teamId, maxParallel)
+    })
+  }
+
+  private drainQualityGateQueue(teamId: string, maxParallel: number): void {
+    const state = this.teamQgQueueState.get(teamId)
+    if (!state) return
+
+    while (state.active < maxParallel && state.queue.length > 0) {
+      const next = state.queue.shift()!
+      state.active += 1
+
+      void next.fn()
+        .catch((err) => {
+          sessionLog.error(`[AgentTeams] Quality gate worker failed for team ${teamId}:`, err)
+        })
+        .finally(() => {
+          state.active = Math.max(0, state.active - 1)
+          next.resolve()
+          if (state.active === 0 && state.queue.length === 0) {
+            this.teamQgQueueState.delete(teamId)
+            return
+          }
+          this.drainQualityGateQueue(teamId, maxParallel)
+        })
+    }
   }
 
   private async relayTeammateMessages(parentSessionId: string, teammateName: string, resultContent: string, deliveryMeta: string, template = '**{name}** completed:'): Promise<void> {
@@ -169,6 +280,12 @@ export class AgentTeamCompletionCoordinator {
     }
   }
 
+  private buildReviewFingerprint(reviewDiff: Awaited<ReturnType<typeof DiffCollector.collectWorkingDiff>> | null): string {
+    if (!reviewDiff) return 'none'
+    const payload = reviewDiff.unifiedDiff || ''
+    return `${payload.length}:${payload.slice(0, 120)}:${payload.slice(-120)}`
+  }
+
   private async maybePromptLeadSynthesis(lead: ManagedSessionLike, parentSessionId: string): Promise<void> {
     // Guard: only send the synthesis prompt once per team lifecycle.
     // Multiple teammates completing in quick succession can each trigger this check,
@@ -181,6 +298,9 @@ export class AgentTeamCompletionCoordinator {
     })
 
     if (allDone && !lead.teamLevelQgRunning) {
+      if (!(await this.enforceReviewerQaGate(lead, parentSessionId))) {
+        return
+      }
       lead.synthesisPromptSent = true  // Mark before sending to prevent races
       this.context.messaging.clearLeadTeamState(lead)
       // Stop health monitoring — all teammates are done, no more check-ins needed
@@ -205,6 +325,9 @@ export class AgentTeamCompletionCoordinator {
     })
     const allNonCode = allTaskTypes.every(t => t != null && shouldSkipQualityGates(t))
     if (allNonCode) {
+      if (!(await this.enforceReviewerQaGate(lead, managed.parentSessionId!))) {
+        return
+      }
       lead.synthesisPromptSent = true
       this.context.messaging.clearLeadTeamState(lead)
       this.context.team.stopHealthMonitoring?.(lead.teamId ?? managed.parentSessionId!)
@@ -219,6 +342,9 @@ export class AgentTeamCompletionCoordinator {
       const teamReviewInput = this.context.quality.resolveReviewInput(teamDiff)
 
       if (!teamReviewInput.usesGitDiff) {
+        if (!(await this.enforceReviewerQaGate(lead, managed.parentSessionId!))) {
+          return
+        }
         this.context.messaging.clearLeadTeamState(lead)
         await this.context.messaging.sendToSession(managed.parentSessionId!, '[System] All teammates have completed their work. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
         return
@@ -228,20 +354,87 @@ export class AgentTeamCompletionCoordinator {
       const taskContext: TaskContext = { taskDescription: lead.name || 'Team integration check', workingDirectory: managed.workingDirectory }
       const result = await runner.runProgressive(teamReviewInput.reviewInput, taskContext, qgConfig, spec)
       this.context.team.storeQualityResult(resolvedTeamId, managed.parentSessionId!, result)
+      recordQualityLearning(managed.workspace.rootPath, result)
 
       if (result.passed) {
+        if (!(await this.enforceReviewerQaGate(lead, managed.parentSessionId!))) {
+          return
+        }
         this.context.messaging.clearLeadTeamState(lead)
         await this.context.messaging.sendToSession(managed.parentSessionId!, [`<details><summary>Quality Gate — PASSED (${result.aggregateScore}%)</summary>`, '', formatSuccessReport(result), '', '</details>', '', '[System] All teammates have completed their work and the team-level quality gate has passed. Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.'].join('\n'))
       } else {
         await this.context.messaging.sendToSession(managed.parentSessionId!, [`<details open><summary>Quality Gate — FAILED (${result.aggregateScore}%)</summary>`, '', formatFailureReport(result, qgConfig), '', '</details>', '', '[System] All teammates have completed, but the team-level quality gate did not pass. Review the issues above and decide how to address them — you may need to spawn additional Heads or fix issues directly.'].join('\n'))
       }
     } catch (err) {
+      if (!(await this.enforceReviewerQaGate(lead, managed.parentSessionId!))) {
+        return
+      }
       this.context.messaging.clearLeadTeamState(lead)
       await this.context.messaging.sendToSession(managed.parentSessionId!, '[System] All teammates have completed their work (team quality gate skipped due to error). Please review the results above, verify they are correct and complete, then synthesize a final comprehensive response for the user.')
       sessionLog.error('[AgentTeams] Team-level quality gate error:', err)
     } finally {
       lead.teamLevelQgRunning = false
     }
+  }
+
+  private evaluateReviewerQaGate(lead: ManagedSessionLike): { passed: boolean; reason?: string } {
+    const reviewerSessions = (lead.teammateSessionIds || [])
+      .map(tid => this.context.sessions.getById(tid))
+      .filter((session): session is ManagedSessionLike => Boolean(session))
+      .filter(isReviewerSessionCandidate)
+
+    if (reviewerSessions.length === 0) {
+      return { passed: true }
+    }
+
+    // Use the latest reviewer verdict as the explicit QA gate signal.
+    const latestReviewer = reviewerSessions
+      .slice()
+      .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))[0]!
+
+    const lastAssistantMsg = [...latestReviewer.messages]
+      .reverse()
+      .find(m => m.role === 'assistant' && !m.isIntermediate)
+
+    const verdict = latestReviewer.qaVerdict ?? inferReviewerQaVerdict(lastAssistantMsg?.content ?? '')
+    if (verdict === 'pass') {
+      return { passed: true }
+    }
+
+    if (verdict === 'fail') {
+      return {
+        passed: false,
+        reason: `Reviewer "${latestReviewer.teammateName || latestReviewer.id}" reported FAIL. QA PASS is required before synthesis.`,
+      }
+    }
+
+    return {
+      passed: false,
+      reason: `Reviewer "${latestReviewer.teammateName || latestReviewer.id}" did not provide an explicit PASS signal.`,
+    }
+  }
+
+  private async enforceReviewerQaGate(lead: ManagedSessionLike, parentSessionId: string): Promise<boolean> {
+    // Implements REQ-QA-001: synthesis is blocked until the latest reviewer signals PASS.
+    const qaGate = this.evaluateReviewerQaGate(lead)
+    if (qaGate.passed) {
+      lead.qaGateBlockedNotified = false
+      return true
+    }
+
+    if (!lead.qaGateBlockedNotified) {
+      lead.qaGateBlockedNotified = true
+      await this.context.messaging.sendToSession(
+        parentSessionId,
+        [
+          '[System] QA gate is blocking final synthesis.',
+          qaGate.reason ?? 'A reviewer PASS signal is required before synthesis.',
+          'Resolve reviewer findings (or re-run QA) and ensure the latest reviewer report explicitly says PASS.',
+        ].join('\n'),
+      )
+    }
+
+    return false
   }
 
   private async runIndividualQualityGates(params: {
@@ -279,8 +472,32 @@ export class AgentTeamCompletionCoordinator {
 
     try {
       const spec = managed.teamId ? this.context.team.getTeamSpec(this.context.team.resolveTeamId(managed.teamId)) : undefined
-      const reviewDiff = managed.workingDirectory ? await DiffCollector.collectWorkingDiff(managed.workingDirectory) : null
-      const reviewInput = this.context.quality.resolveReviewInput(reviewDiff)
+      const speculativeAgeMs = managed.speculativeReviewCapturedAt ? Date.now() - managed.speculativeReviewCapturedAt : Number.POSITIVE_INFINITY
+      const useSpeculative = Boolean(managed.speculativeReviewDiff && speculativeAgeMs <= 2 * 60 * 1000)
+      let reviewDiff = useSpeculative
+        ? managed.speculativeReviewDiff ?? null
+        : (managed.workingDirectory ? await DiffCollector.collectWorkingDiff(managed.workingDirectory) : null)
+      let reviewInput = this.context.quality.resolveReviewInput(reviewDiff)
+
+      // REQ-NEXT-008: If speculative artifact is stale/mismatched, fall back safely to fresh diff.
+      if (useSpeculative && managed.speculativeReviewFingerprint && reviewDiff) {
+        const currentFingerprint = this.buildReviewFingerprint(reviewDiff)
+        if (currentFingerprint !== managed.speculativeReviewFingerprint && managed.workingDirectory) {
+          sessionLog.info(`[SpeculativeQG] Fingerprint mismatch for ${sessionId}; falling back to fresh diff`)
+          reviewDiff = await DiffCollector.collectWorkingDiff(managed.workingDirectory)
+          reviewInput = this.context.quality.resolveReviewInput(reviewDiff)
+        }
+      }
+      if (useSpeculative && !reviewInput.usesGitDiff && managed.workingDirectory) {
+        reviewDiff = await DiffCollector.collectWorkingDiff(managed.workingDirectory)
+        reviewInput = this.context.quality.resolveReviewInput(reviewDiff)
+      }
+      if (useSpeculative) {
+        sessionLog.info(`[SpeculativeQG] ${reviewInput.usesGitDiff ? 'Reused' : 'Skipped'} speculative artifact for ${teammateName}`)
+      }
+      managed.speculativeReviewDiff = null
+      managed.speculativeReviewFingerprint = undefined
+      managed.speculativeReviewCapturedAt = undefined
 
       if (!reviewInput.usesGitDiff) {
         if (currentCycle >= qgConfig.maxReviewCycles) {
@@ -298,6 +515,7 @@ export class AgentTeamCompletionCoordinator {
       result.cycleCount = currentCycle
       result.maxCycles = qgConfig.maxReviewCycles
       this.context.team.storeQualityResult(resolvedTeamId, managed.id, result)
+      recordQualityLearning(managed.workspace.rootPath, result)
 
       if (result.passed) {
         this.context.quality.cycles.delete(cycleKey)

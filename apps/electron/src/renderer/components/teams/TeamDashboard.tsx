@@ -83,6 +83,15 @@ interface TeammateHealthIssue {
   details: string
   timestamp: string
 }
+interface TeamKnowledgeEntry {
+  id: string
+  type: string
+  content: string
+  source: string
+  filePaths?: string[]
+  tags: string[]
+  timestamp: number
+}
 const EMPTY_TASKS: TeamTask[] = []
 const EMPTY_MESSAGES: TeammateMessage[] = []
 const EMPTY_ACTIVITY: TeamActivityEvent[] = []
@@ -205,7 +214,7 @@ export function TeamDashboard({
   const [viewMode, setViewMode] = useState<'overview' | 'focus'>('overview')
   const [selectedTeammateId, setSelectedTeammateId] = useState<string | undefined>()
   const [taskListCollapsed, setTaskListCollapsed] = useState(true)
-  const [activeTab, setActiveTab] = useState<'teammate' | 'activity' | 'spec-coverage' | 'traceability'>('teammate')
+  const [activeTab, setActiveTab] = useState<'teammate' | 'activity' | 'spec-coverage' | 'traceability' | 'knowledge'>('teammate')
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [checklistOpen, setChecklistOpen] = useState(false)
   const [compactSidebarMode, setCompactSidebarMode] = useState(false)
@@ -219,6 +228,7 @@ export function TeamDashboard({
   const [realtimeMessages, setRealtimeMessages] = useState<TeammateMessage[]>(messages)
   const [realtimeTasks, setRealtimeTasks] = useState<TeamTask[]>(tasks)
   const [realtimeActivity, setRealtimeActivity] = useState<TeamActivityEvent[]>(activityEvents)
+  const [realtimeKnowledge, setRealtimeKnowledge] = useState<TeamKnowledgeEntry[]>([])
   const [realtimeToolActivity, setRealtimeToolActivity] = useState<Record<string, ToolActivity[]>>({})
   const [realtimeHealthIssues, setRealtimeHealthIssues] = useState<Record<string, TeammateHealthIssue[]>>({})
   const [yoloState, setYoloState] = useState<YoloState | null>(null)
@@ -379,10 +389,44 @@ export function TeamDashboard({
             return merged.slice(-MAX_REALTIME_ACTIVITY)
           })
         }
+        if (state.knowledge?.length && !cancelled) {
+          const knowledge = state.knowledge ?? []
+          setRealtimeKnowledge((prev) => {
+            const existingIds = new Set(prev.map(k => k.id))
+            const merged = [...knowledge.filter(k => !existingIds.has(k.id)), ...prev]
+            return merged
+              .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
+              .slice(0, 200)
+          })
+        }
       })
       .catch(() => { /* no persisted state — first-time team */ })
     return () => { cancelled = true }
   }, [session.id])
+
+  // Refresh memory entries periodically when viewing the Knowledge tab.
+  useEffect(() => {
+    if (activeTab !== 'knowledge') return
+    if (!window.electronAPI?.getPersistedTeamState) return
+    let cancelled = false
+    const load = async () => {
+      const state = await window.electronAPI.getPersistedTeamState(session.id)
+      if (cancelled || !state?.knowledge) return
+      const knowledge = state.knowledge ?? []
+      setRealtimeKnowledge(
+        knowledge
+          .slice()
+          .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
+          .slice(0, 200),
+      )
+    }
+    void load()
+    const timer = setInterval(() => { void load() }, 12_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [activeTab, session.id])
 
   // Sync realtime state with props when they change
   useEffect(() => {
@@ -435,6 +479,46 @@ export function TeamDashboard({
     const inProgress = specRequirements.filter(r => r.status === 'in-progress').length
     return Math.round(((verified + implemented * 0.75 + inProgress * 0.25) / specRequirements.length) * 100)
   }, [specModeEnabled, specRequirements, specIsDraft])
+
+  const knowledgeHealth = useMemo(() => {
+    const now = Date.now()
+    const staleCutoff = now - (24 * 60 * 60 * 1000)
+    const previousWindowStart = now - (48 * 60 * 60 * 1000)
+
+    const total = realtimeKnowledge.length
+    const stale = realtimeKnowledge.filter((entry) => (entry.timestamp ?? 0) < staleCutoff).length
+    const stalePct = total > 0 ? Math.round((stale / total) * 100) : 0
+    const conflicts24h = realtimeKnowledge.filter((entry) =>
+      entry.type === 'warning'
+      && (entry.tags || []).some((tag) => tag.toLowerCase().includes('conflict'))
+      && (entry.timestamp ?? 0) >= staleCutoff
+    ).length
+    const conflictsPrev24h = realtimeKnowledge.filter((entry) =>
+      entry.type === 'warning'
+      && (entry.tags || []).some((tag) => tag.toLowerCase().includes('conflict'))
+      && (entry.timestamp ?? 0) < staleCutoff
+      && (entry.timestamp ?? 0) >= previousWindowStart
+    ).length
+
+    const injectionEvents = realtimeActivity.filter((event) => event.details?.includes('[KnowledgeBus][inject]'))
+    const injectionHits = injectionEvents.filter((event) => event.details?.includes('hit')).length
+    const injectionMisses = injectionEvents.filter((event) => event.details?.includes('miss')).length
+    const injectionHitRate = (injectionHits + injectionMisses) > 0
+      ? Math.round((injectionHits / (injectionHits + injectionMisses)) * 100)
+      : null
+
+    const queryEvents = realtimeActivity.filter((event) => event.details?.includes('[KnowledgeBus][query]'))
+
+    return {
+      total,
+      stale,
+      stalePct,
+      conflicts24h,
+      conflictsPrev24h,
+      injectionHitRate,
+      queryCount: queryEvents.length,
+    }
+  }, [realtimeKnowledge, realtimeActivity])
 
   // Implements BUG-6: check if YOLO is enabled in workspace settings
   const yoloEnabled = workspaceSettings?.yoloMode !== undefined && workspaceSettings.yoloMode !== 'off'
@@ -939,6 +1023,18 @@ export function TeamDashboard({
               <GitBranch className="size-3" />
               Traceability
             </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('knowledge')}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
+                activeTab === 'knowledge'
+                  ? 'bg-foreground/5 text-foreground'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/[0.03]'
+              )}
+            >
+              Knowledge
+            </button>
           </div>
 
           {/* Content */}
@@ -1002,9 +1098,75 @@ export function TeamDashboard({
               ) : (
                 <SpecTraceabilityPanel
                   traceabilityMap={specTraceabilityMap}
+                  specRequirementIds={specRequirements.map((req) => req.id)}
                   className="h-full"
                 />
               )
+            ) : activeTab === 'knowledge' ? (
+              <div className="h-full p-3">
+                <div className="rounded-lg border border-border bg-background/40 h-full flex flex-col min-h-0">
+                  <div className="px-3 py-2 border-b border-border">
+                    <h3 className="text-sm font-semibold">Team Knowledge Bus</h3>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Recent shared memory entries captured from team execution.
+                    </p>
+                    <div className="mt-2 grid grid-cols-2 lg:grid-cols-4 gap-2">
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Entries</p>
+                        <p className="text-xs font-semibold">{knowledgeHealth.total}</p>
+                      </div>
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Stale (&gt;24h)</p>
+                        <p className="text-xs font-semibold">{knowledgeHealth.stale} ({knowledgeHealth.stalePct}%)</p>
+                      </div>
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Inject hit rate</p>
+                        <p className="text-xs font-semibold">
+                          {knowledgeHealth.injectionHitRate == null ? 'N/A' : `${knowledgeHealth.injectionHitRate}%`}
+                        </p>
+                      </div>
+                      <div className="rounded border border-border/70 px-2 py-1">
+                        <p className="text-[10px] text-muted-foreground">Conflicts (24h)</p>
+                        <p className="text-xs font-semibold">
+                          {knowledgeHealth.conflicts24h}
+                          <span className="text-muted-foreground font-normal"> (prev: {knowledgeHealth.conflictsPrev24h})</span>
+                        </p>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      Query events observed: {knowledgeHealth.queryCount}
+                    </p>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-auto p-2 space-y-2">
+                    {realtimeKnowledge.length === 0 ? (
+                      <p className="text-xs text-muted-foreground px-1">No knowledge entries captured yet.</p>
+                    ) : (
+                      realtimeKnowledge.map((entry) => (
+                        <div key={entry.id} className="rounded-md border border-border/70 p-2 bg-background/70">
+                          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <span className="font-medium text-foreground/80">{entry.type}</span>
+                            <span>•</span>
+                            <span>{entry.source}</span>
+                            <span>•</span>
+                            <span>{new Date(entry.timestamp).toLocaleString()}</span>
+                          </div>
+                          <p className="text-xs mt-1 whitespace-pre-wrap">{entry.content}</p>
+                          {entry.filePaths && entry.filePaths.length > 0 && (
+                            <p className="text-[11px] text-muted-foreground mt-1">
+                              Files: {entry.filePaths.slice(0, 3).join(', ')}
+                            </p>
+                          )}
+                          {entry.tags.length > 0 && (
+                            <p className="text-[11px] text-muted-foreground mt-0.5">
+                              Tags: {entry.tags.slice(0, 8).join(', ')}
+                            </p>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
                 <p className="text-sm">Select a teammate</p>

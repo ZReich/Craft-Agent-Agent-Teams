@@ -86,6 +86,7 @@ import {
   validateConfigWrite,
   BUILT_IN_TOOLS,
 } from './core/pre-tool-use.ts';
+import { buildKnowledgeInjectionBlock } from '../agent-teams/team-knowledge-bus-registry.ts';
 
 // Import types from generated codex-types
 import type {
@@ -298,6 +299,12 @@ export class CodexAgent extends BaseAgent {
       this.onTeammateMessage = config.onTeammateMessage;
     }
 
+    // Implements REQ-NEXT-001: Non-lead team members (e.g., Heads) should
+    // default Task calls without team_name to native in-process subagents.
+    if (config.session?.parentSessionId && config.session?.teamId) {
+      this.activeTeamName = config.session.teamId
+    }
+
     // Start config watcher for hot-reloading source changes (non-headless only)
     if (!config.isHeadless) {
       this.startConfigWatcher();
@@ -376,9 +383,19 @@ export class CodexAgent extends BaseAgent {
     this.setupClientEventHandlers();
 
     // Connect
+    // Implements REQ-001/REQ-003: always clear connection latch and reset client
+    // on connect failure to avoid stale null/disconnected threadStart states.
     this.clientConnecting = this.client.connect();
-    await this.clientConnecting;
-    this.clientConnecting = null;
+    try {
+      await this.clientConnecting;
+    } catch (error) {
+      this.debug(`App-server client connect failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.client?.forceKill();
+      this.client = null;
+      throw error;
+    } finally {
+      this.clientConnecting = null;
+    }
 
     this.debug('App-server client connected');
 
@@ -423,6 +440,38 @@ export class CodexAgent extends BaseAgent {
     }
 
     return this.client;
+  }
+
+  /**
+   * Detect transient app-server transport failures that may recover after reconnect.
+   */
+  private isRecoverableClientError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    return /not connected|client not connected|connection closing|broken pipe|econnreset|write eof|transport/i.test(message);
+  }
+
+  /**
+   * Run an operation against a connected client with one bounded reconnect retry.
+   */
+  private async withConnectedClient<T>(
+    operationName: string,
+    operation: (client: AppServerClient) => Promise<T>,
+  ): Promise<T> {
+    const attempt = async () => {
+      const client = await this.ensureClient();
+      return operation(client);
+    };
+
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!this.isRecoverableClientError(error)) {
+        throw error;
+      }
+      this.debug(`[${operationName}] Recoverable client error, reconnecting once: ${error instanceof Error ? error.message : String(error)}`);
+      await this.reconnect();
+      return attempt();
+    }
   }
 
   /**
@@ -1161,8 +1210,12 @@ export class CodexAgent extends BaseAgent {
       toolName === 'Task' ||
       sdkToolName === 'Task' ||
       sdkToolName.endsWith('__Task');
+    const isNonLeadTeamMember = Boolean(this.config.session?.parentSessionId)
+    const allowNativeSubagentSpawn = isSpawnTool && !explicitTeamName && isNonLeadTeamMember && Boolean(this.activeTeamName)
 
-    if (isSpawnTool && teamName && this.onTeammateSpawnRequested) {
+    if (allowNativeSubagentSpawn) {
+      this.debug('[AgentTeams] Task without explicit team_name from team member - falling through to native subagent spawn')
+    } else if (isSpawnTool && teamName && this.onTeammateSpawnRequested) {
       // Implements REQ-001: Let session manager generate witty codenames
       const teammateName = (inputObj.name as string) || undefined;
       const prompt = (inputObj.prompt as string) || (inputObj.input as string) || '';
@@ -1326,10 +1379,30 @@ export class CodexAgent extends BaseAgent {
     // Track modifications to input
     let modifiedInput: Record<string, unknown> | null = null;
 
+    // REQ-NEXT-001: inject shared team memory for native subagent Task spawns.
+    if (allowNativeSubagentSpawn) {
+      const teamId = this.config.session?.teamId
+      const rawPrompt = (inputObj.prompt as string) || (inputObj.input as string) || ''
+      if (teamId && rawPrompt) {
+        const sharedKnowledge = buildKnowledgeInjectionBlock(teamId, rawPrompt, {
+          maxChars: 1_800,
+          maxEntries: 8,
+          maxTokens: 500,
+        })
+        if (sharedKnowledge) {
+          modifiedInput = {
+            ...inputObj,
+            prompt: `${sharedKnowledge}\n\n${rawPrompt}`,
+          }
+          this.debug('[KnowledgeBus][REQ-NEXT-001] Injected shared team memory into Task prompt for subagent spawn')
+        }
+      }
+    }
+
     // ============================================================
     // PATH EXPANSION: Expand ~ in file paths for all file tools
     // ============================================================
-    const pathResult = expandToolPaths(sdkToolName, inputObj, (msg) => this.debug(`PreToolUse: ${msg}`));
+    const pathResult = expandToolPaths(sdkToolName, modifiedInput || inputObj, (msg) => this.debug(`PreToolUse: ${msg}`));
     if (pathResult.modified) {
       modifiedInput = pathResult.input;
     }
@@ -1842,7 +1915,7 @@ export class CodexAgent extends BaseAgent {
    * Falls back to null on failure — caller should fall back to Claude.
    */
   async generateTitle(prompt: string): Promise<string | null> {
-    const client = await this.ensureClient();
+    let client = await this.ensureClient();
 
     // Use the cheapest model (Codex Mini) — title is just a 5-word summary
     const miniModelId = getModelIdByShortName('Codex Mini');
@@ -1851,13 +1924,28 @@ export class CodexAgent extends BaseAgent {
     this.debug(`[generateTitle] Starting ephemeral thread with model=${model}`);
 
     // Start an ephemeral thread (not persisted, no tools)
-    const response = await client.threadStart({
-      model,
-      ephemeral: true,
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
-      baseInstructions: 'Reply with ONLY the requested text. No explanation.',
-    });
+    let response;
+    try {
+      response = await client.threadStart({
+        model,
+        ephemeral: true,
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        baseInstructions: 'Reply with ONLY the requested text. No explanation.',
+      });
+    } catch (error) {
+      if (!this.isRecoverableClientError(error)) throw error;
+      this.debug(`[generateTitle.threadStart] Recoverable client error, reconnecting once: ${error instanceof Error ? error.message : String(error)}`);
+      await this.reconnect();
+      client = await this.ensureClient();
+      response = await client.threadStart({
+        model,
+        ephemeral: true,
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        baseInstructions: 'Reply with ONLY the requested text. No explanation.',
+      });
+    }
     const threadId = response.thread.id;
 
     this.debug(`[generateTitle] Thread started: ${threadId}`);
@@ -2023,7 +2111,7 @@ export class CodexAgent extends BaseAgent {
             this.debug('Injected recovery context into message');
           }
 
-          const response = await client.threadStart({
+          const response = await this.withConnectedClient('chat.recovery.threadStart', currentClient => currentClient.threadStart({
             model,
             cwd: this.workingDirectory,
             approvalPolicy: this.getApprovalPolicy(permissionMode),
@@ -2039,14 +2127,14 @@ export class CodexAgent extends BaseAgent {
                   undefined, // preset (default)
                   'Codex' // backend name
                 ),
-          });
+          }));
           this.codexThreadId = response.thread.id;
           this.debug(`Started new thread: ${this.codexThreadId}`);
           this.config.onSdkSessionIdUpdate?.(this.codexThreadId);
         }
       } else {
         // Start new thread
-        const response = await client.threadStart({
+        const response = await this.withConnectedClient('chat.new.threadStart', currentClient => currentClient.threadStart({
           model,
           cwd: this.workingDirectory,
           approvalPolicy: this.getApprovalPolicy(permissionMode),
@@ -2062,7 +2150,7 @@ export class CodexAgent extends BaseAgent {
                 undefined, // preset (default)
                 'Codex' // backend name
               ),
-        });
+        }));
         this.codexThreadId = response.thread.id;
         this.debug(`Started new thread: ${this.codexThreadId}`);
         this.config.onSdkSessionIdUpdate?.(this.codexThreadId);
@@ -2766,12 +2854,12 @@ export class CodexAgent extends BaseAgent {
 
       // Start an ephemeral thread with no system prompt
       debug(`[CodexAgent.runMiniCompletion] Starting ephemeral thread...`);
-      const threadResponse = await client.threadStart({
+      const threadResponse = await this.withConnectedClient('runMiniCompletion.threadStart', currentClient => currentClient.threadStart({
         model,
         cwd: this.workingDirectory,
         baseInstructions: '', // Empty - no system prompt
         ephemeral: true, // Don't persist this thread
-      });
+      }));
       const threadId = threadResponse.thread.id;
       debug(`[CodexAgent.runMiniCompletion] Started ephemeral thread: ${threadId}`);
 
@@ -2853,3 +2941,4 @@ export class CodexAgent extends BaseAgent {
 
 /** @deprecated Use CodexAgent instead */
 export { CodexAgent as CodexBackend };
+

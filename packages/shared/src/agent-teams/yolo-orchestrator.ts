@@ -35,6 +35,7 @@ import { DEFAULT_YOLO_CONFIG, DEFAULT_DESIGN_FLOW_CONFIG, mergeDesignFlowConfig 
 import type { AgentTeamManager } from '../agent/agent-team-manager';
 import type { ReviewLoopOrchestrator } from './review-loop';
 import { classifyTaskDomain } from './routing-policy';
+import { selectArchitectureMode, type ArchitectureLearningHint } from './architecture-selector';
 
 // ============================================================
 // Conditional Head Spawning (REQ-P1)
@@ -861,13 +862,24 @@ export class YoloOrchestrator extends EventEmitter {
 /**
  * Decide whether to spawn Heads (managed) or workers directly (flat).
  *
- * - 1 domain AND ≤5 tasks → flat (workers spawn directly, no Head overhead)
- * - 2+ domains → managed (domain-specific Heads coordinate their workers)
- * - 1 domain AND 6+ tasks → managed (volume warrants a coordinator)
+ * - 2 domains AND ≤4 tasks per domain → flat (skill-injected workers, lower overhead)
+ * - 2 domains AND >4 tasks in any domain → managed
+ * - 3+ domains → managed
+ * - 1 domain AND 8+ tasks → managed (raised threshold from 6)
  * - Research/explore only → always flat (independent by nature)
+ * - UX/design work always keeps a Head path (hard enforcement preservation)
  */
-export function decideSpawnStrategy(tasks: { id: string; title: string; description?: string; taskType?: string }[]): SpawnStrategy {
+export function decideSpawnStrategy(
+  tasks: { id: string; title: string; description?: string; taskType?: string; dependencies?: string[] }[],
+  options?: { learningHint?: ArchitectureLearningHint },
+): SpawnStrategy {
   if (tasks.length === 0) return { mode: 'flat' }
+
+  const architectureDecision = selectArchitectureMode(tasks, { learningHint: options?.learningHint })
+
+  if (architectureDecision.mode === 'single' || architectureDecision.mode === 'flat') {
+    return { mode: 'flat' }
+  }
 
   // Classify each task by domain
   const tasksByDomain = new Map<string, string[]>()
@@ -883,6 +895,21 @@ export function decideSpawnStrategy(tasks: { id: string; title: string; descript
   const meaningfulDomains = [...tasksByDomain.entries()].filter(
     ([domain]) => domain !== 'other'
   )
+  const forceManaged = architectureDecision.mode === 'managed' || architectureDecision.mode === 'hybrid'
+
+  if (forceManaged) {
+    const managedDomains: Array<[string, string[]]> = meaningfulDomains.length > 0
+      ? meaningfulDomains.map(([domain, taskIds]) => [domain, taskIds])
+      : [['other', tasks.map((t) => t.id)]]
+    const heads: DomainHeadPlan[] = managedDomains.map(([domain, taskIds]) => ({ domain, taskIds }))
+
+    const otherTasks = tasksByDomain.get('other')
+    if (otherTasks?.length && heads.length > 0 && !heads.some((head) => head.domain === 'other')) {
+      const largest = heads.reduce((a, b) => a.taskIds.length >= b.taskIds.length ? a : b)
+      largest.taskIds.push(...otherTasks)
+    }
+    return { mode: 'managed', heads }
+  }
 
   // Research/explore only → always flat
   const researchOnly = meaningfulDomains.every(
@@ -890,8 +917,14 @@ export function decideSpawnStrategy(tasks: { id: string; title: string; descript
   )
   if (researchOnly) return { mode: 'flat' }
 
-  // Multi-domain → managed with one Head per domain
-  if (meaningfulDomains.length >= 2) {
+  // REQ-NEXT-010: Preserve UX/design hard enforcement by keeping managed mode.
+  if (meaningfulDomains.some(([domain]) => domain === 'ux_design')) {
+    const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({ domain, taskIds }))
+    return { mode: 'managed', heads }
+  }
+
+  // REQ-NEXT-010: 3+ meaningful domains still warrant managed coordination.
+  if (meaningfulDomains.length >= 3) {
     const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({
       domain,
       taskIds,
@@ -905,14 +938,33 @@ export function decideSpawnStrategy(tasks: { id: string; title: string; descript
     return { mode: 'managed', heads }
   }
 
-  // Single domain — check task count
-  if (tasks.length >= 6) {
+  // REQ-NEXT-010: exactly 2 meaningful domains can run flat for small loads.
+  if (meaningfulDomains.length === 2) {
+    const perDomainWithinFlatBudget = meaningfulDomains.every(([, taskIds]) => taskIds.length <= 4)
+    if (perDomainWithinFlatBudget) {
+      return { mode: 'flat' }
+    }
+
+    const heads: DomainHeadPlan[] = meaningfulDomains.map(([domain, taskIds]) => ({
+      domain,
+      taskIds,
+    }))
+    const otherTasks = tasksByDomain.get('other')
+    if (otherTasks?.length && heads.length > 0) {
+      const largest = heads.reduce((a, b) => a.taskIds.length >= b.taskIds.length ? a : b)
+      largest.taskIds.push(...otherTasks)
+    }
+    return { mode: 'managed', heads }
+  }
+
+  // Single domain — raised managed threshold (REQ-NEXT-010).
+  if (tasks.length >= 8) {
     const allTaskIds = tasks.map(t => t.id)
     const domain = meaningfulDomains[0]?.[0] ?? 'other'
     return { mode: 'managed', heads: [{ domain, taskIds: allTaskIds }] }
   }
 
-  // Simple case: single domain, ≤5 tasks → flat
+  // Simple case: single domain, ≤7 tasks → flat
   return { mode: 'flat' }
 }
 

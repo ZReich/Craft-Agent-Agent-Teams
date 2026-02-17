@@ -365,6 +365,50 @@ export interface QualityGateStageConfig {
   binary?: boolean;
 }
 
+/** Thresholds for bypassing low-risk AI review stages (REQ-NEXT-013). */
+export interface QualityGateBypassConfig {
+  /** Master toggle for low-risk AI stage bypass logic. */
+  enabled: boolean;
+  architecture: {
+    /** Max changed lines allowed to bypass architecture review. */
+    maxDiffLines: number;
+    /** Max files changed allowed to bypass architecture review. */
+    maxFilesChanged: number;
+    /** Whether newly added files are allowed for architecture bypass. */
+    allowNewFiles: boolean;
+    /** Score assigned when architecture review is bypassed. */
+    defaultScore: number;
+  };
+  simplicity: {
+    /** Max changed lines allowed to bypass simplicity review. */
+    maxDiffLines: number;
+    /** Max detected function length allowed for simplicity bypass. */
+    maxFunctionLines: number;
+    /** Score assigned when simplicity review is bypassed. */
+    defaultScore: number;
+  };
+  errors: {
+    /** Max changed lines allowed to bypass error analysis. */
+    maxDiffLines: number;
+    /** Require tests to pass before bypassing error analysis. */
+    requirePassingTests: boolean;
+    /** Require at least this many tests to have run/passed for bypass. */
+    minTestCount: number;
+    /** When true, async/await usage prevents bypass. */
+    disallowAsyncAwait: boolean;
+    /** Score assigned when error analysis is bypassed. */
+    defaultScore: number;
+  };
+}
+
+/** Deep-partial override shape for workspace-configurable bypass tuning. */
+export interface QualityGateBypassOverrides {
+  enabled?: boolean;
+  architecture?: Partial<QualityGateBypassConfig['architecture']>;
+  simplicity?: Partial<QualityGateBypassConfig['simplicity']>;
+  errors?: Partial<QualityGateBypassConfig['errors']>;
+}
+
 /** Quality gate configuration (stored in workspace config) */
 export interface QualityGateConfig {
   /** Master toggle for quality gates */
@@ -389,6 +433,18 @@ export interface QualityGateConfig {
   knownFailingTests?: string[];
   /** Test scope for per-task quality gates. 'affected' runs only tests related to changed files (vitest --changed), 'full' runs the entire suite, 'none' skips tests. Default: 'affected' */
   testScope?: 'full' | 'affected' | 'none';
+  /** Use a single batched AI review call for stages 3-6 (REQ-NEXT-012). Default: true */
+  useCombinedReview?: boolean;
+  /** Max concurrent teammate quality-gate pipelines per team (REQ-NEXT-005). */
+  maxParallelReviews?: number;
+  /** Low-risk stage bypass thresholds and defaults (REQ-NEXT-013). */
+  bypass?: QualityGateBypassOverrides;
+  /** Deterministic anchor blending for architecture/simplicity/errors (REQ-NEXT-003). */
+  deterministicAnchors?: {
+    enabled: boolean;
+    /** Blend weight for deterministic anchors: 0-1, where 0.3 = 30% anchor / 70% LLM. */
+    weight: number;
+  };
   /** Per-stage configuration */
   stages: Record<QualityGateStageName, QualityGateStageConfig>;
 }
