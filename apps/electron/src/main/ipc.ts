@@ -1879,6 +1879,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsWorkerThinking: config?.agentTeams?.workerThinking ?? false,
       agentTeamsReviewerThinking: config?.agentTeams?.reviewerThinking ?? false,
       agentTeamsEscalationThinking: config?.agentTeams?.escalationThinking ?? false,
+      agentTeamsUxDesignPreferOpus: config?.agentTeams?.uxDesignPreferOpus ?? true,
       agentTeamsCostCapUsd: config?.agentTeams?.costCapUsd,
       agentTeamsMemoryInjectionEnabled: config?.agentTeams?.memory?.injectionEnabled ?? true,
       agentTeamsKnowledgeMetricsUiEnabled: config?.agentTeams?.memory?.metricsUiEnabled ?? true,
@@ -1998,6 +1999,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsWorkerThinking: 'workerThinking',
       agentTeamsReviewerThinking: 'reviewerThinking',
       agentTeamsEscalationThinking: 'escalationThinking',
+      agentTeamsUxDesignPreferOpus: 'uxDesignPreferOpus',
       agentTeamsCostCapUsd: 'costCapUsd',
     }
     const agentTeamsMemoryKeyMap: Record<string, string> = {
@@ -4001,6 +4003,18 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         ?? teamManager.getActiveTeams().find(t => t.members.some(m => m.id === teammate.id))?.id ?? null
       if (teamId) teammateToTeam.set(teammate.id, teamId)
       if (!teamId) return
+      const team = teamManager.getTeam(teamId)
+      // Implements REQ-001: emit team:initialized when the first teammate appears so
+      // renderer hooks don't rely on a dead/never-emitted lifecycle event.
+      if (team && team.members.length === 1) {
+        const initializedEnvelope: import('@craft-agent/core/types').TeamInitializedEvent = {
+          type: 'team:initialized',
+          teamId,
+          payload: { team },
+          timestamp: new Date().toISOString(),
+        }
+        windowManager.broadcastToAll(IPC_CHANNELS.AGENT_TEAMS_EVENT, initializedEnvelope)
+      }
       const envelope: import('@craft-agent/core/types').TeammateSpawnedEvent = {
         type: 'teammate:spawned',
         teamId,

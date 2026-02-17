@@ -245,6 +245,16 @@ export function TeamDashboard({
   const teamEventsHook = useTeamStateSync(
     session.teamId || session.id,
     {
+      onTeamUpdated: (event) => {
+        if (event.payload.team?.status === 'completed') {
+          // Implements REQ-001: keep completion UX in sync with explicit team status transitions.
+          setCompletionBannerDismissed(false)
+        }
+      },
+      onTeamCompleted: () => {
+        // Implements REQ-001: handle explicit completion envelope from main process.
+        setCompletionBannerDismissed(false)
+      },
       onTeammateUpdated: (event) => {
         const teammate = event.payload.teammate
         setRealtimeTeammateStatus((prev) => ({

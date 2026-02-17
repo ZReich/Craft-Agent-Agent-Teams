@@ -168,6 +168,8 @@ export default function AgentTeamsSettingsPage() {
   const [workerThinking, setWorkerThinking] = useState(false)
   const [reviewerThinking, setReviewerThinking] = useState(false)
   const [escalationThinking, setEscalationThinking] = useState(false)
+  // UX routing policy toggle (REQ-AUDIT-007)
+  const [uxDesignPreferOpus, setUxDesignPreferOpus] = useState(true)
 
   // Provider API keys (stored in encrypted secure storage, not plaintext config)
   const [moonshotApiKey, setMoonshotApiKey] = useState('')
@@ -246,7 +248,7 @@ export default function AgentTeamsSettingsPage() {
           setSelectedPreset(migrated)
           // Persist migration if changed
           if (migrated !== settings.agentTeamsModelPreset) {
-            saveSetting('agentTeamsModelPreset', migrated)
+            await electronAPI.updateWorkspaceSetting(activeWorkspaceId, 'agentTeamsModelPreset', migrated)
           }
         }
         if (settings?.agentTeamsLeadModel) setLeadModel(settings.agentTeamsLeadModel)
@@ -263,6 +265,7 @@ export default function AgentTeamsSettingsPage() {
         if (settings?.agentTeamsWorkerThinking !== undefined) setWorkerThinking(settings.agentTeamsWorkerThinking)
         if (settings?.agentTeamsReviewerThinking !== undefined) setReviewerThinking(settings.agentTeamsReviewerThinking)
         if (settings?.agentTeamsEscalationThinking !== undefined) setEscalationThinking(settings.agentTeamsEscalationThinking)
+        if (settings?.agentTeamsUxDesignPreferOpus !== undefined) setUxDesignPreferOpus(settings.agentTeamsUxDesignPreferOpus)
         if (settings?.agentTeamsCostCapUsd) {
           setCostCapEnabled(true)
           setCostCapUsd(String(settings.agentTeamsCostCapUsd))
@@ -358,7 +361,7 @@ export default function AgentTeamsSettingsPage() {
     }
 
     loadSettings()
-  }, [activeWorkspaceId, hasAgentTeamsSettingsApi])
+  }, [activeWorkspaceId, hasAgentTeamsSettingsApi, electronAPI])
 
   // Save workspace setting helper
   const saveSetting = useCallback(
@@ -370,7 +373,7 @@ export default function AgentTeamsSettingsPage() {
         console.error(`Failed to save ${key}:`, error)
       }
     },
-    [activeWorkspaceId, hasAgentTeamsSettingsApi]
+    [activeWorkspaceId, hasAgentTeamsSettingsApi, electronAPI]
   )
 
   // Toggle handler
@@ -386,7 +389,7 @@ export default function AgentTeamsSettingsPage() {
         console.error('Failed to toggle agent teams:', error)
       }
     },
-    [activeWorkspaceId, hasAgentTeamsSettingsApi, onWorkspaceFeatureFlagsChange]
+    [activeWorkspaceId, hasAgentTeamsSettingsApi, onWorkspaceFeatureFlagsChange, electronAPI]
   )
 
   // Preset change handler
@@ -480,6 +483,12 @@ export default function AgentTeamsSettingsPage() {
     }
     setters[role]?.(enabled)
     if (keys[role]) saveSetting(keys[role], enabled)
+  }, [saveSetting])
+
+  // Implements REQ-AUDIT-007: allow users to control UX/Design Opus preference policy.
+  const handleUxDesignPreferOpusToggle = useCallback((enabled: boolean) => {
+    setUxDesignPreferOpus(enabled)
+    saveSetting('agentTeamsUxDesignPreferOpus', enabled)
   }, [saveSetting])
 
   // Cost cap handlers
@@ -663,7 +672,7 @@ export default function AgentTeamsSettingsPage() {
     } finally {
       setDesignTemplatesLoading(false)
     }
-  }, [activeWorkspaceId])
+  }, [activeWorkspaceId, electronAPI])
 
   const handleLoadTemplateDetail = useCallback(async (templateId: string): Promise<TemplateDetail | null> => {
     if (!electronAPI || typeof electronAPI.loadDesignTemplate !== 'function' || !activeWorkspaceId) return null
@@ -682,13 +691,13 @@ export default function AgentTeamsSettingsPage() {
       sourceSessionId: full.sourceSessionId,
       sourceTeamId: full.sourceTeamId,
     }
-  }, [activeWorkspaceId])
+  }, [activeWorkspaceId, electronAPI])
 
   const handleDeleteTemplate = useCallback(async (templateId: string) => {
     if (!electronAPI || typeof electronAPI.deleteDesignTemplate !== 'function' || !activeWorkspaceId) return
     await electronAPI.deleteDesignTemplate(activeWorkspaceId, templateId)
     setDesignTemplates(prev => prev.filter(t => t.id !== templateId))
-  }, [activeWorkspaceId])
+  }, [activeWorkspaceId, electronAPI])
 
   // Design Flow handlers
   const handleDesignFlowToggle = useCallback((enabled: boolean) => {
@@ -763,27 +772,58 @@ export default function AgentTeamsSettingsPage() {
     isCodexModel(model)
   )
 
+  // Implements REQ-AT-011: Surface newly configured Codex models in Agent Teams settings.
+  const codexModelOptions = React.useMemo(() => {
+    const optionsById = new Map<string, { value: string; label: string; description?: string }>()
+
+    for (const option of CODEX_MODEL_OPTIONS) {
+      optionsById.set(option.value, option)
+    }
+
+    for (const connection of llmConnections || []) {
+      if (!isOpenAIProvider(connection.providerType)) continue
+      if (!Array.isArray(connection.models)) continue
+
+      for (const model of connection.models) {
+        const modelId = typeof model === 'string' ? model : model?.id
+        if (!modelId || !isCodexModel(modelId) || optionsById.has(modelId)) continue
+
+        const modelName = typeof model === 'string'
+          ? getModelShortName(modelId)
+          : (model.name || getModelShortName(modelId))
+
+        optionsById.set(modelId, {
+          value: modelId,
+          label: modelName,
+          description: `Available via ${connection.name}`,
+        })
+      }
+    }
+
+    return Array.from(optionsById.values())
+  }, [llmConnections])
+
   const roleModelOptions = React.useMemo(() => {
     if (hasCodexConnection || codexSelected) {
       return [
         ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('claude-')),
-        ...CODEX_MODEL_OPTIONS,
+        ...codexModelOptions,
         ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('kimi-')),
       ]
     }
     return BASE_MODEL_OPTIONS
-  }, [hasCodexConnection, codexSelected])
+  }, [hasCodexConnection, codexSelected, codexModelOptions])
 
   const reviewModelOptions = React.useMemo(() => {
     if (hasCodexConnection || codexSelected) {
       return [
         ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('claude-')),
-        ...CODEX_MODEL_OPTIONS,
+        ...codexModelOptions,
         ...BASE_MODEL_OPTIONS.filter((o) => o.value.startsWith('kimi-')),
       ]
     }
     return BASE_MODEL_OPTIONS
-  }, [hasCodexConnection, codexSelected])
+  }, [hasCodexConnection, codexSelected, codexModelOptions])
 
   const renderQualityHelpLabel = useCallback((entryKey: keyof typeof QUALITY_GATE_HELP, fallback: string) => {
     const help = QUALITY_GATE_HELP[entryKey]
@@ -941,6 +981,15 @@ export default function AgentTeamsSettingsPage() {
                           Thinking enabled for Lead, Reviewer, and Escalation roles.
                         </p>
                       )}
+
+                      <SettingsCard className="mt-4">
+                        <SettingsToggle
+                          label="Prefer Opus for UX/Design"
+                          description="When enabled, UX/Design tasks try Opus first, then fall back to Codex Spark/Codex if Opus is unavailable. UX/Design always keeps Thinking ON."
+                          checked={uxDesignPreferOpus}
+                          onCheckedChange={handleUxDesignPreferOpusToggle}
+                        />
+                      </SettingsCard>
                     </SettingsSection>
 
                     {/* Per-Role Model Assignment (Custom strategy only) */}

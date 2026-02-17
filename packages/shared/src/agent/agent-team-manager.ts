@@ -122,21 +122,40 @@ export class AgentTeamManager extends EventEmitter {
   /** Optional per-task completion contracts (artifact requirements, etc.) */
   private taskCompletionContracts = new Map<string, Map<string, TaskCompletionContract>>(); // teamId → taskId → contract
 
-  /** Review loop orchestrator — when set, task completions are routed through quality gates */
-  private reviewLoop: ReviewLoopOrchestrator | null = null;
+  /** Review loop orchestrators keyed per team; task completion interception is team-scoped. */
+  private reviewLoops = new Map<string, ReviewLoopOrchestrator>();
+  private static readonly GLOBAL_REVIEW_LOOP_KEY = '__global__';
 
   /**
    * Attach a review loop orchestrator.
    * When attached, task completions from teammates are intercepted and routed
    * through quality gate review before being accepted as truly "completed."
    */
-  setReviewLoop(reviewLoop: ReviewLoopOrchestrator | null): void {
-    this.reviewLoop = reviewLoop;
+  setReviewLoop(reviewLoop: ReviewLoopOrchestrator | null, teamId?: string): void {
+    const key = teamId ? this.resolveTeamId(teamId) : AgentTeamManager.GLOBAL_REVIEW_LOOP_KEY;
+    if (!reviewLoop) {
+      this.reviewLoops.delete(key);
+      return;
+    }
+    this.reviewLoops.set(key, reviewLoop);
   }
 
   /** Get the attached review loop (if any) */
-  getReviewLoop(): ReviewLoopOrchestrator | null {
-    return this.reviewLoop;
+  getReviewLoop(teamId?: string): ReviewLoopOrchestrator | null {
+    if (teamId) {
+      const resolvedTeamId = this.resolveTeamId(teamId);
+      return this.reviewLoops.get(resolvedTeamId)
+        ?? this.reviewLoops.get(AgentTeamManager.GLOBAL_REVIEW_LOOP_KEY)
+        ?? null;
+    }
+
+    return this.reviewLoops.get(AgentTeamManager.GLOBAL_REVIEW_LOOP_KEY)
+      ?? this.reviewLoops.values().next().value
+      ?? null;
+  }
+
+  getAllReviewLoops(): ReviewLoopOrchestrator[] {
+    return Array.from(new Set(this.reviewLoops.values()));
   }
 
   // ── Team State Persistence ──────────────────────────────────
@@ -306,6 +325,7 @@ export class AgentTeamManager extends EventEmitter {
     this.yoloStates.clear();
     this.teamPhases.clear();
     this.yoloOrchestrators.clear();
+    this.reviewLoops.clear();
     this.teamStateStores.clear();
     this.qualityGateResults.clear();
     this.teamWorkspaceRoots.clear();
@@ -338,7 +358,7 @@ export class AgentTeamManager extends EventEmitter {
     this.addActivity(teamId, 'teammate-shutdown', 'Team cleaned up', undefined, undefined);
 
     // Clean up review loop state for this team
-    this.reviewLoop?.cleanup(teamId);
+    this.getReviewLoop(teamId)?.cleanup(teamId);
 
     // Stop YOLO if running
     this.stopYolo(teamId, 'Team cleanup');
@@ -355,6 +375,7 @@ export class AgentTeamManager extends EventEmitter {
       try { map.delete(teamId); } catch { /* continue cleanup */ }
     }
     try { this.synthesisRequested.delete(teamId); } catch { /* continue */ }
+    try { this.reviewLoops.delete(teamId); } catch { /* continue */ }
     try { clearTeamKnowledgeBus(teamId) } catch { /* continue */ }
   }
 
@@ -741,9 +762,10 @@ export class AgentTeamManager extends EventEmitter {
     // --- Review Loop Interception ---
     // When a teammate marks a task "completed" and a review loop is attached,
     // route through quality gates instead of accepting immediately.
+    const reviewLoop = this.getReviewLoop(teamId);
     if (
       status === 'completed' &&
-      this.reviewLoop &&
+      reviewLoop &&
       !options?.bypassReviewLoop &&
       task.assignee // only intercept teammate tasks (not lead/system tasks)
     ) {
@@ -751,7 +773,7 @@ export class AgentTeamManager extends EventEmitter {
       this.emit('task:updated', task);
       this.tasks.set(teamId, this.trimTasks(teamTasks));
       this.addActivity(teamId, 'task-in-review', `Task "${task.title}" → quality gate review`, undefined, undefined, taskId);
-      this.reviewLoop.enqueueReview(teamId, taskId, task);
+      reviewLoop.enqueueReview(teamId, taskId, task);
       return;
     }
 

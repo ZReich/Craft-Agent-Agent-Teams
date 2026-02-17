@@ -664,7 +664,18 @@ export default function App() {
     })
 
     return cleanup
-  }, [processAgentEvent, windowWorkspaceId, store, updateSessionDirect, showSessionNotification, addSession])
+  }, [
+    processAgentEvent,
+    windowWorkspaceId,
+    store,
+    updateSessionDirect,
+    showSessionNotification,
+    addSession,
+    workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
+    setSessionOptions,
+  ])
 
   // Listen for menu bar events
   useEffect(() => {
@@ -979,7 +990,15 @@ export default function App() {
         ]
       }))
     }
-  }, [updateSessionById, skills, sources, windowWorkspaceSlug, workspaceAgentTeamsEnabled])
+  }, [
+    updateSessionById,
+    skills,
+    sources,
+    windowWorkspaceSlug,
+    workspaceAgentTeamsEnabled,
+    workspaceYoloEnabled,
+    workspaceDesignFlowEnabled,
+  ])
 
   /**
    * Unified handler for all session option changes.
@@ -1004,7 +1023,7 @@ export default function App() {
       window.electronAPI.sessionCommand(sessionId, { type: 'setThinkingLevel', level: updates.thinkingLevel })
     }
     // ultrathinkEnabled is UI-only (single-shot), no backend persistence needed
-  }, [workspaceAgentTeamsEnabled])
+  }, [workspaceAgentTeamsEnabled, workspaceYoloEnabled, workspaceDesignFlowEnabled, setSessionOptions])
 
   // Callback for settings pages to update workspace-level feature flags in real-time
   // Fixes: toggles in Session Controls not appearing until app restart after settings change

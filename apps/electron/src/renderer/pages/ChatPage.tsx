@@ -529,6 +529,22 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
           updateMeta(session.id, { teamStatus: event.payload.team.status })
         }
       }
+      if (event.type === 'team:completed') {
+        // Implements REQ-001: react to explicit completion envelopes from main process.
+        updateMeta(session.id, { teamStatus: 'completed' })
+        setTeamStatus((prev) => (prev ? { ...prev, status: 'completed' } : prev))
+        if (!showTeamDashboard) {
+          teamCompletedSummaryRef.current = {
+            teammateCount: session.teammateSessionIds?.length ?? 0,
+            taskCount: event.payload.tasksCompleted,
+            elapsed: session.createdAt
+              ? formatDistanceToNowStrict(new Date(session.createdAt))
+              : '',
+          }
+          setTeamCompletedMinimized(true)
+        }
+        void loadTeamData()
+      }
       if (event.type === 'cost:updated') {
         setTeamCost(event.payload.summary)
       }
@@ -555,7 +571,18 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
       }
       cleanup?.()
     }
-  }, [showTeamDashboard, session?.teamId, teamSessionIds, ensureMessagesLoaded, loadTeamData, scheduleTeamDataReload])
+  }, [
+    showTeamDashboard,
+    session?.teamId,
+    session?.id,
+    session?.createdAt,
+    session?.teammateSessionIds,
+    teamSessionIds,
+    ensureMessagesLoaded,
+    loadTeamData,
+    scheduleTeamDataReload,
+    updateMeta,
+  ])
 
   React.useEffect(() => {
     if (!showTeamDashboard) return
