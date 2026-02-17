@@ -76,4 +76,24 @@ describe('SDD auto-spec + compact-spec', () => {
     expect(withoutSpec).toContain(basePrompt);
     expect(withoutSpec).toContain('TEAM COMPLETION PROTOCOL (MANDATORY)');
   });
+
+  it('injects tool budgets into teammate prompts (REQ-BUDGET-003)', () => {
+    const basePrompt = 'Research restaurants';
+    const budgets = { WebSearch: 7, Read: 20, _default: 15 };
+    const prompt = buildTeammatePromptWithCompactSpec(basePrompt, null, budgets);
+
+    expect(prompt).toContain('TOOL BUDGETS (HARD LIMITS)');
+    expect(prompt).toContain('WebSearch: 7 calls');
+    expect(prompt).toContain('Read: 20 calls');
+    expect(prompt).toContain('All other tools: 15 calls');
+    expect(prompt).toContain('make each call count');
+    // Completion protocol still present
+    expect(prompt).toContain('TEAM COMPLETION PROTOCOL (MANDATORY)');
+  });
+
+  it('omits budget section when no budgets provided', () => {
+    const prompt = buildTeammatePromptWithCompactSpec('Do work', null);
+    expect(prompt).not.toContain('TOOL BUDGETS');
+    expect(prompt).toContain('TEAM COMPLETION PROTOCOL (MANDATORY)');
+  });
 });

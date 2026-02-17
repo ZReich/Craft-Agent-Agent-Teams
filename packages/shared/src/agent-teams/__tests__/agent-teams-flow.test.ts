@@ -18,7 +18,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 // ── Modules Under Test ──────────────────────────────────────
-import { ToolCallThrottle, DEFAULT_THROTTLE_CONFIG } from '../tool-call-throttle';
+import { ToolCallThrottle, DEFAULT_THROTTLE_CONFIG, DEFAULT_TOOL_BUDGETS, DEFAULT_MAX_CALLS } from '../tool-call-throttle';
 import {
   classifyTaskDomain,
   decideTeammateRouting,
@@ -51,8 +51,8 @@ import type {
 // STORY 1: Tool Call Throttle
 // ============================================================
 
-describe('Tool Call Throttle — TCP Slow-Start & AIMD', () => {
-  it('starts in slow-start with initialWindow budget', () => {
+describe('Tool Call Throttle — Hard Budget Cap', () => {
+  it('initializes state on first check', () => {
     const throttle = new ToolCallThrottle();
     const state = throttle.getToolState('Read');
     expect(state).toBeUndefined(); // no state until first check
@@ -62,91 +62,78 @@ describe('Tool Call Throttle — TCP Slow-Start & AIMD', () => {
 
     const postState = throttle.getToolState('Read');
     expect(postState).toBeDefined();
-    expect(postState!.inSlowStart).toBe(true);
-    expect(postState!.budget).toBe(DEFAULT_THROTTLE_CONFIG.initialWindow);
+    expect(postState!.totalCalls).toBe(1);
+    expect(postState!.maxCalls).toBe(DEFAULT_TOOL_BUDGETS['Read']); // 20
   });
 
-  it('allows calls within budget', () => {
-    const throttle = new ToolCallThrottle({ initialWindow: 3 });
+  it('allows calls within hard budget cap', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { Read: 3 } });
 
     expect(throttle.check('Read', 'a').allowed).toBe(true);
     expect(throttle.check('Read', 'b').allowed).toBe(true);
     expect(throttle.check('Read', 'c').allowed).toBe(true);
-    // 4th call should fail — budget is 3
+    // 4th call blocked by hard cap
     expect(throttle.check('Read', 'd').allowed).toBe(false);
   });
 
-  it('doubles budget on diverse success during slow-start', () => {
-    const throttle = new ToolCallThrottle({ initialWindow: 2, ssthresh: 8 });
+  it('tracks diversity via recordSuccess for observability', () => {
+    const throttle = new ToolCallThrottle();
 
-    // Make 2 allowed calls with different inputs
+    // Make diverse calls and record success
     throttle.check('Read', 'file-a');
     throttle.check('Read', 'file-b');
-
-    // Record diverse success
     throttle.recordSuccess('Read', 'file-a');
     throttle.recordSuccess('Read', 'file-b');
 
     const state = throttle.getToolState('Read');
-    // Budget should have doubled from 2 → 4 (diverse success in slow-start)
-    expect(state!.budget).toBeGreaterThan(2);
-    expect(state!.inSlowStart).toBe(true);
+    // Budget grows on diverse success (AIMD still tracks internally)
+    expect(state!.budget).toBeGreaterThan(DEFAULT_THROTTLE_CONFIG.initialWindow);
   });
 
-  it('transitions from slow-start to congestion avoidance at ssthresh', () => {
+  it('recordSuccess still tracks budget growth', () => {
     const throttle = new ToolCallThrottle({ initialWindow: 4, ssthresh: 8 });
 
-    // Make diverse calls and record success to reach ssthresh
     throttle.check('Read', 'a');
     throttle.recordSuccess('Read', 'a');
     throttle.check('Read', 'b');
     throttle.recordSuccess('Read', 'b');
 
-    // After doubling from 4→8 at ssthresh, exits slow-start.
-    // Second diverse success triggers linear +1, so budget = 9.
     const state = throttle.getToolState('Read');
+    // Budget should grow via AIMD tracking
     expect(state!.budget).toBeGreaterThanOrEqual(8);
-    expect(state!.inSlowStart).toBe(false);
   });
 
-  it('backs off on similar repeated calls', () => {
-    const throttle = new ToolCallThrottle({ initialWindow: 2 });
+  it('hard budget blocks regardless of input variation', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { Bash: 3 } });
 
-    // Fill budget with identical calls (budget=2)
-    throttle.check('Bash', 'echo test');
-    throttle.check('Bash', 'echo test');
+    // 3 diverse calls — all count toward hard budget
+    expect(throttle.check('Bash', 'cmd-1').allowed).toBe(true);
+    expect(throttle.check('Bash', 'cmd-2').allowed).toBe(true);
+    expect(throttle.check('Bash', 'cmd-3').allowed).toBe(true);
 
-    // 3rd identical call — similar count (2) >= budget (2), triggers backoff
-    const result = throttle.check('Bash', 'echo test');
+    // 4th call blocked even though all inputs are different
+    const result = throttle.check('Bash', 'cmd-4');
     expect(result.allowed).toBe(false);
-    expect(result.reason).toContain('similar');
+    expect(result.reason).toContain('Synthesize');
   });
 
-  it('hard-blocks after maxBackoffs', () => {
-    const throttle = new ToolCallThrottle({
-      initialWindow: 2,
-      maxBackoffs: 2,
-      backoffCooldownMs: 0, // instant cooldown for testing
-    });
+  it('hardBlockTool blocks independently of hard budget', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { Write: 10 } });
 
-    // Trigger backoff 1: fill budget with similar calls
-    throttle.check('Write', 'same');
-    throttle.check('Write', 'same');
-    const r1 = throttle.check('Write', 'same');
-    expect(r1.allowed).toBe(false);
+    // Use 2 of 10 budget
+    throttle.check('Write', 'a');
+    throttle.check('Write', 'b');
 
-    // Trigger backoff 2: repeat
-    throttle.check('Write', 'same');
-    const r2 = throttle.check('Write', 'same');
-    expect(r2.allowed).toBe(false);
+    // External hard-block (from health monitor)
+    throttle.hardBlockTool('Write', 'Blocked by monitor');
 
-    // Should now be hard-blocked
+    // Blocked even though budget has 8 remaining
+    const r3 = throttle.check('Write', 'c');
+    expect(r3.allowed).toBe(false);
+    expect(r3.reason).toContain('Blocked by monitor');
+
     const state = throttle.getToolState('Write');
     expect(state!.blocked).toBe(true);
-
-    const r3 = throttle.check('Write', 'new-input');
-    expect(r3.allowed).toBe(false);
-    expect(r3.reason).toContain('blocked');
   });
 
   it('hardBlockTool permanently blocks a specific tool', () => {
@@ -178,6 +165,119 @@ describe('Tool Call Throttle — TCP Slow-Start & AIMD', () => {
     expect(result.reason).toContain('blocked');
   });
 
+  // ── Hard Budget Cap Tests (REQ-BUDGET-001 through REQ-BUDGET-007) ──
+
+  it('maxCallsPerTool blocks after budget exhausted (REQ-BUDGET-001)', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { WebSearch: 3 }, defaultMaxCalls: 15 });
+
+    // 3 calls should all be allowed
+    expect(throttle.check('WebSearch', 'query-1').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'query-2').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'query-3').allowed).toBe(true);
+
+    // 4th call should be blocked
+    const r4 = throttle.check('WebSearch', 'query-4');
+    expect(r4.allowed).toBe(false);
+    expect(r4.reason).toContain('3 allowed "WebSearch" calls');
+    expect(r4.reason).toContain('Synthesize');
+  });
+
+  it('default budgets match DEFAULT_TOOL_BUDGETS (REQ-BUDGET-002)', () => {
+    const throttle = new ToolCallThrottle();
+
+    // WebSearch default is 7
+    for (let i = 0; i < 7; i++) {
+      expect(throttle.check('WebSearch', `q-${i}`).allowed).toBe(true);
+    }
+    expect(throttle.check('WebSearch', 'q-8').allowed).toBe(false);
+
+    // Read default is 20
+    const state = throttle.getToolState('WebSearch');
+    expect(state!.maxCalls).toBe(DEFAULT_TOOL_BUDGETS['WebSearch']);
+  });
+
+  it('different tools have independent budgets (REQ-BUDGET-001)', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { WebSearch: 2, Read: 3 }, defaultMaxCalls: 15 });
+
+    // Use up WebSearch budget
+    expect(throttle.check('WebSearch', 'a').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'b').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'c').allowed).toBe(false);
+
+    // Read should still have budget
+    expect(throttle.check('Read', 'file-1').allowed).toBe(true);
+    expect(throttle.check('Read', 'file-2').allowed).toBe(true);
+    expect(throttle.check('Read', 'file-3').allowed).toBe(true);
+    expect(throttle.check('Read', 'file-4').allowed).toBe(false);
+  });
+
+  it('custom maxCallsPerTool overrides defaults (REQ-BUDGET-007)', () => {
+    // Override WebSearch from 7 to 2
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { WebSearch: 2 } });
+
+    expect(throttle.check('WebSearch', 'a').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'b').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'c').allowed).toBe(false);
+
+    // Read should still use default (20)
+    const readState = throttle.getToolState('Read');
+    // Read hasn't been called yet, so no state — check default via config
+    expect(DEFAULT_TOOL_BUDGETS['Read']).toBe(20);
+  });
+
+  it('defaultMaxCalls applies to unlisted tools (REQ-BUDGET-001)', () => {
+    const throttle = new ToolCallThrottle({ defaultMaxCalls: 3 });
+
+    // "CustomTool" is not in DEFAULT_TOOL_BUDGETS
+    expect(throttle.check('CustomTool', 'a').allowed).toBe(true);
+    expect(throttle.check('CustomTool', 'b').allowed).toBe(true);
+    expect(throttle.check('CustomTool', 'c').allowed).toBe(true);
+    expect(throttle.check('CustomTool', 'd').allowed).toBe(false);
+
+    const state = throttle.getToolState('CustomTool');
+    expect(state!.maxCalls).toBe(3);
+  });
+
+  it('block message contains synthesis instruction (REQ-BUDGET-004)', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { WebSearch: 1 }, defaultMaxCalls: 15 });
+
+    throttle.check('WebSearch', 'query');
+    const blocked = throttle.check('WebSearch', 'another-query');
+
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.reason).toContain('Synthesize your findings');
+    expect(blocked.reason).toContain('team-lead');
+    expect(blocked.reason).toContain('SendMessage');
+  });
+
+  it('budget counter counts ALL calls regardless of input similarity (REQ-BUDGET-001)', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { WebSearch: 3 }, defaultMaxCalls: 15 });
+
+    // Same query 3 times — all count toward budget
+    expect(throttle.check('WebSearch', 'same-query').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'same-query').allowed).toBe(true);
+    expect(throttle.check('WebSearch', 'same-query').allowed).toBe(true);
+
+    // 4th call blocked even though AIMD might allow it (budget is the primary defense)
+    expect(throttle.check('WebSearch', 'same-query').allowed).toBe(false);
+
+    const state = throttle.getToolState('WebSearch');
+    expect(state!.totalCalls).toBe(3);
+  });
+
+  it('getResolvedBudgets returns merged config for prompt injection (REQ-BUDGET-003)', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { WebSearch: 5 } });
+    const budgets = throttle.getResolvedBudgets();
+
+    // Custom override
+    expect(budgets['WebSearch']).toBe(5);
+    // Defaults still present
+    expect(budgets['Read']).toBe(20);
+    expect(budgets['Bash']).toBe(10);
+    // Default fallback
+    expect(budgets['_default']).toBe(DEFAULT_MAX_CALLS);
+  });
+
   it('records failure and halves budget', () => {
     const throttle = new ToolCallThrottle({ initialWindow: 4 });
 
@@ -201,16 +301,16 @@ describe('Tool Call Throttle — TCP Slow-Start & AIMD', () => {
     expect(throttle.getToolState('Write')).toBeUndefined();
   });
 
-  it('maintains independent per-tool budgets', () => {
-    const throttle = new ToolCallThrottle({ initialWindow: 2 });
+  it('maintains independent per-tool hard budgets', () => {
+    const throttle = new ToolCallThrottle({ maxCallsPerTool: { Read: 2, Write: 5 } });
 
     throttle.check('Read', 'a');
     throttle.check('Read', 'b');
 
-    // Read budget exhausted
+    // Read budget exhausted (2/2)
     expect(throttle.check('Read', 'c').allowed).toBe(false);
 
-    // But Write should still have budget
+    // But Write should still have budget (0/5)
     expect(throttle.check('Write', 'x').allowed).toBe(true);
   });
 });

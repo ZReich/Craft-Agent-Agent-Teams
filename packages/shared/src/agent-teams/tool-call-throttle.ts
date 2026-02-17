@@ -1,16 +1,18 @@
 /**
- * Adaptive Tool Call Throttle for Agent Teams
+ * Tool Call Throttle for Agent Teams
  *
- * Prevents retry storms by applying TCP-inspired congestion control to teammate
- * tool calls. Each tool type gets an independent budget that starts small
- * (slow-start) and grows as the agent proves it's making diverse, productive calls.
+ * Prevents retry storms via a two-layer defense:
  *
- * Algorithm: TCP Slow-Start + AIMD (Additive Increase, Multiplicative Decrease)
- * - Start with a small budget per tool (initialWindow)
- * - Double budget on diverse success (slow-start phase)
- * - Switch to linear growth after hitting ssthresh
- * - Halve budget on detection of similar repeated calls (backoff)
- * - Hard-block after maxBackoffs within windowDuration
+ * Layer 1 — Hard Budget (Primary, REQ-BUDGET-001):
+ *   Each tool type has a fixed call cap (e.g. WebSearch: 7). Once an agent
+ *   exhausts its budget, the tool is permanently blocked for the session with
+ *   a message instructing the agent to synthesize findings. This cap is
+ *   un-gameable — it counts ALL calls regardless of input similarity.
+ *
+ * Layer 2 — AIMD Congestion Control (Secondary):
+ *   TCP slow-start / AIMD provides finer-grained control within the hard cap.
+ *   Detects repeated similar calls and applies backoff/cooldown. Acts as an
+ *   early warning before the hard cap is reached.
  *
  * This module uses only built-in types (no external dependencies).
  */
@@ -19,7 +21,31 @@
 // Configuration
 // ============================================================
 
+/** Implements REQ-BUDGET-002: Default hard caps per tool type */
+export const DEFAULT_TOOL_BUDGETS: Record<string, number> = {
+  WebSearch: 7,
+  WebFetch: 10,
+  Bash: 10,
+  Read: 20,
+  Grep: 20,
+  Glob: 20,
+  Edit: 15,
+  Write: 10,
+};
+
+/** Implements REQ-BUDGET-002: Default cap for tools not listed in DEFAULT_TOOL_BUDGETS */
+export const DEFAULT_MAX_CALLS = 15;
+
 export interface ThrottleConfig {
+  // --- Layer 1: Hard budget (primary defense) ---
+
+  /** Implements REQ-BUDGET-001: Per-tool hard call caps. Merged with DEFAULT_TOOL_BUDGETS. */
+  maxCallsPerTool: Record<string, number>;
+  /** Implements REQ-BUDGET-001: Fallback cap for tools not in maxCallsPerTool. Default: 15 */
+  defaultMaxCalls: number;
+
+  // --- Layer 2: AIMD congestion control (secondary defense) ---
+
   /** Initial tool call budget per tool type. Default: 2 */
   initialWindow: number;
   /** Slow-start threshold — switch from exponential to linear growth. Default: 8 */
@@ -35,6 +61,8 @@ export interface ThrottleConfig {
 }
 
 export const DEFAULT_THROTTLE_CONFIG: ThrottleConfig = {
+  maxCallsPerTool: { ...DEFAULT_TOOL_BUDGETS },
+  defaultMaxCalls: DEFAULT_MAX_CALLS,
   initialWindow: 2,
   ssthresh: 8,
   maxWindow: 15,
@@ -48,7 +76,9 @@ export const DEFAULT_THROTTLE_CONFIG: ThrottleConfig = {
 // ============================================================
 
 interface ToolState {
-  /** Current allowed calls in the window */
+  /** Implements REQ-BUDGET-001: Lifetime total calls for this tool (never resets) */
+  totalCalls: number;
+  /** Current allowed calls in the AIMD sliding window */
   budget: number;
   /** Calls made in current sliding window */
   callsInWindow: Array<{ timestamp: number; inputPrefix: string }>;
@@ -83,7 +113,15 @@ export class ToolCallThrottle {
   private tools: Map<string, ToolState> = new Map();
 
   constructor(config?: Partial<ThrottleConfig>) {
-    this.config = { ...DEFAULT_THROTTLE_CONFIG, ...config };
+    this.config = {
+      ...DEFAULT_THROTTLE_CONFIG,
+      ...config,
+      // Implements REQ-BUDGET-007: Merge user overrides with defaults (not replace)
+      maxCallsPerTool: {
+        ...DEFAULT_TOOL_BUDGETS,
+        ...config?.maxCallsPerTool,
+      },
+    };
   }
 
   /**
@@ -95,58 +133,46 @@ export class ToolCallThrottle {
     const state = this.ensureState(toolName);
     const now = Date.now();
 
-    // Prune expired calls from sliding window
-    this.pruneWindow(state, now);
-
-    // Also prune backoff count if the window has elapsed since first backoff
-    if (state.firstBackoffAt > 0 && now - state.firstBackoffAt > this.config.windowDurationMs) {
-      state.backoffCount = 0;
-      state.firstBackoffAt = 0;
-      state.blocked = false;
+    // ================================================================
+    // Hard budget cap (primary defense — REQ-BUDGET-001)
+    // Simple counter, un-gameable, counts ALL calls regardless of input.
+    // This is the only similarity-independent check and cannot be bypassed
+    // by varying query text.
+    // ================================================================
+    const maxCalls = this.config.maxCallsPerTool[toolName] ?? this.config.defaultMaxCalls;
+    if (state.totalCalls >= maxCalls) {
+      // Implements REQ-BUDGET-004: synthesis instruction on exhaustion
+      const customReason = (state as any)._blockReason as string | undefined;
+      return {
+        allowed: false,
+        reason: customReason
+          ?? `You have used all ${maxCalls} allowed "${toolName}" calls for this task. `
+          + 'Synthesize your findings now and send your complete report to team-lead via SendMessage(type="message", recipient="team-lead"). '
+          + 'Do NOT attempt to call this tool again.',
+      };
     }
 
-    // Hard-blocked?
+    // ================================================================
+    // External hard-block (from hardBlockTool — used by health monitor)
+    // ================================================================
     if (state.blocked) {
       const customReason = (state as any)._blockReason as string | undefined;
       return {
         allowed: false,
         reason: customReason
-          ?? `"${toolName}" is temporarily blocked after ${this.config.maxBackoffs} repeated similar call patterns. Use a different tool or significantly change your approach.`,
+          ?? `"${toolName}" has been blocked. Use a different tool or synthesize your findings.`,
       };
     }
 
-    // In cooldown?
-    if (now < state.cooldownUntil) {
-      return {
-        allowed: false,
-        reason: `"${toolName}" is in cooldown for ${Math.ceil((state.cooldownUntil - now) / 1000)}s after similar call detection. Try a different approach or tool.`,
-        waitMs: state.cooldownUntil - now,
-      };
-    }
+    // ================================================================
+    // Call allowed — record it
+    // ================================================================
 
-    // Check similarity — are recent calls too similar?
-    const similarCount = this.countSimilar(state, inputPrefix);
-    if (similarCount >= state.budget) {
-      // Multiplicative decrease
-      this.backoff(state, now);
-      return {
-        allowed: false,
-        reason: `Too many similar "${toolName}" calls (${similarCount}/${state.budget}). Budget reduced. Try a different query or tool.`,
-      };
-    }
+    // Increment lifetime counter (hard budget)
+    state.totalCalls++;
 
-    // Budget check (total calls of this type in window)
-    if (state.callsInWindow.length >= state.budget) {
-      return {
-        allowed: false,
-        reason: `"${toolName}" budget exhausted (${state.callsInWindow.length}/${state.budget} in last ${this.config.windowDurationMs / 1000}s). Wait or use a different tool.`,
-      };
-    }
-
-    // Record the call immediately so parallel tool calls (fired in the same batch by the
-    // agent) see each other's pending calls. Without this, N parallel calls would all see
-    // callsInWindow.length=0 and all pass the budget check. recordSuccess() handles only
-    // budget growth (no duplicate push).
+    // Record in sliding window (for recordSuccess/recordFailure diversity tracking)
+    this.pruneWindow(state, now);
     state.callsInWindow.push({ timestamp: now, inputPrefix });
 
     return { allowed: true };
@@ -208,7 +234,7 @@ export class ToolCallThrottle {
   }
 
   /** Get current state for a tool (for observability / dashboard). */
-  getToolState(toolName: string): { budget: number; callsInWindow: number; blocked: boolean; inCooldown: boolean; inSlowStart: boolean } | undefined {
+  getToolState(toolName: string): { budget: number; callsInWindow: number; blocked: boolean; inCooldown: boolean; inSlowStart: boolean; totalCalls: number; maxCalls: number } | undefined {
     const state = this.tools.get(toolName);
     if (!state) return undefined;
     const now = Date.now();
@@ -218,7 +244,17 @@ export class ToolCallThrottle {
       blocked: state.blocked,
       inCooldown: now < state.cooldownUntil,
       inSlowStart: state.inSlowStart,
+      totalCalls: state.totalCalls,
+      maxCalls: this.config.maxCallsPerTool[toolName] ?? this.config.defaultMaxCalls,
     };
+  }
+
+  /** Implements REQ-BUDGET-003: Get resolved budgets for prompt injection. */
+  getResolvedBudgets(): Record<string, number> {
+    const budgets: Record<string, number> = { ...this.config.maxCallsPerTool };
+    // Ensure default is available for prompt generation
+    budgets['_default'] = this.config.defaultMaxCalls;
+    return budgets;
   }
 
   // --- Private helpers ---
@@ -258,6 +294,7 @@ export class ToolCallThrottle {
   private ensureState(toolName: string): ToolState {
     if (!this.tools.has(toolName)) {
       this.tools.set(toolName, {
+        totalCalls: 0,
         budget: this.config.initialWindow,
         callsInWindow: [],
         backoffCount: 0,

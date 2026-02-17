@@ -742,12 +742,33 @@ export function buildSpecMarkdown(options: {
 
 export function buildTeammatePromptWithCompactSpec(
   prompt: string,
-  compactSpecContext?: string | null
+  compactSpecContext?: string | null,
+  toolBudgets?: Record<string, number>,
 ): string {
   const sections: string[] = [prompt]
 
   if (compactSpecContext && compactSpecContext.trim().length > 0) {
     sections.push(`<compact_spec>\n${compactSpecContext}\n</compact_spec>`)
+  }
+
+  // Implements REQ-BUDGET-003: Inject tool budgets so agents plan proactively.
+  // Agents that KNOW their budget make better, more targeted tool calls.
+  if (toolBudgets && Object.keys(toolBudgets).length > 0) {
+    const defaultBudget = toolBudgets['_default'] ?? 15
+    const budgetLines = Object.entries(toolBudgets)
+      .filter(([key]) => key !== '_default')
+      .sort(([, a], [, b]) => a - b)
+      .map(([tool, limit]) => `- ${tool}: ${limit} calls`)
+    sections.push([
+      'TOOL BUDGETS (HARD LIMITS)',
+      'You have a limited number of tool calls for this task. Plan carefully and make each call count.',
+      ...budgetLines,
+      `- All other tools: ${defaultBudget} calls`,
+      '',
+      'When a tool budget runs out, it will be permanently blocked.',
+      'At that point, synthesize what you have and send results to team-lead.',
+      'Do NOT waste searches on similar queries — make each one count.',
+    ].join('\n'))
   }
 
   // Implements REQ-LIFECYCLE-001:
@@ -1911,10 +1932,10 @@ export class SessionManager {
           shouldAutoKill = true
           autoKillReason = `retry-storm detected ${count} times`
         }
-        // Implements REQ-THROTTLE-BRIDGE: Stage 1 — early synthesis nudge.
-        // Tell the agent to stop searching and synthesize what it has BEFORE
-        // escalation reaches Stage 2 (hard-block) or Stage 3 (kill).
-        sessionLog.info(`[AgentTeams] Retry-storm WARN for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
+        // REQ-BUDGET-005: The hard per-tool budget cap (Layer 1 in ToolCallThrottle) is the
+        // primary defense against retry storms. This similarity-based detection is a secondary
+        // signal — useful for logging and as a backup nudge, but not the main enforcement.
+        sessionLog.info(`[AgentTeams] Retry-storm WARN (secondary signal) for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
         this.sendMessage(issue.teammateId, [
           `**[SYSTEM] You are approaching a retry-storm limit.** You have made ${issue.details}.`,
           '',
@@ -1930,9 +1951,9 @@ export class SessionManager {
         })
       }
 
-      // Implements REQ-THROTTLE-BRIDGE: Stage 2 — hard-block offending tool + ultimatum.
-      // Instead of resetting the throttle (which gives fresh budget to keep searching),
-      // permanently block the specific tool that's causing the storm.
+      // REQ-BUDGET-005: Stage 2 — hard-block offending tool + ultimatum (secondary defense).
+      // The primary defense is the hard per-tool budget cap in ToolCallThrottle.check().
+      // This fires only if the AIMD similarity detection catches a pattern within the budget.
       if (issue.type === 'retry-storm-throttle') {
         sessionLog.warn(`[AgentTeams] Retry-storm THROTTLE for "${issue.teammateName}" (${issue.teammateId}): ${issue.details}`)
         const teammateManaged = this.sessions.get(issue.teammateId)
@@ -4423,17 +4444,23 @@ export class SessionManager {
           })
           terminatedIds.push(managed.id)
         } else if (managed.agent) {
-          // Lead or non-teammate session — destroy agent to pick up new settings.
-          // CraftAgent's activeTeamName/activeTeammateCount are cleared when the
-          // agent is disposed; the new agent instance starts clean.
+          // Lead or non-teammate session — clear team state immediately so the
+          // agent stops acting as a team lead.
           if (managed.isTeamLead && managed.agent instanceof CraftAgent) {
             managed.agent.clearTeamState()
           }
-          this.destroyManagedAgent(managed, `refreshWorkspaceAgentRuntime:${reason}`)
-          refreshed++
+          // Only destroy the agent if it's NOT actively processing a response.
+          // If it IS processing, let the current turn finish — the agent will
+          // pick up the new workspace config on the next turn.
+          if (!managed.isProcessing) {
+            this.destroyManagedAgent(managed, `refreshWorkspaceAgentRuntime:${reason}`)
+            refreshed++
+          } else {
+            skipped++
+          }
         }
       }
-      sessionLog.info(`[AgentTeams] Kill switch activated for workspace ${workspaceId}: terminated=${terminatedIds.length} refreshed=${refreshed}`)
+      sessionLog.info(`[AgentTeams] Kill switch activated for workspace ${workspaceId}: terminated=${terminatedIds.length} refreshed=${refreshed} skipped_processing=${skipped}`)
       return
     }
 
@@ -5177,9 +5204,8 @@ export class SessionManager {
       resolvedConnection.providerType,
     )
 
-    // Phase 2c: Create adaptive throttle for this teammate session.
-    // Prevents retry storms via TCP slow-start / AIMD congestion control.
-    // Phase 2d: Honor workspace-level throttle config overrides if present.
+    // Implements REQ-BUDGET-001: Create throttle with hard per-tool budgets (primary defense)
+    // + AIMD congestion control (secondary defense). Workspace-level overrides honored via REQ-BUDGET-007.
     const managedTeammate = this.sessions.get(teammateSession.id)
     if (managedTeammate) {
       const throttleOverrides = this.healthMonitor.getThrottleConfig()
@@ -5226,7 +5252,9 @@ export class SessionManager {
       ? `${skillMentions}\n\n${params.prompt}`
       : params.prompt
 
-    const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithSkills, compactSpecContext)
+    // Implements REQ-BUDGET-003: Pass resolved budgets so agents see their limits in the prompt
+    const resolvedBudgets = managedTeammate?.toolCallThrottle?.getResolvedBudgets()
+    const teammatePrompt = buildTeammatePromptWithCompactSpec(promptWithSkills, compactSpecContext, resolvedBudgets)
 
     // Implements REQ-A1: Track pending teammate spawns on the lead session
     // so shouldDelayCompletionForAgentTeam() can block premature 'complete'.
