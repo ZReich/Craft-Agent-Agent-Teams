@@ -22,6 +22,7 @@ import type {
   ModelPresetId,
   TeamActivityEvent,
   TeamActivityType,
+  KnowledgeTelemetryEvent,
   TeamCostSummary,
   TeammateTokenUsage,
   Spec,
@@ -883,7 +884,8 @@ export class AgentTeamManager extends EventEmitter {
     details: string,
     teammateId?: string,
     teammateName?: string,
-    taskId?: string
+    taskId?: string,
+    telemetry?: KnowledgeTelemetryEvent,
   ): void {
     const event: TeamActivityEvent = {
       id: `act-${randomUUID().slice(0, 8)}`,
@@ -894,6 +896,7 @@ export class AgentTeamManager extends EventEmitter {
       teammateId,
       teammateName,
       taskId,
+      telemetry,
     };
 
     const log = this.activityLog.get(teamId) || [];
@@ -913,9 +916,10 @@ export class AgentTeamManager extends EventEmitter {
     details: string,
     teammateId?: string,
     teammateName?: string,
-    taskId?: string
+    taskId?: string,
+    telemetry?: KnowledgeTelemetryEvent,
   ): void {
-    this.addActivity(teamId, type, details, teammateId, teammateName, taskId);
+    this.addActivity(teamId, type, details, teammateId, teammateName, taskId, telemetry);
   }
 
   /** Get activity log for a team */

@@ -466,6 +466,10 @@ createTeam() → addTeammate() → [tasks, messages, reviews]* → cleanupTeam()
 
 State persisted across app restart via `TeamStateStore` (file: `team-state-store.ts`).
 
+Knowledge persistence uses retention guards:
+- `team-state-store.ts` prunes stale/expired knowledge entries (TTL + 14-day default window)
+- `learning-store.ts` retains rolling quality + knowledge telemetry windows (30-day default)
+
 ### Phase-Aware Execution
 
 Tasks can be grouped into phases (`TeamPhase`). Phases execute sequentially; tasks within a phase can run in parallel.
@@ -499,6 +503,10 @@ interface AgentTeamsConfig {
   autoEscalationThreshold?: number;
   qualityGates?: Partial<QualityGateConfig>;
   yolo?: Partial<YoloConfig>;
+  memory?: {
+    injectionEnabled?: boolean;
+    metricsUiEnabled?: boolean;
+  };
 }
 ```
 

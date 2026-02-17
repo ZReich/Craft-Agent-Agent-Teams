@@ -69,6 +69,13 @@ export interface AgentTeamsConfig {
   yolo?: Partial<import('@craft-agent/core/types').YoloConfig>;
   /** Design flow configuration — generate multiple UI design variants before coding (REQ-002) */
   designFlow?: Partial<import('@craft-agent/core/types').DesignFlowConfig>;
+  /** Memory/knowledge runtime controls (REQ-008). */
+  memory?: {
+    /** Kill-switch for prompt-time shared-memory injection. Default: true */
+    injectionEnabled?: boolean;
+    /** Kill-switch for Team Dashboard Knowledge metrics surface. Default: true */
+    metricsUiEnabled?: boolean;
+  };
 }
 
 /**

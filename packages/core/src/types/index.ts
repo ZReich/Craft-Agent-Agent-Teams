@@ -78,6 +78,7 @@ export type {
   TaskType,
   TDDPhase,
   TaskQualityReport,
+  KnowledgeTelemetryEvent,
   TeamActivityEvent,
   TeamActivityType,
   TeamCostSummary,

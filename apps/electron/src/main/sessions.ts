@@ -81,7 +81,7 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, type SessionProcessReapOptions, type SessionProcessReapReport, type SessionProcessCandidate, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, TeamTask, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment, YoloStateChangedEvent } from '@craft-agent/core/types'
+import type { ToolDisplayMeta, QualityGateConfig, QualityGateResult, SpecComplianceReport, SessionUsage, ProviderUsage, TeamSessionUsage, AgentEventUsage, TeamRole, TeamTask, Spec, SpecRequirement, SpecRisk, SpecTemplate, DRIAssignment, YoloStateChangedEvent, KnowledgeTelemetryEvent } from '@craft-agent/core/types'
 import { QualityGateRunner, formatFailureReport, formatSuccessReport, type TaskContext } from './quality-gate-runner'
 import { mergeQualityGateConfig, inferTaskType, shouldSkipQualityGates } from '@craft-agent/shared/agent-teams/quality-gates'
 import { IntegrationGate } from '@craft-agent/shared/agent-teams/integration-gate'
@@ -94,7 +94,7 @@ import { resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/sh
 import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
 import { YoloOrchestrator, mergeYoloConfig, decideSpawnStrategy, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
 import { selectArchitectureMode } from '@craft-agent/shared/agent-teams/architecture-selector'
-import { getLearningGuidance } from '@craft-agent/shared/agent-teams/learning-store'
+import { getLearningGuidance, recordKnowledgeTelemetry } from '@craft-agent/shared/agent-teams/learning-store'
 import { ReviewLoopOrchestrator, type ReviewLoopCallbacks, type ReviewLoopConfig } from '@craft-agent/shared/agent-teams/review-loop'
 import type { YoloConfig, YoloState } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL, getSummarizationModel } from '@craft-agent/shared/config'
@@ -1941,6 +1941,45 @@ export class SessionManager {
       .getTasks(teamId)
       .find((task) => task.assignee === teammateId && (task.status === 'in_progress' || task.status === 'in_review'))
       ?.id
+  }
+
+  private logKnowledgeTelemetry(
+    teamId: string,
+    managed: ManagedSession,
+    payload: Omit<KnowledgeTelemetryEvent, 'channel'>,
+  ): void {
+    const teammateName = managed.teammateName || managed.name || managed.id
+    const telemetry: KnowledgeTelemetryEvent = {
+      channel: 'knowledge',
+      ...payload,
+    }
+    const details = [
+      `[KnowledgeBus][${payload.operation}] ${payload.hit ? 'hit' : 'miss'} entries=${payload.resultCount}`,
+      `scope=${payload.scope}`,
+      payload.suppressed ? 'suppressed=true' : null,
+    ].filter(Boolean).join(' ')
+
+    teamManager.logActivity(
+      teamId,
+      'phase-advanced',
+      details,
+      managed.id,
+      teammateName,
+      undefined,
+      telemetry,
+    )
+
+    try {
+      recordKnowledgeTelemetry(managed.workspace.rootPath, {
+        operation: payload.operation,
+        scope: payload.scope,
+        hit: payload.hit,
+        resultCount: payload.resultCount,
+        suppressed: payload.suppressed,
+      })
+    } catch (err) {
+      sessionLog.warn('[KnowledgeBus] Failed to persist knowledge telemetry:', err)
+    }
   }
 
   private handleKnowledgeToolStart(
@@ -5871,22 +5910,35 @@ export class SessionManager {
       ? `${skillMentions}\n\n${params.prompt}`
       : params.prompt
 
-    // Implements REQ-NEXT-001: Inject compact shared team memory into spawned teammate prompts.
-    const sharedKnowledgeContext = teamManager.buildKnowledgeContext(resolvedTeamId, params.prompt, {
-      maxChars: 1_800, // ~<=500-token budget target
-      maxEntries: 8,
-      maxTokens: 500,
-    })
+    // Implements REQ-NEXT-001 + REQ-008: Inject compact shared team memory with kill-switch support.
+    const memoryInjectionEnabled = workspaceConfig?.agentTeams?.memory?.injectionEnabled !== false
+    const sharedKnowledgeContext = memoryInjectionEnabled
+      ? teamManager.buildKnowledgeContext(resolvedTeamId, params.prompt, {
+        maxChars: 1_800, // ~<=500-token budget target
+        maxEntries: 8,
+        maxTokens: 500,
+      })
+      : ''
     const injectedKnowledgeEntries = sharedKnowledgeContext
       ? sharedKnowledgeContext.split('\n').filter((line) => line.trim().startsWith('- [')).length
       : 0
-    teamManager.logActivity(
-      resolvedTeamId,
-      'phase-advanced',
-      `[KnowledgeBus][inject] ${sharedKnowledgeContext ? 'hit' : 'miss'} entries=${injectedKnowledgeEntries}`,
-      teammateSession.id,
-      teammateDisplayName,
-    )
+    const telemetryManagedSession = managedTeammate ?? this.sessions.get(teammateSession.id)
+    if (telemetryManagedSession) {
+      this.logKnowledgeTelemetry(resolvedTeamId, telemetryManagedSession, {
+        operation: 'query',
+        scope: 'prompt-context',
+        hit: injectedKnowledgeEntries > 0,
+        resultCount: injectedKnowledgeEntries,
+        suppressed: !memoryInjectionEnabled,
+      })
+      this.logKnowledgeTelemetry(resolvedTeamId, telemetryManagedSession, {
+        operation: 'inject',
+        scope: 'prompt-context',
+        hit: injectedKnowledgeEntries > 0,
+        resultCount: injectedKnowledgeEntries,
+        suppressed: !memoryInjectionEnabled,
+      })
+    }
     const promptWithKnowledge = sharedKnowledgeContext
       ? `${sharedKnowledgeContext}\n\n${promptWithSkills}`
       : promptWithSkills

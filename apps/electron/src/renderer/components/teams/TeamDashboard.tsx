@@ -95,6 +95,7 @@ interface TeamKnowledgeEntry {
 const EMPTY_TASKS: TeamTask[] = []
 const EMPTY_MESSAGES: TeammateMessage[] = []
 const EMPTY_ACTIVITY: TeamActivityEvent[] = []
+type StructuredKnowledgeTelemetry = NonNullable<TeamActivityEvent['telemetry']>
 
 /**
  * Derive an AgentTeammateStatus from a teammate's SessionMeta
@@ -406,6 +407,7 @@ export function TeamDashboard({
 
   // Refresh memory entries periodically when viewing the Knowledge tab.
   useEffect(() => {
+    if (workspaceSettings?.agentTeamsKnowledgeMetricsUiEnabled === false) return
     if (activeTab !== 'knowledge') return
     if (!window.electronAPI?.getPersistedTeamState) return
     let cancelled = false
@@ -426,7 +428,7 @@ export function TeamDashboard({
       cancelled = true
       clearInterval(timer)
     }
-  }, [activeTab, session.id])
+  }, [activeTab, session.id, workspaceSettings?.agentTeamsKnowledgeMetricsUiEnabled])
 
   // Sync realtime state with props when they change
   useEffect(() => {
@@ -500,14 +502,33 @@ export function TeamDashboard({
       && (entry.timestamp ?? 0) >= previousWindowStart
     ).length
 
-    const injectionEvents = realtimeActivity.filter((event) => event.details?.includes('[KnowledgeBus][inject]'))
-    const injectionHits = injectionEvents.filter((event) => event.details?.includes('hit')).length
-    const injectionMisses = injectionEvents.filter((event) => event.details?.includes('miss')).length
+    let injectionHits = 0
+    let injectionMisses = 0
+    let queryCount = 0
+    for (const event of realtimeActivity) {
+      const telemetry = event.telemetry as StructuredKnowledgeTelemetry | undefined
+      if (telemetry?.channel === 'knowledge') {
+        if (telemetry.operation === 'inject' && !telemetry.suppressed) {
+          if (telemetry.hit) injectionHits += 1
+          else injectionMisses += 1
+        }
+        if (telemetry.operation === 'query') {
+          queryCount += 1
+        }
+        continue
+      }
+      if (event.details?.includes('[KnowledgeBus][inject]')) {
+        if (event.details.includes('hit')) injectionHits += 1
+        else if (event.details.includes('miss')) injectionMisses += 1
+      }
+      if (event.details?.includes('[KnowledgeBus][query]')) {
+        queryCount += 1
+      }
+    }
+
     const injectionHitRate = (injectionHits + injectionMisses) > 0
       ? Math.round((injectionHits / (injectionHits + injectionMisses)) * 100)
       : null
-
-    const queryEvents = realtimeActivity.filter((event) => event.details?.includes('[KnowledgeBus][query]'))
 
     return {
       total,
@@ -516,12 +537,19 @@ export function TeamDashboard({
       conflicts24h,
       conflictsPrev24h,
       injectionHitRate,
-      queryCount: queryEvents.length,
+      queryCount,
     }
   }, [realtimeKnowledge, realtimeActivity])
 
   // Implements BUG-6: check if YOLO is enabled in workspace settings
   const yoloEnabled = workspaceSettings?.yoloMode !== undefined && workspaceSettings.yoloMode !== 'off'
+  const knowledgeMetricsUiEnabled = workspaceSettings?.agentTeamsKnowledgeMetricsUiEnabled !== false
+
+  useEffect(() => {
+    if (!knowledgeMetricsUiEnabled && activeTab === 'knowledge') {
+      setActiveTab('teammate')
+    }
+  }, [knowledgeMetricsUiEnabled, activeTab])
 
   // Implements REQ-004: gate team creation when SDD is enabled without an active spec
   const sddBlocked = specModeEnabled && !session.activeSpecId
@@ -1023,18 +1051,20 @@ export function TeamDashboard({
               <GitBranch className="size-3" />
               Traceability
             </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab('knowledge')}
-              className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
-                activeTab === 'knowledge'
-                  ? 'bg-foreground/5 text-foreground'
-                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/[0.03]'
-              )}
-            >
-              Knowledge
-            </button>
+            {knowledgeMetricsUiEnabled && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('knowledge')}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
+                  activeTab === 'knowledge'
+                    ? 'bg-foreground/5 text-foreground'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-foreground/[0.03]'
+                )}
+              >
+                Knowledge
+              </button>
+            )}
           </div>
 
           {/* Content */}

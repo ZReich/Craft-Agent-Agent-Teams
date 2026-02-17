@@ -189,6 +189,7 @@ Team lifecycle is managed by `AgentTeamManager` in `src/agent/agent-team-manager
 Recent reliability hardening:
 - Explore mode now allows agent-team control-plane session tools (`Task`, `SendMessage`, `TeamCreate`, `TeamDelete`) while still blocking source/auth mutation tools.
 - `AgentTeamManager` now supports per-task completion contracts (`requiredArtifacts`) so task completion can be blocked when required handoff artifacts are missing.
+- Agent teams now support memory kill-switches (`agentTeams.memory.injectionEnabled`, `metricsUiEnabled`) plus structured knowledge telemetry persisted for adoption tracking.
 
 ## Dependencies
 

@@ -1880,6 +1880,8 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsReviewerThinking: config?.agentTeams?.reviewerThinking ?? false,
       agentTeamsEscalationThinking: config?.agentTeams?.escalationThinking ?? false,
       agentTeamsCostCapUsd: config?.agentTeams?.costCapUsd,
+      agentTeamsMemoryInjectionEnabled: config?.agentTeams?.memory?.injectionEnabled ?? true,
+      agentTeamsKnowledgeMetricsUiEnabled: config?.agentTeams?.memory?.metricsUiEnabled ?? true,
       // Quality gate settings
       qualityGatesEnabled: qg?.enabled ?? true,
       qualityGatesPassThreshold: qg?.passThreshold ?? 90,
@@ -1945,6 +1947,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       'agentTeamsWorkerModel', 'agentTeamsReviewerModel', 'agentTeamsEscalationModel',
       'agentTeamsLeadThinking', 'agentTeamsHeadThinking', 'agentTeamsWorkerThinking',
       'agentTeamsReviewerThinking', 'agentTeamsEscalationThinking', 'agentTeamsCostCapUsd',
+      'agentTeamsMemoryInjectionEnabled', 'agentTeamsKnowledgeMetricsUiEnabled',
       'qualityGatesEnabled', 'qualityGatesPassThreshold', 'qualityGatesMaxCycles', 'qualityGatesEnforceTDD',
       'qualityGatesReviewModel', 'qualityGatesBaselineAwareTests', 'qualityGatesKnownFailingTests',
       'qualityGatesTestScope', 'qualityGatesUseCombinedReview',
@@ -1997,6 +2000,10 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       agentTeamsEscalationThinking: 'escalationThinking',
       agentTeamsCostCapUsd: 'costCapUsd',
     }
+    const agentTeamsMemoryKeyMap: Record<string, string> = {
+      agentTeamsMemoryInjectionEnabled: 'injectionEnabled',
+      agentTeamsKnowledgeMetricsUiEnabled: 'metricsUiEnabled',
+    }
 
     const { loadWorkspaceConfig, saveWorkspaceConfig } = await import('@craft-agent/shared/workspaces')
     const config = loadWorkspaceConfig(workspace.rootPath)
@@ -2019,6 +2026,12 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
       // Store agent teams model/cost settings in config.agentTeams
       config.agentTeams = config.agentTeams || { enabled: false }
       ;(config.agentTeams as unknown as Record<string, unknown>)[agentTeamsKeyMap[key]] = value
+    } else if (key in agentTeamsMemoryKeyMap) {
+      // Store memory feature flags in config.agentTeams.memory (REQ-008)
+      config.agentTeams = config.agentTeams || { enabled: false }
+      const memory = (config.agentTeams.memory || {}) as Record<string, unknown>
+      memory[agentTeamsMemoryKeyMap[key]] = Boolean(value)
+      config.agentTeams.memory = memory as typeof config.agentTeams.memory
     } else if (key.startsWith('qualityGates')) {
       // Store quality gate settings in config.agentTeams.qualityGates
       config.agentTeams = config.agentTeams || { enabled: false }
@@ -2151,7 +2164,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
 
     // Save the config
     saveWorkspaceConfig(workspace.rootPath, config)
-    if (key === 'agentTeamsEnabled' || key in agentTeamsKeyMap) {
+    if (key === 'agentTeamsEnabled' || key in agentTeamsKeyMap || key in agentTeamsMemoryKeyMap) {
       sessionManager.refreshWorkspaceAgentRuntime(workspaceId, `workspaceSetting:${key}`)
     }
     ipcLog.info(`Workspace setting updated: ${key} = ${JSON.stringify(value)}`)

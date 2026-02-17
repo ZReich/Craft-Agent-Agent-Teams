@@ -1654,6 +1654,10 @@ export interface WorkspaceSettings {
   agentTeamsEscalationThinking?: boolean
   /** Cost cap in USD for agent teams operations */
   agentTeamsCostCapUsd?: number
+  /** Kill-switch for prompt-time team memory injection (REQ-008) */
+  agentTeamsMemoryInjectionEnabled?: boolean
+  /** Kill-switch for Team Dashboard Knowledge metrics surface (REQ-008) */
+  agentTeamsKnowledgeMetricsUiEnabled?: boolean
   // Quality gate settings (stored in agentTeams.qualityGates)
   qualityGatesEnabled?: boolean
   qualityGatesPassThreshold?: number

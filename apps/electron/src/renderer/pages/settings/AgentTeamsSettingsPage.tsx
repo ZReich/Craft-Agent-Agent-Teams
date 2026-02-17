@@ -178,6 +178,9 @@ export default function AgentTeamsSettingsPage() {
   // Cost cap
   const [costCapEnabled, setCostCapEnabled] = useState(false)
   const [costCapUsd, setCostCapUsd] = useState('10')
+  // Memory controls (REQ-008)
+  const [memoryInjectionEnabled, setMemoryInjectionEnabled] = useState(true)
+  const [knowledgeMetricsUiEnabled, setKnowledgeMetricsUiEnabled] = useState(true)
 
   // Quality gate settings
   const [qgEnabled, setQgEnabled] = useState(true)
@@ -264,6 +267,8 @@ export default function AgentTeamsSettingsPage() {
           setCostCapEnabled(true)
           setCostCapUsd(String(settings.agentTeamsCostCapUsd))
         }
+        if (settings?.agentTeamsMemoryInjectionEnabled !== undefined) setMemoryInjectionEnabled(settings.agentTeamsMemoryInjectionEnabled)
+        if (settings?.agentTeamsKnowledgeMetricsUiEnabled !== undefined) setKnowledgeMetricsUiEnabled(settings.agentTeamsKnowledgeMetricsUiEnabled)
 
         // Load quality gate settings
         if (settings?.qualityGatesEnabled !== undefined) setQgEnabled(settings.qualityGatesEnabled)
@@ -542,6 +547,16 @@ export default function AgentTeamsSettingsPage() {
       console.error('Failed to save OpenRouter API key:', error)
     }
   }, [electronAPI, openrouterApiKey])
+
+  const handleMemoryInjectionToggle = useCallback((enabled: boolean) => {
+    setMemoryInjectionEnabled(enabled)
+    saveSetting('agentTeamsMemoryInjectionEnabled', enabled)
+  }, [saveSetting])
+
+  const handleKnowledgeMetricsUiToggle = useCallback((enabled: boolean) => {
+    setKnowledgeMetricsUiEnabled(enabled)
+    saveSetting('agentTeamsKnowledgeMetricsUiEnabled', enabled)
+  }, [saveSetting])
 
   // Quality gate handlers
   const handleQgToggle = useCallback((enabled: boolean) => {
@@ -1067,6 +1082,26 @@ export default function AgentTeamsSettingsPage() {
                             />
                           </div>
                         )}
+                      </SettingsCard>
+                    </SettingsSection>
+
+                    <SettingsSection
+                      title="Memory Controls"
+                      description="Operational kill-switches for shared memory injection and dashboard metrics"
+                    >
+                      <SettingsCard>
+                        <SettingsToggle
+                          label="Enable memory injection"
+                          description="Inject relevant Team Knowledge Bus context into spawned teammate prompts"
+                          checked={memoryInjectionEnabled}
+                          onCheckedChange={handleMemoryInjectionToggle}
+                        />
+                        <SettingsToggle
+                          label="Show Knowledge metrics UI"
+                          description="Expose Team Dashboard Knowledge tab and operational memory health metrics"
+                          checked={knowledgeMetricsUiEnabled}
+                          onCheckedChange={handleKnowledgeMetricsUiToggle}
+                        />
                       </SettingsCard>
                     </SettingsSection>
 

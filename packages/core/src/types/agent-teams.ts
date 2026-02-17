@@ -477,6 +477,23 @@ export interface TaskQualityReport {
 // Team Activity Feed
 // ============================================================
 
+/**
+ * Structured telemetry payload for knowledge-memory runtime behavior.
+ * Used to avoid parsing free-form activity strings in downstream consumers.
+ */
+export interface KnowledgeTelemetryEvent {
+  channel: 'knowledge';
+  operation: 'inject' | 'query';
+  /** Retrieval scope used for this operation (e.g. prompt-context, file, tags, text). */
+  scope: string;
+  /** Whether the operation produced at least one relevant entry. */
+  hit: boolean;
+  /** Number of matched/injected entries. */
+  resultCount: number;
+  /** True when feature flags intentionally suppressed injection. */
+  suppressed?: boolean;
+}
+
 export interface TeamActivityEvent {
   id: string;
   timestamp: string;
@@ -490,6 +507,8 @@ export interface TeamActivityEvent {
   details: string;
   /** Related task ID */
   taskId?: string;
+  /** Optional structured telemetry payloads (REQ-002). */
+  telemetry?: KnowledgeTelemetryEvent;
 }
 
 export type TeamActivityType =

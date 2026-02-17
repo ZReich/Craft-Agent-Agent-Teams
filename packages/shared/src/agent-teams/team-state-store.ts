@@ -25,6 +25,9 @@ import type {
 } from '@craft-agent/core/types';
 import type { KnowledgeEntry } from './team-knowledge-bus';
 
+export const KNOWLEDGE_RETENTION_DAYS = 14;
+const KNOWLEDGE_RETENTION_MS = KNOWLEDGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
 // ============================================================
 // Types
 // ============================================================
@@ -105,6 +108,9 @@ export class TeamStateStore {
 
     const taskMap = new Map<string, TeamTask>();
 
+    const now = Date.now();
+    let shouldRewriteForRetention = false;
+
     for (const line of raw.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -131,7 +137,21 @@ export class TeamStateStore {
           result.activity.push(entry.d as TeamActivityEvent);
           break;
         case 'kb':
-          result.knowledge.push(entry.d as KnowledgeEntry);
+          {
+            const knowledge = entry.d as KnowledgeEntry;
+            const timestamp = typeof knowledge.timestamp === 'number' ? knowledge.timestamp : 0;
+            const expiredByTtl = typeof knowledge.ttl === 'number'
+              && timestamp > 0
+              && (timestamp + knowledge.ttl) <= now;
+            const expiredByRetention = timestamp > 0
+              && timestamp < (now - KNOWLEDGE_RETENTION_MS);
+
+            if (expiredByTtl || expiredByRetention) {
+              shouldRewriteForRetention = true;
+              break;
+            }
+            result.knowledge.push(knowledge);
+          }
           break;
         // BUG-020 fix: Load quality gate and YOLO state
         case 'qg':
@@ -146,6 +166,10 @@ export class TeamStateStore {
     // Convert task map to array, preserving order of first appearance
     result.tasks = Array.from(taskMap.values());
 
+    if (shouldRewriteForRetention) {
+      this.writeState(result);
+    }
+
     return result;
   }
 
@@ -157,8 +181,26 @@ export class TeamStateStore {
    */
   compact(): void {
     const state = this.load();
+    this.writeState(state);
+  }
 
-    // Rewrite the file from scratch
+  // ── Internal ────────────────────────────────────────────────
+
+  private appendEntry(entry: TeamStateEntry): void {
+    const dir = dirname(this.filePath);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+
+    try {
+      appendFileSync(this.filePath, JSON.stringify(entry) + '\n', 'utf-8');
+    } catch (err) {
+      // Non-fatal: log and continue (don't crash the team)
+      console.error('[TeamStateStore] Failed to append entry:', err);
+    }
+  }
+
+  private writeState(state: TeamState): void {
     const dir = dirname(this.filePath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -178,7 +220,6 @@ export class TeamStateStore {
     for (const kb of state.knowledge) {
       lines.push(JSON.stringify({ t: 'kb', d: kb }));
     }
-    // BUG-020 fix: Persist quality gates and YOLO state during compaction
     for (const [k, qg] of state.qualityGates) {
       lines.push(JSON.stringify({ t: 'qg', d: qg, k }));
     }
@@ -187,21 +228,5 @@ export class TeamStateStore {
     }
 
     writeFileSync(this.filePath, lines.join('\n') + '\n', 'utf-8');
-  }
-
-  // ── Internal ────────────────────────────────────────────────
-
-  private appendEntry(entry: TeamStateEntry): void {
-    const dir = dirname(this.filePath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-
-    try {
-      appendFileSync(this.filePath, JSON.stringify(entry) + '\n', 'utf-8');
-    } catch (err) {
-      // Non-fatal: log and continue (don't crash the team)
-      console.error('[TeamStateStore] Failed to append entry:', err);
-    }
   }
 }
