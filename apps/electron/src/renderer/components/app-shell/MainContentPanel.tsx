@@ -57,7 +57,6 @@ class SettingsPageErrorBoundary extends React.Component<
   componentDidUpdate(prevProps: { subpage: string }) {
     // Reset the boundary when the user switches to a different settings page.
     if (prevProps.subpage !== this.props.subpage && this.state.error) {
-      // eslint-disable-next-line react/no-did-update-set-state
       this.setState({ error: null })
     }
   }

@@ -13,6 +13,8 @@ import type {
   TeamEventBatch,
   TeamInitializedEvent,
   TeamCreatedEvent,
+  TeamUpdatedEvent,
+  TeamCompletedEvent,
   TeamCleanupEvent,
   TeammateSpawnedEvent,
   TeammateUpdatedEvent,
@@ -375,8 +377,10 @@ export function useTeamEventHandler(
 export function useTeamStateSync(
   teamId: string,
   callbacks: {
+    onTeamInitialized?: (event: TeamInitializedEvent) => void;
     onTeamCreated?: (event: TeamCreatedEvent) => void;
-    onTeamUpdated?: (event: TeamInitializedEvent) => void;
+    onTeamUpdated?: (event: TeamUpdatedEvent) => void;
+    onTeamCompleted?: (event: TeamCompletedEvent) => void;
     onTeamCleanup?: (event: TeamCleanupEvent) => void;
     onTeammateSpawned?: (event: TeammateSpawnedEvent) => void;
     onTeammateUpdated?: (event: TeammateUpdatedEvent) => void;
@@ -401,12 +405,17 @@ export function useTeamStateSync(
   useEffect(() => {
     const handler = (event: TeamEvent) => {
       switch (event.type) {
+        case 'team:initialized':
+          callbacks.onTeamInitialized?.(event as TeamInitializedEvent);
+          break;
         case 'team:created':
           callbacks.onTeamCreated?.(event as TeamCreatedEvent);
           break;
-        case 'team:initialized':
         case 'team:updated':
-          callbacks.onTeamUpdated?.(event as TeamInitializedEvent);
+          callbacks.onTeamUpdated?.(event as TeamUpdatedEvent);
+          break;
+        case 'team:completed':
+          callbacks.onTeamCompleted?.(event as TeamCompletedEvent);
           break;
         case 'team:cleanup':
           callbacks.onTeamCleanup?.(event as TeamCleanupEvent);

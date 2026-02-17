@@ -1652,6 +1652,8 @@ export interface WorkspaceSettings {
   agentTeamsReviewerThinking?: boolean
   /** Whether thinking/extended reasoning is enabled for the Escalation role (Custom preset only) */
   agentTeamsEscalationThinking?: boolean
+  /** Whether UX/Design routing should prefer Opus before Codex fallback (default: true) */
+  agentTeamsUxDesignPreferOpus?: boolean
   /** Cost cap in USD for agent teams operations */
   agentTeamsCostCapUsd?: number
   /** Kill-switch for prompt-time team memory injection (REQ-008) */

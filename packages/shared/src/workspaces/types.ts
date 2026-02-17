@@ -59,6 +59,8 @@ export interface AgentTeamsConfig {
   reviewerThinking?: boolean;
   /** Whether extended thinking is enabled for the Escalation role (Custom preset only) */
   escalationThinking?: boolean;
+  /** Whether UX/Design routing should prefer Opus before Codex fallback (default: true) */
+  uxDesignPreferOpus?: boolean;
   /** Cost cap per session in USD (optional) */
   costCapUsd?: number;
   /** Auto-escalation: upgrade worker model after N failures */
