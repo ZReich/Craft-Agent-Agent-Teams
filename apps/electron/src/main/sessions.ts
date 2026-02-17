@@ -90,7 +90,7 @@ import { TeammateHealthMonitor, type HealthIssue } from '@craft-agent/shared/age
 import { ToolCallThrottle } from '@craft-agent/shared/agent-teams/tool-call-throttle'
 import { HeartbeatAggregator } from '@craft-agent/shared/agent-teams/heartbeat-aggregator'
 import { exportCompactSpec } from '@craft-agent/shared/agent-teams/sdd-exports'
-import { resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/shared/agent-teams/model-resolution'
+import { resolveTeamModelConfig, resolveTeamModelForRole, resolveThinkingForRole } from '@craft-agent/shared/agent-teams/model-resolution'
 import { decideTeammateRouting } from '@craft-agent/shared/agent-teams/routing-policy'
 import { YoloOrchestrator, mergeYoloConfig, decideSpawnStrategy, type YoloCallbacks } from '@craft-agent/shared/agent-teams/yolo-orchestrator'
 import { selectArchitectureMode } from '@craft-agent/shared/agent-teams/architecture-selector'
@@ -5510,8 +5510,11 @@ export class SessionManager {
    * Returns the session with isTeamLead=true and matching teamId, or null if not found.
    */
   findLeadSessionForTeam(teamId: string): { id: string; workspaceId: string } | null {
+    const resolvedTargetTeamId = teamManager.resolveTeamId(teamId)
     for (const [, session] of this.sessions) {
-      if (session.isTeamLead && session.teamId === teamId) {
+      if (!session.isTeamLead || !session.teamId) continue
+      const resolvedSessionTeamId = teamManager.resolveTeamId(session.teamId)
+      if (resolvedSessionTeamId === resolvedTargetTeamId) {
         return { id: session.id, workspaceId: session.workspace.id }
       }
     }
@@ -5571,6 +5574,43 @@ export class SessionManager {
       }
     }
 
+    const workspaceConfig = loadWorkspaceConfig(parent.workspace.rootPath)
+
+    // Implements REQ-003/REQ-004: canonicalize team identity for Task-driven spawns
+    // and bootstrap TeamManager state when no explicit TeamCreate was called.
+    const requestedTeamRef = params.teamId.trim()
+    const parentTeamRef = parent.teamId?.trim()
+    const resolvedParentTeamId = parentTeamRef ? teamManager.resolveTeamId(parentTeamRef) : undefined
+    const resolvedRequestedTeamId = requestedTeamRef ? teamManager.resolveTeamId(requestedTeamRef) : undefined
+
+    let resolvedTeamId = resolvedParentTeamId ?? resolvedRequestedTeamId ?? requestedTeamRef
+    let teamRecord = teamManager.getTeam(resolvedTeamId)
+
+    if (!teamRecord) {
+      const resolvedConfig = resolveTeamModelConfig(workspaceConfig)
+      teamRecord = teamManager.createTeam({
+        name: requestedTeamRef || parent.name || `team-${parent.id.slice(-6)}`,
+        leadSessionId: parent.id,
+        modelConfig: resolvedConfig.modelConfig,
+        modelPreset: resolvedConfig.presetId,
+        workspaceRootPath: parent.workspace.rootPath,
+      })
+      resolvedTeamId = teamRecord.id
+      sessionLog.info(
+        `[AgentTeams] Bootstrapped missing team state for lead ${parent.id}: ` +
+        `requested="${requestedTeamRef}" canonical="${resolvedTeamId}"`,
+      )
+    }
+
+    // Ensure persistent state storage is always wired for this team.
+    teamManager.initStateStore(resolvedTeamId, join(parent.workspace.rootPath, 'sessions', parent.id))
+    this.ensureYoloWiredForTeam(resolvedTeamId, parent.id)
+
+    // Keep lead metadata canonical so dashboard + persistence read/write the same bucket.
+    parent.teamId = resolvedTeamId
+    parent.isTeamLead = true
+    const teamIdForCodename = requestedTeamRef || resolvedTeamId
+
     // Pick team color: count existing teams to rotate through the palette
     let teamColor = parent.teamColor
     if (!teamColor) {
@@ -5581,11 +5621,9 @@ export class SessionManager {
       teamColor = TEAM_COLORS[activeTeamIds.size % TEAM_COLORS.length]
       // Set the color on the parent/lead session too
       parent.teamColor = teamColor
-      parent.teamId = params.teamId
-      parent.isTeamLead = true
 
       // Upgrade lead session model to the preset's lead model
-      const wsConfigForLead = loadWorkspaceConfig(parent.workspace.rootPath)
+      const wsConfigForLead = workspaceConfig
       const leadAssignment = resolveTeamModelForRole(wsConfigForLead, 'lead')
       const leadModel = leadAssignment.model
       if (leadModel && leadModel !== 'unknown' && leadModel !== parent.model) {
@@ -5613,68 +5651,65 @@ export class SessionManager {
         }
       }
 
-      // Implements AUDIT-FIX-1: Wire ReviewLoopOrchestrator so quality gates actually run.
-      // Previously, setReviewLoop() was never called in production — only in tests.
-      // This connects the 10-stage quality gate pipeline to the task completion flow.
-      const qgWsConfig = loadWorkspaceConfig(parent.workspace.rootPath)
-      const qgConfig = mergeQualityGateConfig(qgWsConfig?.agentTeams?.qualityGates)
-      if (qgConfig.enabled) {
-        const resolvedTeamIdForQg = teamManager.resolveTeamId(params.teamId)
-        const workingDir = parent.workingDirectory || parent.workspace.rootPath
-        const reviewCallbacks: ReviewLoopCallbacks = {
-          collectDiff: async (_teamId: string, _taskId: string, wd: string) => {
-            const reviewDiff = await DiffCollector.collectWorkingDiff(wd)
-            return reviewDiff.unifiedDiff
-          },
-          runQualityGates: async (diff, taskDescription, wd, config, cycleCount, spec) => {
-            const runner = this.getQualityGateRunner()
-            const taskContext: TaskContext = {
-              taskDescription,
-              workingDirectory: wd,
-              cycleCount,
-              spec,
-            }
-            return runner.runPipeline(diff, taskContext, config)
-          },
-          sendFeedback: async (_teamId: string, teammateId: string, feedback: string) => {
-            await this.sendMessage(teammateId, feedback)
-          },
-          updateTaskStatus: (teamId: string, taskId: string, status: string, assignee?: string, options?: { bypassReviewLoop?: boolean }) => {
-            teamManager.updateTaskStatus(teamId, taskId, status as import('@craft-agent/core/types').TeamTaskStatus, assignee, options)
-          },
-          escalate: async (result, diff, taskDescription, config) => {
-            const runner = this.getQualityGateRunner()
-            const taskContext: TaskContext = { taskDescription, workingDirectory: workingDir }
-            return runner.escalate(result, diff, taskContext, config)
-          },
-        }
-        const reviewLoopConfig: ReviewLoopConfig = {
-          qualityGates: qgConfig,
-          workingDirectory: workingDir,
-          autoReview: true,
-        }
-        const reviewLoop = new ReviewLoopOrchestrator(reviewCallbacks, reviewLoopConfig)
-        teamManager.setReviewLoop(reviewLoop)
+    }
 
-        // Forward review events as team activity
-        reviewLoop.on('review:passed', (data: { teamId: string; taskId: string }) => {
-          teamManager.logActivity(data.teamId, 'quality-gate-passed', `Task ${data.taskId} passed quality gates`, undefined, undefined)
-        })
-        reviewLoop.on('review:failed', (data: { teamId: string; taskId: string; report: string }) => {
-          teamManager.logActivity(data.teamId, 'quality-gate-failed', `Task ${data.taskId} failed quality gates`, undefined, undefined)
-        })
-        reviewLoop.on('review:escalated', (data: { teamId: string; taskId: string }) => {
-          teamManager.logActivity(data.teamId, 'escalation', `Task ${data.taskId} escalated after max review cycles`, undefined, undefined)
-        })
-
-        sessionLog.info(`[AgentTeams] ReviewLoopOrchestrator wired for team "${resolvedTeamIdForQg}" (QG enabled, threshold: ${qgConfig.passThreshold})`)
-      } else {
-        sessionLog.info(`[AgentTeams] Quality gates disabled for team — ReviewLoop not attached`)
+    // Implements AUDIT-FIX-1: Wire ReviewLoopOrchestrator so quality gates actually run.
+    // This must run even when team color already exists (e.g., restored teams after restart).
+    const qgConfig = mergeQualityGateConfig(workspaceConfig?.agentTeams?.qualityGates)
+    if (qgConfig.enabled && !teamManager.getReviewLoop()) {
+      const workingDir = parent.workingDirectory || parent.workspace.rootPath
+      const reviewCallbacks: ReviewLoopCallbacks = {
+        collectDiff: async (_teamId: string, _taskId: string, wd: string) => {
+          const reviewDiff = await DiffCollector.collectWorkingDiff(wd)
+          return reviewDiff.unifiedDiff
+        },
+        runQualityGates: async (diff, taskDescription, wd, config, cycleCount, spec) => {
+          const runner = this.getQualityGateRunner()
+          const taskContext: TaskContext = {
+            taskDescription,
+            workingDirectory: wd,
+            cycleCount,
+            spec,
+          }
+          return runner.runPipeline(diff, taskContext, config)
+        },
+        sendFeedback: async (_teamId: string, teammateId: string, feedback: string) => {
+          await this.sendMessage(teammateId, feedback)
+        },
+        updateTaskStatus: (teamId: string, taskId: string, status: string, assignee?: string, options?: { bypassReviewLoop?: boolean }) => {
+          teamManager.updateTaskStatus(teamId, taskId, status as import('@craft-agent/core/types').TeamTaskStatus, assignee, options)
+        },
+        escalate: async (result, diff, taskDescription, config) => {
+          const runner = this.getQualityGateRunner()
+          const taskContext: TaskContext = { taskDescription, workingDirectory: workingDir }
+          return runner.escalate(result, diff, taskContext, config)
+        },
       }
+      const reviewLoopConfig: ReviewLoopConfig = {
+        qualityGates: qgConfig,
+        workingDirectory: workingDir,
+        autoReview: true,
+      }
+      const reviewLoop = new ReviewLoopOrchestrator(reviewCallbacks, reviewLoopConfig)
+      teamManager.setReviewLoop(reviewLoop)
+
+      // Forward review events as team activity
+      reviewLoop.on('review:passed', (data: { teamId: string; taskId: string }) => {
+        teamManager.logActivity(data.teamId, 'quality-gate-passed', `Task ${data.taskId} passed quality gates`, undefined, undefined)
+      })
+      reviewLoop.on('review:failed', (data: { teamId: string; taskId: string; report: string }) => {
+        teamManager.logActivity(data.teamId, 'quality-gate-failed', `Task ${data.taskId} failed quality gates`, undefined, undefined)
+      })
+      reviewLoop.on('review:escalated', (data: { teamId: string; taskId: string }) => {
+        teamManager.logActivity(data.teamId, 'escalation', `Task ${data.taskId} escalated after max review cycles`, undefined, undefined)
+      })
+
+      sessionLog.info(`[AgentTeams] ReviewLoopOrchestrator wired for team "${resolvedTeamId}" (QG enabled, threshold: ${qgConfig.passThreshold})`)
+    } else if (!qgConfig.enabled) {
+      sessionLog.info('[AgentTeams] Quality gates disabled for team — ReviewLoop not attached')
     }
 
     // Create the teammate session
-    const workspaceConfig = loadWorkspaceConfig(parent.workspace.rootPath)
     // Implements REQ-003: ensure an active spec when SDD is enabled
     if (parent.sddEnabled && !parent.activeSpecId) {
       await this.ensureSessionActiveSpec(parent.id)
@@ -5691,7 +5726,7 @@ export class SessionManager {
 
     const teammateRole = normalizeTeamRole(routing.role, params.teammateName)
     const teammateOrdinal = (parent.teammateSessionIds?.length ?? 0) + 1
-    const teammateCodename = buildTeammateCodename(teammateRole, params.teamId, teammateOrdinal - 1)
+    const teammateCodename = buildTeammateCodename(teammateRole, teamIdForCodename, teammateOrdinal - 1)
     // Implements REQ-002: Use witty codename as primary name, honor explicit custom names
     const customName = params.teammateName?.trim()
     const teammateDisplayName = customName || teammateCodename
@@ -5803,7 +5838,7 @@ export class SessionManager {
     const teammateThinkingLevel: ThinkingLevel = shouldEnableThinking ? 'think' : DEFAULT_THINKING_LEVEL
 
     const teammateSession = await this.createSession(params.workspaceId, {
-      teamId: params.teamId,
+      teamId: resolvedTeamId,
       parentSessionId: params.parentSessionId,
       teammateName: teammateDisplayName,
       teammateRole,
@@ -5833,12 +5868,11 @@ export class SessionManager {
       sessionId: params.parentSessionId,
       teammateSessionId: teammateSession.id,
       teammateName: teammateDisplayName,
-      teamId: params.teamId,
+      teamId: resolvedTeamId,
       teamColor,
     }, parent.workspace.id)
 
     // Implements REQ-001: emit team activity for spawn tracing
-    const resolvedTeamId = teamManager.resolveTeamId(params.teamId)
     teamManager.logActivity(
       resolvedTeamId,
       'teammate-spawned',
@@ -5884,14 +5918,19 @@ export class SessionManager {
     }
 
     if (parent.sddEnabled && parsedSpec) {
-      const requirementIds = parsedSpec.requirements.map(req => req.id)
+      const specRequirementIds = new Set(parsedSpec.requirements.map(req => req.id.toUpperCase()))
+      const requirementIds = [...new Set(
+        Array.from(params.prompt.matchAll(/\bREQ-[A-Z0-9_-]+\b/gi))
+          .map(match => match[0].toUpperCase())
+          .filter(reqId => specRequirementIds.has(reqId))
+      )]
       const task = teamManager.createTask(
         resolvedTeamId,
         `${teammateDisplayName} task`,
         params.prompt,
         parent.id,
         {
-          requirementIds,
+          requirementIds: requirementIds.length > 0 ? requirementIds : undefined,
           driOwner: parsedSpec.ownerDRI,
           driReviewer: parsedSpec.ownerDRI,
           assignee: teammateSession.id,
@@ -8920,11 +8959,16 @@ export class SessionManager {
       let stdout = ''
 
       if (isWin) {
-        // Windows: use findstr recursively with /S /N
+        // Windows: use findstr recursively with explicit /C tokens.
+        // NOTE: findstr /R does not support regex alternation with "|" reliably,
+        // which caused REQ scans to miss all matches on Windows.
         const { execSync } = require('child_process') as typeof import('child_process')
+        const findstrNeedles = requirementIds
+          .map(id => `/C:"${id.replace(/"/g, '""')}"`)
+          .join(' ')
         try {
           stdout = execSync(
-            `findstr /S /N /R "${pattern}" *.ts *.tsx *.js *.jsx *.py *.rs *.go`,
+            `findstr /S /N /I ${findstrNeedles} *.ts *.tsx *.js *.jsx *.py *.rs *.go`,
             { cwd: workingDir, timeout: 10000, encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }
           )
         } catch (e: any) {
