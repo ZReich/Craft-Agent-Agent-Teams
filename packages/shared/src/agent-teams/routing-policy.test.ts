@@ -39,5 +39,49 @@ describe('agent teams routing policy', () => {
     expect(d.role).toBe('reviewer');
     expect(d.skillSlugs).toEqual(['quality-reviewer']);
   });
-});
 
+  it('routes testing work to test-writer by default', () => {
+    const d = decideTeammateRouting({
+      prompt: 'Write unit tests and improve coverage for routing behavior',
+    });
+    expect(d.domain).toBe('testing');
+    expect(d.role).toBe('worker');
+    expect(d.skillSlugs).toEqual(['test-writer']);
+  });
+
+  it('routes integration work to integration-fixer by default', () => {
+    const d = decideTeammateRouting({
+      prompt: 'Integration: fix cross-module wiring and end-to-end contract mismatch',
+    });
+    expect(d.domain).toBe('integration');
+    expect(d.role).toBe('worker');
+    expect(d.skillSlugs).toEqual(['integration-fixer']);
+  });
+
+  it('routes escalation work to escalation role with escalation-specialist skill', () => {
+    const d = decideTeammateRouting({
+      prompt: 'Escalate this blocked task with unresolved critical risk',
+    });
+    expect(d.domain).toBe('escalation');
+    expect(d.role).toBe('escalation');
+    expect(d.skillSlugs).toEqual(['escalation-specialist']);
+  });
+
+  it('routes planning work to spec-planner', () => {
+    const d = decideTeammateRouting({
+      prompt: 'Create a spec and requirements planning breakdown for this feature',
+    });
+    expect(d.domain).toBe('planning');
+    expect(d.role).toBe('worker');
+    expect(d.skillSlugs).toEqual(['spec-planner']);
+  });
+
+  it('routes docs work to docs-maintainer', () => {
+    const d = decideTeammateRouting({
+      prompt: 'Update documentation and migration notes for this change',
+    });
+    expect(d.domain).toBe('docs');
+    expect(d.role).toBe('worker');
+    expect(d.skillSlugs).toEqual(['docs-maintainer']);
+  });
+});

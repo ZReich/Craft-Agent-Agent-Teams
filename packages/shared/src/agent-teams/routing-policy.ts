@@ -16,6 +16,13 @@ export type TaskDomain =
   | 'research'
   | 'search'
   | 'review'
+  | 'escalation'
+  | 'integration'
+  | 'testing'
+  | 'planning'
+  | 'docs'
+  | 'remediation'
+  | 'rollout_safety'
   | 'other';
 
 export interface DomainClassification {
@@ -59,6 +66,64 @@ const DOMAIN_KEYWORDS: Record<TaskDomain, string[]> = {
     'verify',
     'validate',
   ],
+  escalation: [
+    'escalation',
+    'escalate',
+    'blocked',
+    'unresolved',
+    'manual intervention',
+    'emergency',
+  ],
+  integration: [
+    'integration',
+    'wiring',
+    'cross-module',
+    'end-to-end',
+    'e2e',
+    'merge conflict',
+    'full build',
+  ],
+  testing: [
+    'unit test',
+    'test suite',
+    'coverage',
+    'tdd',
+    'vitest',
+    'jest',
+    'spec file',
+    'test ',
+  ],
+  planning: [
+    'planning',
+    'spec',
+    'requirements',
+    'acceptance criteria',
+    'decompose',
+    'task breakdown',
+  ],
+  docs: [
+    'docs',
+    'documentation',
+    'readme',
+    'guide',
+    'migration notes',
+    'operator runbook',
+  ],
+  remediation: [
+    'remediation',
+    'review failed',
+    'quality gate failed',
+    'rework',
+    'fix plan',
+  ],
+  rollout_safety: [
+    'rollout',
+    'rollback',
+    'feature flag',
+    'blast radius',
+    'release safety',
+    'monitoring plan',
+  ],
   frontend: [
     'frontend',
     'react',
@@ -101,6 +166,13 @@ const DOMAIN_KEYWORDS: Record<TaskDomain, string[]> = {
 const DOMAIN_PRIORITY: TaskDomain[] = [
   'ux_design',
   'review',
+  'escalation',
+  'integration',
+  'testing',
+  'planning',
+  'docs',
+  'remediation',
+  'rollout_safety',
   'frontend',
   'backend',
   'search',
@@ -126,6 +198,16 @@ function defaultRoleForDomain(domain: TaskDomain): TeamRole {
       return 'reviewer';
     case 'ux_design':
       return 'head';
+    case 'escalation':
+      return 'escalation';
+    case 'planning':
+    case 'docs':
+    case 'testing':
+    case 'integration':
+    case 'remediation':
+      return 'worker';
+    case 'rollout_safety':
+      return 'reviewer';
     case 'frontend':
     case 'backend':
     case 'search':
@@ -142,6 +224,13 @@ function skillSlugsForDomain(domain: TaskDomain, role: TeamRole): string[] {
   if (domain === 'frontend') return ['frontend-implementer'];
   if (domain === 'backend') return ['backend-implementer'];
   if (domain === 'search' || domain === 'research') return ['codebase-cartographer'];
+  if (domain === 'testing') return ['test-writer'];
+  if (domain === 'integration') return ['integration-fixer'];
+  if (domain === 'planning') return ['spec-planner'];
+  if (domain === 'docs') return ['docs-maintainer'];
+  if (domain === 'remediation') return ['remediation-coordinator'];
+  if (domain === 'rollout_safety') return ['rollout-safety-planner'];
+  if (domain === 'escalation') return ['escalation-specialist'];
   if (domain === 'review' || role === 'reviewer') return ['quality-reviewer'];
   return [];
 }
@@ -202,4 +291,3 @@ export function decideTeammateRouting(input: {
     reason: reasonParts.join(' '),
   };
 }
-

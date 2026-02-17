@@ -108,13 +108,20 @@ File: `routing-policy.ts`
 Classifies task prompts into domains and enforces routing rules:
 
 ```typescript
-type TaskDomain = 'ux_design' | 'frontend' | 'backend' | 'research' | 'search' | 'review' | 'other';
+type TaskDomain = 'ux_design' | 'frontend' | 'backend' | 'research' | 'search' | 'review' | 'escalation' | 'integration' | 'testing' | 'planning' | 'docs' | 'remediation' | 'rollout_safety' | 'other';
 ```
 
 | Domain | Default Role | Hard Enforcement |
 |--------|-------------|-----------------|
 | `ux_design` | `head` | **Always Head + Opus** (REQ-005) |
 | `review` | `reviewer` | - |
+| `escalation` | `escalation` | - |
+| `integration` | `worker` | - |
+| `testing` | `worker` | - |
+| `planning` | `worker` | - |
+| `docs` | `worker` | - |
+| `remediation` | `worker` | - |
+| `rollout_safety` | `reviewer` | - |
 | `frontend` | `worker` | - |
 | `backend` | `worker` | - |
 | `search` | `worker` | - |
@@ -127,6 +134,13 @@ Each domain maps to skill slugs via `skillSlugsForDomain()`:
 - `backend` → `backend-implementer`
 - `search`/`research` → `codebase-cartographer`
 - `review` → `quality-reviewer`
+- `testing` → `test-writer`
+- `integration` → `integration-fixer`
+- `planning` → `spec-planner`
+- `docs` → `docs-maintainer`
+- `remediation` → `remediation-coordinator`
+- `rollout_safety` → `rollout-safety-planner`
+- `escalation` → `escalation-specialist`
 
 Skill definitions live in `.agents/skills/` at the repo root.
 
