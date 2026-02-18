@@ -1,4 +1,4 @@
-﻿---
+---
 name: remediation-coordinator
 description: Quality-gate remediation planning skill. Use to translate review failures into minimal fix tasks with ordering, ownership, and verification steps.
 ---

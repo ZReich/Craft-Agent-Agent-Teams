@@ -1,4 +1,4 @@
-﻿---
+---
 name: quality-reviewer
 description: Reviewer/QA skill for agent team outputs. Use for code review, SDD traceability checks (REQ↔code↔tests), acceptance test verification, rollout/rollback safety review, and validation of routing/skill-pack changes.
 ---

@@ -1,4 +1,4 @@
-﻿---
+---
 name: backend-implementer
 description: Backend implementation skill. Use for API/service work, data modeling, migrations, validation, security checks, observability (logs/metrics), and backend tests.
 ---

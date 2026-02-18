@@ -1,4 +1,4 @@
-﻿---
+---
 name: frontend-implementer
 description: Frontend implementation skill for React/Electron renderer UI work. Use for component implementation, UI state wiring, styling, accessibility verification, and frontend tests.
 ---

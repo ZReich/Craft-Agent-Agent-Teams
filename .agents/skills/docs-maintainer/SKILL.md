@@ -1,4 +1,4 @@
-﻿---
+---
 name: docs-maintainer
 description: Documentation maintenance skill. Use to update architecture/usage docs, migration notes, and operator guidance so docs remain aligned with shipped behavior.
 ---

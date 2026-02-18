@@ -1,4 +1,4 @@
-﻿---
+---
 name: test-writer
 description: Test authoring skill for agent teams. Use for creating or updating unit/integration/e2e tests, defining acceptance tests from requirements, and closing test coverage gaps before review.
 ---

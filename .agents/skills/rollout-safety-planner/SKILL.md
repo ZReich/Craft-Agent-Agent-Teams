@@ -1,4 +1,4 @@
-﻿---
+---
 name: rollout-safety-planner
 description: Release safety planning skill. Use to define rollout stages, observability checks, rollback criteria, and incident-response guardrails for risky changes.
 ---

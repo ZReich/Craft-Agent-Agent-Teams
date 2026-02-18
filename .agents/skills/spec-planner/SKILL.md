@@ -1,4 +1,4 @@
-﻿---
+---
 name: spec-planner
 description: Specification planning skill. Use to produce concise, testable requirements, acceptance tests, DRI ownership, and task decomposition before implementation.
 ---

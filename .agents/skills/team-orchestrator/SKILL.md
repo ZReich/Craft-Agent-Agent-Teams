@@ -1,4 +1,4 @@
-﻿---
+---
 name: team-orchestrator
 description: Team lead orchestration skill. Use to run the spec -> tasks -> assignment -> review -> synthesis loop with SDD traceability (REQ-IDs, DRIs, acceptance tests) and safety (rollout/rollback).
 ---

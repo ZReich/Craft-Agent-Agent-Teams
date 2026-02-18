@@ -1,4 +1,4 @@
-﻿---
+---
 name: task-router
 description: Task routing skill for agent teams. Use to classify work (ux/design, frontend, backend, research/search, review, testing, integration, planning, docs, remediation, and escalation) and pick the correct teammate role/model and skill pack with guardrails (UX/design must be top-tier).
 ---

@@ -1,4 +1,4 @@
-﻿---
+---
 name: escalation-specialist
 description: Escalation handling skill for agent teams. Use when quality gates fail repeatedly, blockers are cross-domain, risks are high-severity, or a decisive recovery/rollback path is needed.
 ---

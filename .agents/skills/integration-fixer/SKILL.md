@@ -1,4 +1,4 @@
-﻿---
+---
 name: integration-fixer
 description: Integration and wiring repair skill for agent teams. Use when code compiles in isolation but fails in end-to-end integration, import wiring, runtime composition, or cross-module contracts.
 ---
