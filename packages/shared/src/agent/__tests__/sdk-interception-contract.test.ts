@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { buildOverrideSnippet, createToolOverrideResult, didToolOverrideApply } from '../sdk-interception';
+import { didToolOverrideMatch } from '../sdk-interception';
 
 function findSdkDtsPath(): string | null {
   const searchRoots = [
@@ -47,16 +47,14 @@ function findSdkDtsPath(): string | null {
   return null;
 }
 
+// Implements REQ-NEXT-007: Stabilize SDK interception layer.
 describe('sdk interception contract (REQ-NEXT-007)', () => {
-  it('creates synthetic override payload through a single abstraction', () => {
-    const result = createToolOverrideResult('hello world');
-    expect(result).toEqual({ outputContent: 'hello world' });
-  });
-
-  it('detects whether synthetic tool override appears in post-tool output', () => {
-    const snippet = buildOverrideSnippet('Teammate spawned successfully as a separate session.');
-    expect(didToolOverrideApply(`OK: ${snippet}`, snippet)).toBe(true);
-    expect(didToolOverrideApply('different response', snippet)).toBe(false);
+  // Basic helper test
+  it('didToolOverrideMatch finds expected snippet in actual result', () => {
+    expect(didToolOverrideMatch('hello', 'OK: hello world')).toBe(true);
+    expect(didToolOverrideMatch('hello', 'different response')).toBe(false);
+    expect(didToolOverrideMatch('', 'anything')).toBe(true);
+    expect(didToolOverrideMatch('something', '')).toBe(false);
   });
 
   it('asserts SDK hook type contract shape for PreToolUse remains recognizable', () => {
@@ -72,5 +70,17 @@ describe('sdk interception contract (REQ-NEXT-007)', () => {
     expect(sdkDts).toContain('permissionDecision?:');
     expect(sdkDts).toContain('updatedInput?: Record<string, unknown>');
     expect(sdkDts).toContain('type SyncHookJSONOutput');
+    // Regression guard: outputContent must NOT appear in the SDK types.
+    // If the SDK ever adds official support, we can replace decision:'block' with a better mechanism.
+    expect(sdkDts).not.toContain('outputContent');
+  });
+
+  it('asserts decision:block is a valid SDK SyncHookJSONOutput decision value', () => {
+    // This verifies the mechanism we now use for agent team tool interception is officially supported.
+    const dtsPath = findSdkDtsPath();
+    if (!dtsPath) return; // skip if SDK not found (covered by other test)
+    const sdkDts = readFileSync(dtsPath, 'utf8');
+    // decision field should have 'block' as an approved value
+    expect(sdkDts).toContain("'approve' | 'block'");
   });
 });

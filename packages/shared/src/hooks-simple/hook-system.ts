@@ -108,7 +108,7 @@ export class HookSystem implements HooksConfigProvider {
     }
 
     try {
-      const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+      const raw = JSON.parse(readFileSync(configPath, 'utf-8').replace(/^\uFEFF/, ''));
       const validation = validateHooksConfig(raw);
 
       if (!validation.valid) {
@@ -140,7 +140,7 @@ export class HookSystem implements HooksConfigProvider {
     }
 
     try {
-      const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+      const raw = JSON.parse(readFileSync(configPath, 'utf-8').replace(/^\uFEFF/, ''));
       const validation = validateHooksConfig(raw);
 
       if (!validation.valid) {

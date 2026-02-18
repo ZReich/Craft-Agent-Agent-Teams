@@ -236,6 +236,7 @@ export default function App() {
   // Implements REQ-004: Independent workspace-level flags for YOLO and Design Flow
   const [workspaceYoloEnabled, setWorkspaceYoloEnabled] = useState(false)
   const [workspaceDesignFlowEnabled, setWorkspaceDesignFlowEnabled] = useState(false)
+  const [workspaceDashboardAutoMinimizeCompletedTeams, setWorkspaceDashboardAutoMinimizeCompletedTeams] = useState(false)
 
   // Sources and skills for badge extraction
   const sources = useAtomValue(sourcesAtom)
@@ -405,8 +406,10 @@ export default function App() {
       setWorkspaceAgentTeamsEnabled(wsAgentTeamsEnabled)
       const wsYoloEnabled = !!wsSettings?.yoloMode && wsSettings.yoloMode !== 'off'
       const wsDesignFlowEnabled = !!wsSettings?.designFlowEnabled
+      const wsDashboardAutoMinimize = !!wsSettings?.dashboardAutoMinimizeCompletedTeams
       setWorkspaceYoloEnabled(wsYoloEnabled)
       setWorkspaceDesignFlowEnabled(wsDesignFlowEnabled)
+      setWorkspaceDashboardAutoMinimizeCompletedTeams(wsDashboardAutoMinimize)
       // Initialize per-session atoms and metadata map
       // NOTE: No sessionsAtom used - sessions are only in per-session atoms
       initializeSessions(loadedSessions)
@@ -1315,6 +1318,7 @@ export default function App() {
     workspaceAgentTeamsEnabled,
     workspaceYoloEnabled,
     workspaceDesignFlowEnabled,
+    workspaceDashboardAutoMinimizeCompletedTeams,
     onWorkspaceFeatureFlagsChange: handleWorkspaceFeatureFlagsChange,
     // Session callbacks
     onCreateSession: handleCreateSession,
@@ -1362,6 +1366,7 @@ export default function App() {
     workspaceAgentTeamsEnabled,
     workspaceYoloEnabled,
     workspaceDesignFlowEnabled,
+    workspaceDashboardAutoMinimizeCompletedTeams,
     handleWorkspaceFeatureFlagsChange,
     handleCreateSession,
     handleSendMessage,

@@ -56,3 +56,11 @@ export function isInvalidIconValue(str: string): boolean {
   if (str.startsWith('.') || str.startsWith('/')) return true;
   return false;
 }
+
+/**
+ * Check if a string is a Lucide icon name (e.g. "file-text", "git-branch", "zap").
+ * Lucide icon names are lowercase letters, digits, and hyphens, not starting/ending with a hyphen.
+ */
+export function isLucideIconName(str: string): boolean {
+  return /^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$/.test(str);
+}

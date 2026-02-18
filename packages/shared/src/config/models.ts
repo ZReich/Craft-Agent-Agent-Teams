@@ -77,6 +77,14 @@ export const MODEL_REGISTRY: ModelDefinition[] = [
     contextWindow: 200_000,
   },
   {
+    id: 'claude-sonnet-4-6',
+    name: 'Sonnet 4.6',
+    shortName: 'Sonnet 4.6',
+    description: 'Latest balanced Claude model',
+    provider: 'anthropic',
+    contextWindow: 200_000,
+  },
+  {
     id: 'claude-haiku-4-5-20251001',
     name: 'Haiku 4.5',
     shortName: 'Haiku',

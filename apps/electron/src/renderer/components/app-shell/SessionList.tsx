@@ -2,7 +2,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { useAction, useActionLabel } from "@/actions"
 import { formatDistanceToNow, formatDistanceToNowStrict, isToday, isYesterday, format, startOfDay } from "date-fns"
 import type { Locale } from "date-fns"
-import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive, Users, Clock, ChevronRight, ChevronDown } from "lucide-react"
+import { MoreHorizontal, Flag, Copy, Link2Off, CloudUpload, Globe, RefreshCw, Inbox, Check, Archive, Users, Clock } from "lucide-react"
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
@@ -13,6 +13,7 @@ import type { LabelConfig } from "@craft-agent/shared/labels"
 import { flattenLabels, parseLabelEntry, formatLabelEntry, formatDisplayValue } from "@craft-agent/shared/labels"
 import { resolveEntityColor } from "@craft-agent/shared/colors"
 import { useTheme } from "@/context/ThemeContext"
+import { useOptionalAppShellContext } from "@/context/AppShellContext"
 import { Spinner, Tooltip, TooltipTrigger, TooltipContent } from "@craft-agent/ui"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription, EmptyContent } from "@/components/ui/empty"
@@ -40,7 +41,6 @@ import { DropdownMenuProvider, ContextMenuProvider } from "@/components/ui/menu-
 import { SessionMenu } from "./SessionMenu"
 import { SessionSearchHeader } from "./SessionSearchHeader"
 import { ConnectionIcon } from "@/components/icons/ConnectionIcon"
-import { useOptionalAppShellContext } from "@/context/AppShellContext"
 import * as storage from "@/lib/local-storage"
 import {
   Dialog,
@@ -154,17 +154,13 @@ function hasMessages(session: SessionMeta): boolean {
 interface TeamGroupProps {
   lead: SessionMeta
   teammates: SessionMeta[]
-  /** Set of teamIds the user has manually collapsed */
-  collapsedTeams: Set<string>
-  onToggleCollapse: (teamId: string) => void
   /** Render function that returns a <SessionItem> for a given SessionMeta */
   renderSessionItem: (item: SessionMeta, isFirstInGroup: boolean) => React.ReactNode
 }
 
-function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSessionItem }: TeamGroupProps) {
+function TeamGroup({ lead, teammates, renderSessionItem }: TeamGroupProps) {
   const teamColor = lead.teamColor || '#7c3aed'
   const isCompleted = lead.teamStatus === 'completed'
-  const isCollapsed = lead.teamId ? collapsedTeams.has(lead.teamId) : false
 
   const workingCount = teammates.filter(t => t.isProcessing).length
   const doneCount = teammates.filter(t => !t.isProcessing).length
@@ -179,21 +175,14 @@ function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSe
         }}
         className={isCompleted ? 'opacity-70' : undefined}
       >
-        {/* Team status bar — clickable to toggle collapse */}
-        <button
-          type="button"
-          onClick={() => lead.teamId && onToggleCollapse(lead.teamId)}
+        {/* Team status bar (non-collapsible in session sidebar) */}
+        <div
           className={cn(
-            "w-full flex items-center gap-1.5 px-3 py-1 text-[11px] cursor-pointer hover:bg-foreground/3 transition-colors",
+            "w-full flex items-center gap-1.5 px-3 py-1 text-[11px]",
             isCompleted ? "text-muted-foreground" : "text-muted-foreground"
           )}
           style={isCompleted ? undefined : { color: teamColor }}
         >
-          {isCollapsed ? (
-            <ChevronRight className="h-3 w-3 shrink-0" />
-          ) : (
-            <ChevronDown className="h-3 w-3 shrink-0" />
-          )}
           <Users className="h-3 w-3 shrink-0" />
           <span className="font-medium">Team</span>
           <span className="text-muted-foreground mx-0.5">&middot;</span>
@@ -217,9 +206,9 @@ function TeamGroup({ lead, teammates, collapsedTeams, onToggleCollapse, renderSe
               )}
             </>
           )}
-        </button>
-        {/* Lead session item — hidden when collapsed */}
-        {!isCollapsed && renderSessionItem(lead, true)}
+        </div>
+        {/* Lead session item — always visible in session sidebar */}
+        {renderSessionItem(lead, true)}
       </div>
     </div>
   )
@@ -1063,83 +1052,8 @@ export function SessionList({
   } = useSessionSelection()
   const { navigate, navigateToSession } = useNavigation()
   const navState = useNavigationState()
+  const currentFilter = isSessionsNavigation(navState) ? navState.filter : undefined
   const { showEscapeOverlay } = useEscapeInterrupt()
-
-  // Agent Teams: Track which teams are manually collapsed by the user
-  const [collapsedTeams, setCollapsedTeams] = useState<Set<string>>(new Set())
-  // Track known team IDs so we can detect when a new team appears
-  const knownTeamIds = useRef<Set<string>>(new Set())
-
-  const handleToggleCollapse = useCallback((teamId: string) => {
-    setCollapsedTeams(prev => {
-      const next = new Set(prev)
-      if (next.has(teamId)) {
-        next.delete(teamId)
-      } else {
-        next.add(teamId)
-      }
-      return next
-    })
-  }, [])
-
-  // Auto-collapse prior teams when a new team is spawned by the lead
-  useEffect(() => {
-    const currentTeamIds = new Set<string>()
-    for (const item of items) {
-      if (item.isTeamLead && item.teamId) {
-        currentTeamIds.add(item.teamId)
-      }
-    }
-
-    // Detect newly added teams
-    const newTeamIds: string[] = []
-    for (const teamId of currentTeamIds) {
-      if (!knownTeamIds.current.has(teamId)) {
-        newTeamIds.push(teamId)
-      }
-    }
-
-    if (newTeamIds.length > 0 && knownTeamIds.current.size > 0) {
-      // A new team appeared while other teams already exist:
-      // collapse all prior teams, expand the new one
-      setCollapsedTeams(prev => {
-        const next = new Set(prev)
-        // Collapse all existing teams
-        for (const existingId of knownTeamIds.current) {
-          next.add(existingId)
-        }
-        // Make sure new teams are expanded
-        for (const newId of newTeamIds) {
-          next.delete(newId)
-        }
-        return next
-      })
-    }
-
-    // Update known set
-    knownTeamIds.current = currentTeamIds
-
-    // Implements REQ-UX-003: Auto-collapse completed teams
-    const completedTeamIds: string[] = []
-    for (const item of items) {
-      if (item.isTeamLead && item.teamId && item.teamStatus === 'completed') {
-        completedTeamIds.push(item.teamId)
-      }
-    }
-    if (completedTeamIds.length > 0) {
-      setCollapsedTeams(prev => {
-        let changed = false
-        const next = new Set(prev)
-        for (const id of completedTeamIds) {
-          if (!next.has(id)) {
-            next.add(id)
-            changed = true
-          }
-        }
-        return changed ? next : prev
-      })
-    }
-  }, [items])
 
   // Pre-flatten label tree once for efficient ID lookups in each SessionItem
   const flatLabels = useMemo(() => flattenLabels(labels), [labels])
@@ -1151,9 +1065,6 @@ export function SessionList({
   const visibleItems = useMemo(() => items.filter(item =>
     !item.hidden && !item.parentSessionId
   ), [items])
-
-  // Get current filter from navigation state (for preserving context in tab routes)
-  const currentFilter = isSessionsNavigation(navState) ? navState.filter : undefined
 
   const [renameDialogOpen, setRenameDialogOpen] = useState(false)
   const [renameSessionId, setRenameSessionId] = useState<string | null>(null)
@@ -1928,8 +1839,6 @@ export function SessionList({
                           key={item.id}
                           lead={item}
                           teammates={teammates}
-                          collapsedTeams={collapsedTeams}
-                          onToggleCollapse={handleToggleCollapse}
                           renderSessionItem={renderItem}
                         />
                       )

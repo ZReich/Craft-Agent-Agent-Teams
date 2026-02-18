@@ -59,7 +59,7 @@ function readHooksFile(workspaceRootPath: string): { version?: number; hooks: Re
   if (!existsSync(path)) {
     return { version: 1, hooks: {} };
   }
-  const raw = readFileSync(path, 'utf-8');
+  const raw = readFileSync(path, 'utf-8').replace(/^\uFEFF/, '');
   return JSON.parse(raw);
 }
 

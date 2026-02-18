@@ -16,7 +16,7 @@
 import * as React from 'react'
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { useAtomValue } from 'jotai'
-import { Plus, Activity, FileCheck2, GitBranch, LayoutGrid, Focus, Send, AlertTriangle } from 'lucide-react'
+import { Plus, Activity, FileCheck2, GitBranch, LayoutGrid, Focus, Send, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -58,6 +58,7 @@ import { useTeamStateSync } from '@/hooks/useTeamEvents'
 import { ToolActivityIndicator } from './ToolActivityIndicator'
 import type { ToolActivity } from './ToolActivityIndicator'
 import { TeamCompletionBanner } from './TeamCompletionBanner'
+import { bucketTeamCards } from './team-dashboard-card-buckets'
 
 const MODEL_NAMES: Record<string, string> = {
   'claude-opus-4-6': 'Opus 4.6',
@@ -222,6 +223,7 @@ export function TeamDashboard({
   const [compactSidebarExpanded, setCompactSidebarExpanded] = useState(false)
   const [highlightedTaskIds, setHighlightedTaskIds] = useState<string[]>([])
   const [quickReplyByTeammate, setQuickReplyByTeammate] = useState<Record<string, string>>({})
+  const [minimizedSectionCollapsed, setMinimizedSectionCollapsed] = useState(true)
   const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null)
 
   // Real-time event state for Command Center cards
@@ -686,6 +688,21 @@ export function TeamDashboard({
     })
     return counts
   }, [realtimeTasks])
+  const cardBuckets = useMemo(() => bucketTeamCards({
+    teammates: teammatesWithTasks,
+    teammateActiveTaskCount,
+    sessionMetaMap,
+    selectedTeammateId,
+  }), [teammatesWithTasks, teammateActiveTaskCount, sessionMetaMap, selectedTeammateId])
+  const commandCenterTeammates = cardBuckets.visible
+  const minimizedTeammates = cardBuckets.minimized
+  const minimizedTeammateKey = useMemo(() => minimizedTeammates.map((t) => t.id).join('|'), [minimizedTeammates])
+
+  useEffect(() => {
+    if (minimizedTeammates.length > 0) {
+      setMinimizedSectionCollapsed(true)
+    }
+  }, [minimizedTeammates.length, minimizedTeammateKey])
 
   const compactRecentActivity = useMemo(() => realtimeActivity.slice(-5).reverse(), [realtimeActivity])
   const recentMessagesByTeammate = useMemo(() => {
@@ -829,7 +846,7 @@ export function TeamDashboard({
             }}
           />
           <div className="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-3">
-            {teammatesWithTasks.map((teammate) => {
+            {commandCenterTeammates.map((teammate) => {
               const activeCount = teammateActiveTaskCount.get(teammate.id) || 0
               const recent = recentMessagesByTeammate.get(teammate.id) ?? []
               const draft = quickReplyByTeammate[teammate.id] ?? ''
@@ -974,6 +991,39 @@ export function TeamDashboard({
               )
             })}
           </div>
+
+          {minimizedTeammates.length > 0 && (
+            <div className="mt-3 rounded-lg border border-border bg-foreground/[0.02]">
+              <button
+                type="button"
+                onClick={() => setMinimizedSectionCollapsed(prev => !prev)}
+                className="w-full px-3 py-2 flex items-center gap-2 text-xs font-medium text-muted-foreground hover:bg-foreground/[0.03]"
+              >
+                {minimizedSectionCollapsed ? <ChevronRight className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+                {minimizedTeammates.length} older teammate card{minimizedTeammates.length !== 1 ? 's' : ''} minimized
+              </button>
+
+              {!minimizedSectionCollapsed && (
+                <div className="px-3 pb-3 grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-3">
+                  {minimizedTeammates.map((teammate) => (
+                    <div key={teammate.id} className="rounded-lg p-3 bg-background/70 border border-border/70 opacity-80">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <h3 className="text-sm font-semibold truncate">{teammate.name}</h3>
+                          <p className="text-[11px] text-muted-foreground truncate capitalize">
+                            {teammate.role} • {MODEL_NAMES[teammate.model] || teammate.model}
+                          </p>
+                        </div>
+                        <Badge variant="secondary" className="text-[10px] px-2 py-0.5">
+                          minimized
+                        </Badge>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ) : (
       <div className="flex-1 flex min-h-0">

@@ -1259,6 +1259,47 @@ function migrateOpus45ToOpus46(config: StoredConfig): boolean {
 }
 
 /**
+ * Ensure Sonnet 4.6 is present in direct Anthropic connection model lists.
+ * Adds the model if missing so existing users see it in selectors without
+ * manually resetting their connection configuration.
+ */
+function backfillSonnet46InAnthropicConnections(config: StoredConfig): boolean {
+  if (!config.llmConnections) return false;
+
+  const SONNET_46_ID = 'claude-sonnet-4-6';
+  const SONNET_46_ENTRY = {
+    id: SONNET_46_ID,
+    name: 'Sonnet 4.6',
+    shortName: 'Sonnet 4.6',
+    description: 'Latest balanced Claude model',
+    provider: 'anthropic',
+    contextWindow: 200_000,
+  } as const;
+
+  let changed = false;
+
+  for (const connection of config.llmConnections) {
+    // Only update direct Anthropic connections. Compat endpoints are user-owned.
+    if (connection.providerType !== 'anthropic') continue;
+    if (!connection.models || !Array.isArray(connection.models)) continue;
+
+    const modelIds = connection.models.map((model) => typeof model === 'string' ? model : model.id);
+    if (modelIds.includes(SONNET_46_ID)) continue;
+
+    // Insert after Sonnet 4.5 when present, otherwise append.
+    const sonnet45Index = modelIds.findIndex((id) => id === 'claude-sonnet-4-5-20250929');
+    if (sonnet45Index >= 0) {
+      connection.models.splice(sonnet45Index + 1, 0, SONNET_46_ENTRY);
+    } else {
+      connection.models.push(SONNET_46_ENTRY);
+    }
+    changed = true;
+  }
+
+  return changed;
+}
+
+/**
  * Migrate Opus 4.5 to Opus 4.6 in workspace default models.
  * Iterates over all workspaces and updates defaults.model if it's Opus 4.5.
  */
@@ -1433,6 +1474,10 @@ export function migrateLegacyLlmConnectionsConfig(): void {
     }
     // Phase 1e: Migrate Opus 4.5 → Opus 4.6 in workspace default models
     migrateWorkspaceOpus45ToOpus46(config);
+    // Phase 1f: Ensure Sonnet 4.6 is available for existing Anthropic connections
+    if (backfillSonnet46InAnthropicConnections(config)) {
+      needsSave = true;
+    }
 
     if (needsSave) {
       saveConfig(config);
@@ -1538,6 +1583,7 @@ export function migrateLegacyLlmConnectionsConfig(): void {
   // Run the same backfill and migration on newly created connections
   backfillAllConnectionModels(config);
   migrateModelDefaultsToConnections(config);
+  backfillSonnet46InAnthropicConnections(config);
 
   saveConfig(config);
 }

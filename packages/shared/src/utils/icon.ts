@@ -29,9 +29,10 @@ export {
   isEmoji,
   isIconUrl,
   isInvalidIconValue,
+  isLucideIconName,
 } from './icon-constants.ts';
 
-import { ICON_EXTENSIONS, isEmoji, isIconUrl, isInvalidIconValue } from './icon-constants.ts';
+import { ICON_EXTENSIONS, isEmoji, isIconUrl, isInvalidIconValue, isLucideIconName } from './icon-constants.ts';
 
 /**
  * Map of content-type to file extension for icon downloads.
@@ -73,6 +74,11 @@ export function validateIconValue(icon: unknown, context: string = 'Icon'): stri
 
   // Accept emoji or URL
   if (isEmoji(trimmed) || isIconUrl(trimmed)) {
+    return trimmed;
+  }
+
+  // Accept Lucide icon names (e.g. "file-text", "git-branch") - rendered as fallback in UI
+  if (isLucideIconName(trimmed)) {
     return trimmed;
   }
 

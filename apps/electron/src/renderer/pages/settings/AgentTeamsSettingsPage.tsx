@@ -49,6 +49,7 @@ export const meta: DetailsPageMeta = {
 const BASE_MODEL_OPTIONS = [
   { value: 'claude-opus-4-6', label: 'Opus 4.6', description: 'Most capable ($15/$75 per 1M tokens)' },
   { value: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5', description: 'Best balance ($3/$15 per 1M tokens)' },
+  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6', description: 'Latest balanced model ($3/$15 per 1M tokens)' },
   { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', description: 'Fastest ($0.80/$4 per 1M tokens)' },
   { value: 'kimi-k2.5', label: 'Kimi K2.5', description: 'Cost-effective worker ($1.50/$7.50 per 1M tokens)' },
 ]

@@ -60,7 +60,7 @@ import {
   validateConfigWrite,
   BUILT_IN_TOOLS,
 } from './core/pre-tool-use.ts';
-import { buildOverrideSnippet, createToolOverrideResult, didToolOverrideApply } from './sdk-interception.ts';
+// sdk-interception.ts: createToolOverrideResult/outputContent removed — SDK does not support this field (REQ-NEXT-007)
 import { buildKnowledgeInjectionBlock } from '../agent-teams/team-knowledge-bus-registry.ts';
 import { type ThinkingLevel, getThinkingTokens, DEFAULT_THINKING_LEVEL } from './thinking-levels.ts';
 import type { LoadedSource } from '../sources/types.ts';
@@ -408,9 +408,7 @@ export class ClaudeAgent extends BaseAgent {
   // When true, prevents premature session completion after spawning teammates
   private activeTeamName: string | null = null;
   private activeTeammateCount: number = 0;
-  // REQ-NEXT-007: Runtime contract verification for undocumented outputContent interception.
-  private pendingSdkToolOverrides: Map<string, { toolName: string; expectedSnippet: string; createdAt: number }> = new Map();
-  private sdkToolOverrideHealthy: boolean = true;
+  // hookSystem and throttle for teammate sessions
   private hookSystem?: HookSystem;
   private toolCallThrottle?: import('../agent-teams/tool-call-throttle.ts').ToolCallThrottle;
 
@@ -602,8 +600,6 @@ export class ClaudeAgent extends BaseAgent {
     }
     this.activeTeamName = null;
     this.activeTeammateCount = 0;
-    this.pendingSdkToolOverrides.clear();
-    this.sdkToolOverrideHealthy = true;
   }
 
   /**
@@ -620,44 +616,6 @@ export class ClaudeAgent extends BaseAgent {
   private isTeammateSpawnToolName(toolName: string | undefined): boolean {
     if (!toolName) return false;
     return toolName === 'Task' || toolName === 'Agent';
-  }
-
-  private trackSdkToolOverride(toolUseId: string | undefined, toolName: string, overrideContent: string): void {
-    if (!toolUseId) return;
-
-    const now = Date.now();
-    // Opportunistic stale-entry cleanup (5 minute TTL)
-    for (const [id, pending] of this.pendingSdkToolOverrides.entries()) {
-      if (now - pending.createdAt > 5 * 60 * 1000) {
-        this.pendingSdkToolOverrides.delete(id);
-      }
-    }
-
-    this.pendingSdkToolOverrides.set(toolUseId, {
-      toolName,
-      expectedSnippet: buildOverrideSnippet(overrideContent),
-      createdAt: now,
-    });
-  }
-
-  private verifySdkToolOverride(
-    input: { tool_name?: string; tool_response?: unknown },
-    toolUseId: string | undefined,
-  ): void {
-    if (!toolUseId) return;
-
-    const pending = this.pendingSdkToolOverrides.get(toolUseId);
-    if (!pending) return;
-    this.pendingSdkToolOverrides.delete(toolUseId);
-
-    const applied = didToolOverrideApply(input.tool_response, pending.expectedSnippet);
-    if (!applied) {
-      this.sdkToolOverrideHealthy = false;
-      this.onDebug?.(
-        `[CRITICAL][REQ-NEXT-007] SDK PreToolUse outputContent override mismatch for "${pending.toolName}". ` +
-        `Synthetic interception may no longer be honored by this SDK build; teammate interception is now degraded.`,
-      );
-    }
   }
 
   /**
@@ -1058,14 +1016,9 @@ export class ClaudeAgent extends BaseAgent {
 
                   this.onDebug?.(`[AgentTeams] Intercepting teammate spawn: ${teammateName || '(auto-generated)'} for team "${teamName}" (count: ${this.activeTeammateCount})`);
 
-                  if (!this.sdkToolOverrideHealthy) {
-                    this.activeTeammateCount = Math.max(0, this.activeTeammateCount - 1);
-                    return blockWithReason(
-                      'Teammate tool interception is temporarily degraded due to SDK hook compatibility. ' +
-                      'Restart the session or update SDK compatibility before spawning teammates.',
-                    );
-                  }
-
+                  // Implements REQ-NEXT-007: Use decision:'block' + reason instead of the removed
+                  // outputContent mechanism. The SDK ignores outputContent entirely; decision:'block'
+                  // prevents the SDK from also spawning its own subprocess teammate.
                   try {
                     const result = await this.onTeammateSpawnRequested({
                       teamName,
@@ -1078,9 +1031,10 @@ export class ClaudeAgent extends BaseAgent {
                     const displayName = teammateName || 'teammate';
                     this.onDebug?.(`[AgentTeams] Teammate ${displayName} spawned as session ${result.sessionId}`);
 
-                    const output = `Teammate spawned successfully as a separate session.\nagent_id: ${result.sessionId}\nstatus: running\n\nThe teammate is now working independently in its own context window with an auto-generated codename. You will receive their results when they complete.`;
-                    this.trackSdkToolOverride(toolUseId, toolName, output);
-                    return createToolOverrideResult(output);
+                    return {
+                      decision: 'block' as const,
+                      reason: `Teammate "${displayName}" has been spawned as a separate Craft Agent session (id: ${result.sessionId}). It is running independently. You will receive its results when it completes.`,
+                    };
                   } catch (err) {
                     // Roll back count on failure
                     this.activeTeammateCount--;
@@ -1090,9 +1044,10 @@ export class ClaudeAgent extends BaseAgent {
                     }
                     const displayName = teammateName || 'teammate';
                     this.onDebug?.(`[AgentTeams] Failed to spawn teammate ${displayName}: ${err}`);
-                    const output = `Failed to spawn teammate: ${err instanceof Error ? err.message : String(err)}`;
-                    this.trackSdkToolOverride(toolUseId, toolName, output);
-                    return createToolOverrideResult(output);
+                    return {
+                      decision: 'block' as const,
+                      reason: `Failed to spawn teammate: ${err instanceof Error ? err.message : String(err)}`,
+                    };
                   }
                 }
               } // end else (explicit team_name provided)
@@ -1110,13 +1065,8 @@ export class ClaudeAgent extends BaseAgent {
 
                   this.onDebug?.(`[AgentTeams] Intercepting SendMessage: type=${msgType}, target=${targetName}`);
 
-                  if (!this.sdkToolOverrideHealthy) {
-                    return blockWithReason(
-                      'SendMessage interception is temporarily degraded due to SDK hook compatibility. ' +
-                      'Retry after restarting the session.',
-                    );
-                  }
-
+                  // Implements REQ-NEXT-007: decision:'block' prevents SDK from routing the message
+                  // natively while our session-based routing already handled delivery.
                   try {
                     const result = await this.onTeammateMessage({
                       targetName,
@@ -1125,20 +1075,23 @@ export class ClaudeAgent extends BaseAgent {
                     });
 
                     if (result.delivered) {
-                      const output = msgType === 'broadcast'
-                        ? 'Message broadcast to all teammates successfully.'
-                        : `Message delivered to "${targetName}" successfully.`;
-                      this.trackSdkToolOverride(toolUseId, toolName, output);
-                      return createToolOverrideResult(output);
+                      return {
+                        decision: 'block' as const,
+                        reason: msgType === 'broadcast'
+                          ? 'Message broadcast to all teammates successfully.'
+                          : `Message delivered to "${targetName}" successfully.`,
+                      };
                     } else {
-                      const output = `Failed to deliver message: ${result.error || 'Unknown error'}`;
-                      this.trackSdkToolOverride(toolUseId, toolName, output);
-                      return createToolOverrideResult(output);
+                      return {
+                        decision: 'block' as const,
+                        reason: `Failed to deliver message: ${result.error || 'Unknown error'}`,
+                      };
                     }
                   } catch (err) {
-                    const output = `Failed to send message: ${err instanceof Error ? err.message : String(err)}`;
-                    this.trackSdkToolOverride(toolUseId, toolName, output);
-                    return createToolOverrideResult(output);
+                    return {
+                      decision: 'block' as const,
+                      reason: `Failed to send message: ${err instanceof Error ? err.message : String(err)}`,
+                    };
                   }
                 }
               }
@@ -1160,16 +1113,13 @@ export class ClaudeAgent extends BaseAgent {
                   this.onDebug?.(`[AgentTeams] TeamCreate for "${teamCreateName}" — already active (idempotent no-op)`)
                 }
 
-                if (!this.sdkToolOverrideHealthy) {
-                  return blockWithReason(
-                    'TeamCreate interception is temporarily degraded due to SDK hook compatibility. ' +
-                    'Retry after restarting the session.',
-                  );
+                // Implements REQ-NEXT-007 + REQ-ALIGN-001: decision:'block' prevents native SDK execution
+                // (which would create orphan ~/.claude/teams/ files). The reason string informs Claude
+                // that the team is managed by Craft Agent and it should proceed to spawn teammates.
+                return {
+                  decision: 'block' as const,
+                  reason: `Team "${teamCreateName}" is managed by Craft Agent. Proceed to spawn teammates using the Task tool.`,
                 }
-
-                const output = `Team "${teamCreateName}" created successfully. Teams are managed automatically when spawning teammates.`;
-                this.trackSdkToolOverride(toolUseId, toolName, output);
-                return createToolOverrideResult(output)
               }
 
               // --- TeamDelete: Trigger our session-based cleanup ---
@@ -1200,16 +1150,11 @@ export class ClaudeAgent extends BaseAgent {
                     this.onDebug?.(`[AgentTeams] Failed to clean up SDK files: ${err instanceof Error ? err.message : String(err)}`)
                   }
                 }
-                if (!this.sdkToolOverrideHealthy) {
-                  return blockWithReason(
-                    'TeamDelete interception is temporarily degraded due to SDK hook compatibility. ' +
-                    'Retry after restarting the session.',
-                  );
+                // Implements REQ-NEXT-007: decision:'block' prevents SDK from running TeamDelete natively.
+                return {
+                  decision: 'block' as const,
+                  reason: 'Team deleted and sessions cleaned up successfully.',
                 }
-
-                const output = 'Team deleted and sessions cleaned up successfully.';
-                this.trackSdkToolOverride(toolUseId, toolName, output);
-                return createToolOverrideResult(output)
               }
 
               // ============================================================
@@ -1619,22 +1564,6 @@ export class ClaudeAgent extends BaseAgent {
               return { continue: true };
             }],
           }],
-          // REQ-NEXT-007: PostToolUse runtime contract verification for outputContent interception.
-          // We do not mutate tool output here; we only verify that our synthetic result was honored.
-          PostToolUse: [{
-            hooks: [async (input, hookToolUseId) => {
-              if (input.hook_event_name !== 'PostToolUse') {
-                return { continue: true };
-              }
-
-              this.verifySdkToolOverride(
-                input as { tool_name?: string; tool_response?: unknown },
-                hookToolUseId,
-              );
-              return { continue: true };
-            }],
-          }],
-
           // ═══════════════════════════════════════════════════════════════════════════
           // SUBAGENT HOOKS: Logging only - parent tracking uses SDK's parent_tool_use_id
           // ═══════════════════════════════════════════════════════════════════════════
@@ -2777,15 +2706,6 @@ export class ClaudeAgent extends BaseAgent {
           // as an active parent for fallback assignment.
           for (const event of resultEvents) {
             if (event.type === 'tool_result') {
-              // REQ-NEXT-007: Verify SDK still applies synthetic outputContent overrides.
-              this.verifySdkToolOverride(
-                {
-                  tool_name: event.toolName,
-                  tool_response: event.result,
-                },
-                event.toolUseId,
-              );
-
               if (this.isTeammateSpawnToolName(event.toolName)) {
                 activeParentTools.delete(event.toolUseId);
               }
@@ -3223,8 +3143,6 @@ export class ClaudeAgent extends BaseAgent {
     // Claude-specific cleanup first
     this.currentQueryAbortController?.abort();
     this.pendingPermissions.clear();
-    this.pendingSdkToolOverrides.clear();
-    this.sdkToolOverrideHealthy = true;
 
     // Clear pinned system prompt state
     this.pinnedPreferencesPrompt = null;

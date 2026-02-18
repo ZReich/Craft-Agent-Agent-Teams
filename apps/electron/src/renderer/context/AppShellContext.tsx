@@ -71,6 +71,8 @@ export interface AppShellContextType {
   workspaceYoloEnabled?: boolean
   /** Workspace-level Design Flow enabled — drives per-session toggle default (REQ-004) */
   workspaceDesignFlowEnabled?: boolean
+  /** Workspace-level dashboard behavior flag for minimizing completed teams */
+  workspaceDashboardAutoMinimizeCompletedTeams?: boolean
   /** Update workspace-level feature flags from settings pages (fixes stale state after toggle) */
   onWorkspaceFeatureFlagsChange?: (flags: { agentTeamsEnabled?: boolean; yoloEnabled?: boolean; designFlowEnabled?: boolean }) => void
 

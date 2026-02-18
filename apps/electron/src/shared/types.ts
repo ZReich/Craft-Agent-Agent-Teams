@@ -1660,6 +1660,8 @@ export interface WorkspaceSettings {
   agentTeamsMemoryInjectionEnabled?: boolean
   /** Kill-switch for Team Dashboard Knowledge metrics surface (REQ-008) */
   agentTeamsKnowledgeMetricsUiEnabled?: boolean
+  /** Whether the dashboard should auto-minimize completed teams when a new team starts */
+  dashboardAutoMinimizeCompletedTeams?: boolean
   // Quality gate settings (stored in agentTeams.qualityGates)
   qualityGatesEnabled?: boolean
   qualityGatesPassThreshold?: number
