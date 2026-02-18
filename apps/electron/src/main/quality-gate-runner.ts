@@ -769,15 +769,15 @@ export class QualityGateRunner {
         );
 
         if (result.total === 0) {
-          // In 'affected' scope, zero tests means no tests were affected by the change — that's fine
-          if (changedOnly || !requireTests) {
+          // Implements REQ-QG-001: Feature tasks must have tests even in affected scope
+          if (!requireTests) {
             return {
               score: 100,
               passed: true,
               issues: [],
               suggestions: [
                 changedOnly
-                  ? 'No tests affected by the changed files; full suite runs at integration gate'
+                  ? 'No tests affected by the changed files; tests not required for this task type'
                   : 'No test files detected; tests are not required for this task type',
                 diagnostics,
               ],
@@ -791,8 +791,14 @@ export class QualityGateRunner {
           return {
             score: 0,
             passed: false,
-            issues: ['No test files found - tests are required for all feature work', diagnostics],
-            suggestions: ['Add unit tests for this change and re-run the quality gate'],
+            issues: [
+              'No test files found for changed files — feature tasks require tests',
+              diagnostics,
+            ],
+            suggestions: [
+              'Write tests covering the new behavior using .test.ts or .spec.ts files',
+              'Use the test-writer skill to generate tests from your requirement IDs',
+            ],
             totalTests: 0,
             passedTests: 0,
             failedTests: 0,
@@ -985,12 +991,13 @@ export class QualityGateRunner {
     return `Diagnostics: command="${command}", cwd="${cwd}", timeoutMs=${timeoutMs}, attempt=${attempt}/${maxAttempts}, cacheHit=${cacheHit}`;
   }
 
+  // Implements REQ-QG-003: Include test-writer skill guidance in failure feedback
   private testFailureSuggestions(kind: TestFailureKind): string[] {
-    if (kind === 'no-tests') return ['Add unit tests for this change and re-run the quality gate'];
+    if (kind === 'no-tests') return ['Add unit tests for this change and re-run the quality gate', 'Use the test-writer skill to generate tests from your requirement IDs'];
     if (kind === 'infra-failure') return ['Resolve dependency/tooling errors (install deps, verify workspace setup) and rerun tests'];
     if (kind === 'timeout') return ['Investigate long-running tests, reduce test scope, or optimize setup before retrying'];
     if (kind === 'config-error') return ['Fix vitest configuration issues and rerun tests'];
-    return ['Fix all failing tests and rerun the quality gate'];
+    return ['Fix all failing tests and rerun the quality gate', 'Use the test-writer skill to generate or fix failing tests'];
   }
 
   private isBaselineOnlyFailure(failedTests: string[], knownFailingTests: string[]): boolean {
@@ -2254,51 +2261,71 @@ Please analyze the diff and provide:
   /**
    * Check if test files exist in the diff (for TDD enforcement).
    * Returns issues if the task is a feature and no test files are found.
+   * Implements REQ-QG-002: Catch implementation-only diffs for feature tasks
    */
   enforceTestFirst(
     diff: string,
     taskContext: TaskContext,
   ): QualityGateStageResult | null {
     if (taskContext.taskType !== 'feature') return null;
-    if (taskContext.tddPhase !== 'test-writing') return null;
 
-    const testFilePatterns = [
-      /\+\+\+.*\.test\.[jt]sx?/,
-      /\+\+\+.*\.spec\.[jt]sx?/,
-      /\+\+\+.*__tests__\//,
-      /\+\+\+.*\.test\./,
-    ];
-
-    const hasTestFiles = testFilePatterns.some(p => p.test(diff));
-
-    if (!hasTestFiles) {
-      return {
-        score: 0,
-        passed: false,
-        issues: ['No test files found in this change. TDD requires writing tests FIRST for new features.'],
-        suggestions: [
-          'Create test files before writing implementation code',
-          'Name test files with .test.ts or .spec.ts suffix',
-          'Write tests that describe the expected behavior, then implement to make them pass',
-        ],
-      };
+    // Phase 'review' means implementation files only, no test files — fail for features
+    if (taskContext.tddPhase === 'review') {
+      const hasNewSourceFiles = /\+\+\+ b\/.*\.[jt]sx?$/m.test(diff);
+      if (hasNewSourceFiles) {
+        return {
+          score: 0,
+          passed: false,
+          issues: ['Feature code submitted without test files. TDD requires tests alongside implementation.'],
+          suggestions: [
+            'Add test files (.test.ts or .spec.ts) covering the new behavior',
+            'Use the test-writer skill to generate tests from your requirement IDs',
+          ],
+        };
+      }
     }
 
-    // Check for meaningful tests (not just empty test files)
-    const hasAssertions = /expect\(|assert|toBe|toEqual|toContain|toThrow|toHaveBeenCalled/.test(diff);
-    if (!hasAssertions) {
-      return {
-        score: 30,
-        passed: false,
-        issues: ['Test files found but they appear to contain no assertions. Tests must be meaningful.'],
-        suggestions: [
-          'Add assertions using expect() or assert()',
-          'Each test should verify specific behavior',
-          'Test edge cases and error paths, not just the happy path',
-        ],
-      };
+    // Phase 'test-writing' means only test files in diff — check they have assertions
+    if (taskContext.tddPhase === 'test-writing') {
+      const testFilePatterns = [
+        /\+\+\+.*\.test\.[jt]sx?/,
+        /\+\+\+.*\.spec\.[jt]sx?/,
+        /\+\+\+.*__tests__\//,
+        /\+\+\+.*\.test\./,
+      ];
+
+      const hasTestFiles = testFilePatterns.some(p => p.test(diff));
+
+      if (!hasTestFiles) {
+        return {
+          score: 0,
+          passed: false,
+          issues: ['No test files found in this change. TDD requires writing tests FIRST for new features.'],
+          suggestions: [
+            'Create test files before writing implementation code',
+            'Name test files with .test.ts or .spec.ts suffix',
+            'Write tests that describe the expected behavior, then implement to make them pass',
+          ],
+        };
+      }
+
+      // Check for meaningful tests (not just empty test files)
+      const hasAssertions = /expect\(|assert|toBe|toEqual|toContain|toThrow|toHaveBeenCalled/.test(diff);
+      if (!hasAssertions) {
+        return {
+          score: 30,
+          passed: false,
+          issues: ['Test files found but they appear to contain no assertions. Tests must be meaningful.'],
+          suggestions: [
+            'Add assertions using expect() or assert()',
+            'Each test should verify specific behavior',
+            'Test edge cases and error paths, not just the happy path',
+          ],
+        };
+      }
     }
 
+    // Phase 'implementing' means both impl + test files — that's correct TDD
     return {
       score: 100,
       passed: true,
